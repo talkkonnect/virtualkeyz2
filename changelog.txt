@@ -1,0 +1,10 @@
+# VirtualKeyz2 changelog (newest first)
+#
+# After each code change, bump version and append an entry:
+#   ./tools/bump-version.sh "What you changed"
+#
+
+[0.04] 2026-04-09T10:47:00Z  … → commit version.go + changelog.txt
+[0.03] 2026-04-09T10:45:41Z  added versioning support
+[0.02] 2026-04-09T12:00:00Z  Add software version/release (menu v), changelog display (menu ch), tools/bump-version.sh.
+[0.01] 2026-04-09T00:00:00Z  Initial tracked build version (0.01 baseline).

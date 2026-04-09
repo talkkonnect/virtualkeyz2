@@ -1,0 +1,807 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	"unicode"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/gin-gonic/gin"
+	evdev "github.com/gvalkov/golang-evdev"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/stianeikeland/go-rpio/v4"
+)
+
+// GPIOSettings holds BCM pin numbers and relay polarity (wiring on the Pi).
+type GPIOSettings struct {
+	DoorRelayPin         uint8
+	DoorRelayActiveLow   bool
+	BuzzerRelayPin       uint8
+	BuzzerRelayActiveLow bool
+	DoorSensorPin        uint8
+	HeartbeatLEDPin      uint8
+}
+
+// AppContext holds our global connections and configurations
+type AppContext struct {
+	DB           *sql.DB
+	MQTTClient   mqtt.Client
+	Config       DeviceConfig
+	GPIO         *GPIOManager // nil if rpio failed to open (e.g. not on a Pi)
+	GPIOSettings GPIOSettings
+	// PinDisplayDigits receives how many PIN digits are entered; displayController prints that many asterisks.
+	PinDisplayDigits chan int
+
+	pinFailMu  sync.Mutex
+	pinFailSeq int // consecutive rejected PIN submissions (reset on success or after buzzer fires)
+}
+
+// DeviceConfig represents configurable parameters (loaded from SQLite/Central Server)
+type DeviceConfig struct {
+	HeartbeatInterval time.Duration
+	// DoorOpenWarningAfter: if the door stays open longer than this, a warning is logged once until it closes again.
+	DoorOpenWarningAfter time.Duration
+	// DoorSensorClosedIsLow: when true, a low GPIO level means the door is closed (e.g. switch to GND when closed, often with pull-up).
+	// When false, a high level means closed (open when the pin reads low).
+	DoorSensorClosedIsLow bool
+	SoundCardName         string // ALSA device passed to aplay -D (e.g. plughw:1,0); empty = default card
+	// WAV paths played via aplay; missing files are skipped with a debug log.
+	SoundStartup   string
+	SoundShutdown  string
+	SoundPinOK     string
+	SoundPinReject string
+	SoundKeypress  string
+	LogLevel       string
+	// PinLength is how many digit keys must be entered before the PIN is submitted automatically.
+	// If zero, the user must press Enter (or KPENTER) to submit.
+	PinLength int
+	// RelayPulseDuration is how long the door relay stays energized after a valid PIN.
+	RelayPulseDuration time.Duration
+	// PinRejectBuzzerAfterAttempts: after this many consecutive wrong PINs, pulse the buzzer relay (GPIO in GPIOSettings). Zero disables the buzzer.
+	PinRejectBuzzerAfterAttempts int
+	// BuzzerRelayPulseDuration is how long the buzzer relay stays on when the wrong-PIN threshold is reached.
+	BuzzerRelayPulseDuration time.Duration
+}
+
+func main() {
+	// 1. Run Mode Configuration (Foreground vs Daemon) [cite: 8]
+	daemonMode := flag.Bool("daemon", false, "Run system as a background daemon")
+	flag.Parse()
+
+	if *daemonMode {
+		fmt.Println("Starting in Daemon Mode...")
+		// In a production environment, you would handle systemd integration here
+	}
+
+	// 2. Initialize Logging Levels (Info, Debug, Warning, Critical) [cite: 9]
+	initLogger()
+
+	// 3. Initialize Local SQLite Database
+	db := initDatabase()
+	defer db.Close()
+
+	appCtx := &AppContext{
+		DB: db,
+		Config: DeviceConfig{
+			HeartbeatInterval:            60 * time.Second,
+			DoorOpenWarningAfter:         10 * time.Second,
+			DoorSensorClosedIsLow:        true,
+			PinLength:                    6,
+			RelayPulseDuration:           400 * time.Millisecond,
+			PinRejectBuzzerAfterAttempts: 3,
+			BuzzerRelayPulseDuration:     800 * time.Millisecond,
+			SoundCardName:                "plughw:1,0",
+			SoundStartup:                 "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/startup.wav",
+			SoundShutdown:                "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/shutdown.wav",
+			SoundPinOK:                   "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/pin_ok.wav",
+			SoundPinReject:               "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/pin_reject.wav",
+			SoundKeypress:                "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/key.wav",
+		},
+		GPIOSettings: GPIOSettings{
+			DoorRelayPin:         5,
+			DoorRelayActiveLow:   false,
+			BuzzerRelayPin:       10,
+			BuzzerRelayActiveLow: false,
+			DoorSensorPin:        7,
+			HeartbeatLEDPin:      26,
+		},
+		PinDisplayDigits: make(chan int, 16),
+	}
+
+	// 4. Initialize Hardware IO (GPIO, Relays, Heartbeat LED) [cite: 1, 3]
+	err := rpio.Open()
+	if err != nil {
+		log.Printf("WARNING: Cannot open GPIO (Not running on Pi?): %v", err)
+	} else {
+		defer rpio.Close()
+		go manageHardwareHeartbeat(appCtx.GPIOSettings.HeartbeatLEDPin)
+		gpio := NewGPIOManager()
+		gpio.AddOutput("door", appCtx.GPIOSettings.DoorRelayPin, appCtx.GPIOSettings.DoorRelayActiveLow)
+		gpio.AddOutput("buzzer", appCtx.GPIOSettings.BuzzerRelayPin, appCtx.GPIOSettings.BuzzerRelayActiveLow)
+		gpio.ConfigureDoorSensor(appCtx.GPIOSettings.DoorSensorPin)
+		appCtx.GPIO = gpio
+	}
+
+	// 5. Initialize MQTT for Centralized Remote Control [cite: 6, 7]
+	appCtx.MQTTClient = initMQTT()
+
+	// 6. Start Concurrent Subsystems
+	go startHeartbeatAPI(appCtx)   // Regular heartbeat via API [cite: 9]
+	go startNumpadListener(appCtx) // Listen to USB Numpad events
+	go monitorDoorSensors(appCtx)  // Door open timers & warnings
+	go displayController(appCtx)   // Manage DSI Screen and random QR codes [cite: 3, 10, 11]
+
+	// 7. Start Web Server (Web UI & REST HTTP API with token support) [cite: 6, 7]
+	srv := startWebServer(appCtx)
+	playSoundAsync(appCtx.Config, appCtx.Config.SoundStartup)
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
+	log.Println("INFO: Shutdown signal received.")
+	playSoundSync(appCtx.Config, appCtx.Config.SoundShutdown)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("WARNING: HTTP server shutdown: %v", err)
+	}
+}
+
+// --- Subsystem Implementations (Stubs) ---
+
+func initLogger() {
+	// Set up logger with configurable levels (Info, Debug, Warning, Critical) [cite: 9]
+	// Allows console debugging [cite: 8]
+	log.SetOutput(newColorLogWriter(os.Stdout))
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Println("INFO: Access Control System Booting...")
+}
+
+// ANSI level colors (foreground). Set NO_COLOR in the environment to disable.
+const (
+	colorReset   = "\033[0m"
+	colorDebug   = "\033[36m"   // cyan
+	colorInfo    = "\033[32m"   // green
+	colorWarning = "\033[33m"   // yellow
+	colorError   = "\033[31m"   // red
+	colorCrit    = "\033[1;31m" // bold red
+)
+
+// levelTag associates a log prefix with a color code.
+var logLevelTags = []struct {
+	prefix string
+	color  string
+}{
+	{"CRITICAL:", colorCrit},
+	{"ERROR:", colorError},
+	{"WARNING:", colorWarning},
+	{"DEBUG:", colorDebug},
+	{"INFO:", colorInfo},
+}
+
+type colorLogWriter struct {
+	w   io.Writer
+	buf []byte
+}
+
+func newColorLogWriter(w io.Writer) *colorLogWriter {
+	return &colorLogWriter{w: w}
+}
+
+func (c *colorLogWriter) Write(p []byte) (n int, err error) {
+	n = len(p)
+	if os.Getenv("NO_COLOR") != "" {
+		_, err = c.w.Write(p)
+		return n, err
+	}
+	c.buf = append(c.buf, p...)
+	for {
+		idx := bytes.IndexByte(c.buf, '\n')
+		if idx < 0 {
+			return n, nil
+		}
+		line := c.buf[:idx+1]
+		c.buf = append([]byte(nil), c.buf[idx+1:]...)
+		c.writeColoredLine(line)
+	}
+}
+
+func (c *colorLogWriter) writeColoredLine(line []byte) {
+	s := string(line)
+	colored := s
+	for _, lt := range logLevelTags {
+		if strings.Contains(s, lt.prefix) {
+			colored = lt.color + s + colorReset
+			break
+		}
+	}
+	_, _ = io.WriteString(c.w, colored)
+}
+
+func initDatabase() *sql.DB {
+	// Initialize SQLite for storing logs, configs, and access control lists [cite: 6, 7]
+	db, err := sql.Open("sqlite3", "./access_control.db")
+	if err != nil {
+		log.Fatalf("CRITICAL: Failed to open database: %v", err)
+	}
+	// Setup schemas for doors, pins, permissions, and store-and-forward logs [cite: 7, 8]
+	return db
+}
+
+func initMQTT() mqtt.Client {
+	opts := mqtt.NewClientOptions().AddBroker("tcp://central-mqtt-server:1883")
+	opts.SetClientID("self-storage-pi-001")
+	// Set up handlers for remote event actions (open door, play sound) [cite: 11]
+	client := mqtt.NewClient(opts)
+	if token := client.Connect(); token.Wait() && token.Error() != nil {
+		log.Printf("WARNING: MQTT connection failed: %v", token.Error())
+	}
+	return client
+}
+
+func startHeartbeatAPI(ctx *AppContext) {
+	// Sends regular heartbeat via API informing central server it is online [cite: 9]
+	ticker := time.NewTicker(ctx.Config.HeartbeatInterval)
+	for range ticker.C {
+		log.Println("DEBUG: Sending heartbeat to central server...")
+		// Implement HTTP POST to central server API
+	}
+}
+
+func startWebServer(ctx *AppContext) *http.Server {
+	router := gin.Default()
+
+	// REST API with Token Support & ACL [cite: 7]
+	api := router.Group("/api")
+	api.Use(TokenAuthMiddleware())
+	{
+		api.POST("/remote-control", func(c *gin.Context) {
+			// Trigger GPIO based on remote REST command [cite: 7]
+			c.JSON(http.StatusOK, gin.H{"status": "door_opened"})
+		})
+	}
+
+	// Local Web Interface for Config and Monitoring
+	router.GET("/admin", func(c *gin.Context) {
+		c.String(http.StatusOK, "Local Configuration Interface")
+	})
+
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: router,
+	}
+	go func() {
+		log.Println("INFO: Starting Web Server on port 8080")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("CRITICAL: Web server: %v", err)
+		}
+	}()
+	return srv
+}
+
+func monitorDoorSensors(ctx *AppContext) {
+	if ctx.GPIO == nil {
+		log.Println("INFO: Door sensor monitor disabled (GPIO not available).")
+		return
+	}
+	if !ctx.GPIO.DoorSensorConfigured() {
+		log.Println("INFO: Door sensor monitor disabled (no door sensor pin configured).")
+		return
+	}
+
+	warnAfter := ctx.Config.DoorOpenWarningAfter
+	if warnAfter <= 0 {
+		warnAfter = 10 * time.Second
+	}
+
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+
+	var openSince time.Time
+	var warned bool
+	first := true
+	var wasOpen bool
+
+	for range tick.C {
+		open := ctx.GPIO.DoorIsOpen(ctx.Config.DoorSensorClosedIsLow)
+
+		if first {
+			first = false
+			wasOpen = open
+			if open {
+				log.Printf("INFO: Door status: OPEN (sensor GPIO %d).", ctx.GPIOSettings.DoorSensorPin)
+				openSince = time.Now()
+			} else {
+				log.Printf("INFO: Door status: CLOSED (sensor GPIO %d).", ctx.GPIOSettings.DoorSensorPin)
+				openSince = time.Time{}
+			}
+			warned = false
+		} else if open != wasOpen {
+			wasOpen = open
+			if open {
+				log.Printf("INFO: Door is now OPEN (sensor GPIO %d).", ctx.GPIOSettings.DoorSensorPin)
+				openSince = time.Now()
+				warned = false
+			} else {
+				log.Printf("INFO: Door is now CLOSED (sensor GPIO %d).", ctx.GPIOSettings.DoorSensorPin)
+				openSince = time.Time{}
+				warned = false
+			}
+		}
+
+		if !open {
+			continue
+		}
+		if openSince.IsZero() {
+			openSince = time.Now()
+		}
+		if warned {
+			continue
+		}
+		if time.Since(openSince) >= warnAfter {
+			log.Printf("WARNING: Door open longer than %v (door sensor GPIO %d).", warnAfter, ctx.GPIOSettings.DoorSensorPin)
+			warned = true
+		}
+	}
+}
+
+// pinMaskLineWidth is the column where the rightmost asterisk is placed (right-aligned mask).
+const pinMaskLineWidth = 80
+
+func displayController(ctx *AppContext) {
+	// Manages DSI screen, displays greeting messages [cite: 3, 9]
+	// Displays random QR code for external mobile phone interaction
+	for n := range ctx.PinDisplayDigits {
+		if n <= 0 {
+			continue
+		}
+		mask := strings.Repeat("*", n)
+		log.Printf("DEBUG: Pin Digits Count %s", mask)
+	}
+}
+
+// playSoundSync plays a WAV via ALSA aplay; blocks until finished.
+func playSoundSync(cfg DeviceConfig, path string) {
+	if path == "" {
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		log.Printf("DEBUG: sound skipped (not found): %s", path)
+		return
+	}
+	args := []string{"-q"}
+	if cfg.SoundCardName != "" {
+		args = append(args, "-D", cfg.SoundCardName)
+	}
+	args = append(args, path)
+	cmd := exec.Command("aplay", args...)
+	if err := cmd.Run(); err != nil {
+		log.Printf("WARNING: aplay failed for %s: %v", path, err)
+	}
+}
+
+func playSoundAsync(cfg DeviceConfig, path string) {
+	if path == "" {
+		return
+	}
+	go playSoundSync(cfg, path)
+}
+
+func manageHardwareHeartbeat(bcm uint8) {
+	// Blinks onboard heartbeat LED to indicate software is running
+	pin := rpio.Pin(bcm)
+	pin.Output()
+	for {
+		pin.Toggle()
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+func pinDigitCount(pin string) int {
+	n := 0
+	for _, r := range pin {
+		if unicode.IsDigit(r) {
+			n++
+		}
+	}
+	return n
+}
+
+func notifyPinDisplay(ctx *AppContext, pin string) {
+	if ctx.PinDisplayDigits == nil {
+		return
+	}
+	ctx.PinDisplayDigits <- pinDigitCount(pin)
+}
+
+func TokenAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Validates tokens for the REST HTTP API [cite: 7]
+		c.Next()
+	}
+}
+
+// Use evtest in linux to test the capabilities of the keypad
+func startNumpadListener(ctx *AppContext) {
+	// In a production environment, the device path should be loaded from your ctx.Config
+	// You can find the correct event file by running `cat /proc/bus/input/devices` on the Pi
+	devicePath := "/dev/input/event1"
+
+	dev, err := evdev.Open(devicePath)
+	if err != nil {
+		log.Printf("CRITICAL: Failed to open USB keypad at %s: %v", devicePath, err)
+		return
+	}
+	defer dev.File.Close()
+
+	log.Printf("INFO: Listening to USB Keypad: %s", dev.Name)
+
+	var pinBuffer string
+
+	// Timeout configuration for the keypad as defined in your specs
+	keyTimeout := 5 * time.Second
+	timer := time.NewTimer(keyTimeout)
+	timer.Stop()
+
+	for {
+		// ReadOne blocks until an event occurs
+		ev, err := dev.ReadOne()
+		if err != nil {
+			log.Printf("ERROR: Failed to read from keypad: %v", err)
+			time.Sleep(1 * time.Second) // Prevent tight loop on hardware failure
+			continue
+		}
+
+		// We only process Key events (EV_KEY) and specifically Key Press/Down events (Value 1)
+		if ev.Type == evdev.EV_KEY && ev.Value == 1 {
+			// Reset the timeout timer on every valid keypress
+			timer.Reset(keyTimeout)
+			playSoundSync(ctx.Config, ctx.Config.SoundKeypress)
+
+			ke := evdev.NewKeyEvent(ev)
+			char := ""
+
+			// Map standard Keypad and standard Number Scancodes
+			switch ke.Scancode {
+			case evdev.KEY_KP0, evdev.KEY_0:
+				char = "0"
+				log.Println("DEBUG: Keypad 0 pressed")
+			case evdev.KEY_KP1, evdev.KEY_1:
+				char = "1"
+				log.Println("DEBUG: Keypad 1 pressed")
+			case evdev.KEY_KP2, evdev.KEY_2:
+				char = "2"
+				log.Println("DEBUG: Keypad 2 pressed")
+			case evdev.KEY_KP3, evdev.KEY_3:
+				char = "3"
+				log.Println("DEBUG: Keypad 3 pressed")
+			case evdev.KEY_KP4, evdev.KEY_4:
+				char = "4"
+				log.Println("DEBUG: Keypad 4 pressed")
+			case evdev.KEY_KP5, evdev.KEY_5:
+				char = "5"
+				log.Println("DEBUG: Keypad 5 pressed")
+			case evdev.KEY_KP6, evdev.KEY_6:
+				char = "6"
+				log.Println("DEBUG: Keypad 6 pressed")
+			case evdev.KEY_KP7, evdev.KEY_7:
+				char = "7"
+				log.Println("DEBUG: Keypad 7 pressed")
+			case evdev.KEY_KP8, evdev.KEY_8:
+				char = "8"
+				log.Println("DEBUG: Keypad 8 pressed")
+			case evdev.KEY_KP9, evdev.KEY_9:
+				char = "9"
+				log.Println("DEBUG: Keypad 9 pressed")
+			case evdev.KEY_KPSLASH, evdev.KEY_SLASH:
+				char = "/"
+				log.Println("DEBUG: Keypad Slash pressed")
+			case evdev.KEY_KPMINUS:
+				char = "-"
+				log.Println("DEBUG: Keypad Minus pressed")
+			case evdev.KEY_KPPLUS:
+				char = "+"
+				log.Println("DEBUG: Keypad Plus pressed")
+			case evdev.KEY_KPDOT:
+				char = "."
+				log.Println("DEBUG: Keypad Dot pressed")
+			case evdev.KEY_BACKSPACE:
+				if len(pinBuffer) > 0 {
+					pinBuffer = pinBuffer[:len(pinBuffer)-1]
+				}
+				notifyPinDisplay(ctx, pinBuffer)
+			case evdev.KEY_KPENTER, evdev.KEY_ENTER:
+				// Submit PIN
+				log.Printf("INFO: PIN submission initiated.")
+				processPIN(ctx, pinBuffer)
+				pinBuffer = ""
+				timer.Stop()
+				notifyPinDisplay(ctx, pinBuffer)
+			case evdev.KEY_KPASTERISK:
+				// Execute the "Call for help" function from your specifications
+				log.Println("INFO: 'Call for Help' triggered via USB keypad.")
+				triggerCallForHelp(ctx)
+				pinBuffer = ""
+				timer.Stop()
+				notifyPinDisplay(ctx, pinBuffer)
+			}
+
+			if char != "" {
+				pinBuffer += char
+				notifyPinDisplay(ctx, pinBuffer)
+
+				if ctx.Config.PinLength > 0 && len(pinBuffer) >= ctx.Config.PinLength && isAllDigits(pinBuffer) {
+					log.Printf("INFO: PIN auto-submitted after %d digits.", ctx.Config.PinLength)
+					processPIN(ctx, pinBuffer)
+					pinBuffer = ""
+					timer.Stop()
+					notifyPinDisplay(ctx, pinBuffer)
+				}
+			}
+		}
+
+		// Check if the timer has expired to clear the buffer
+		select {
+		case <-timer.C:
+			if len(pinBuffer) > 0 {
+				log.Println("DEBUG: Keypad entry timed out. Clearing buffer.")
+				pinBuffer = ""
+				notifyPinDisplay(ctx, pinBuffer)
+			}
+		default:
+			// Non-blocking default allows the loop to continue instantly
+		}
+	}
+}
+
+const validAccessPIN = "123456"
+
+func processPIN(ctx *AppContext, pin string) {
+	// Query local SQLite for permissions
+	// Validate PIN against door constraints
+	// Trigger Relay, Sound Event, MQTT Update, and Logging
+	log.Printf("DEBUG: Processing PIN: %s", pin)
+	if pin == validAccessPIN {
+		ctx.pinFailMu.Lock()
+		ctx.pinFailSeq = 0
+		ctx.pinFailMu.Unlock()
+
+		log.Printf("INFO: PIN accepted; pulsing door relay (GPIO %d).", ctx.GPIOSettings.DoorRelayPin)
+		playSoundSync(ctx.Config, ctx.Config.SoundPinOK)
+		if ctx.GPIO != nil {
+			ctx.GPIO.ActionPulse("door", ctx.Config.RelayPulseDuration)
+		} else {
+			log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
+		}
+		return
+	}
+
+	log.Println("INFO: PIN rejected.")
+	playSoundSync(ctx.Config, ctx.Config.SoundPinReject)
+
+	ctx.pinFailMu.Lock()
+	ctx.pinFailSeq++
+	failCount := ctx.pinFailSeq
+	threshold := ctx.Config.PinRejectBuzzerAfterAttempts
+	ctx.pinFailMu.Unlock()
+
+	if threshold <= 0 || failCount < threshold {
+		return
+	}
+
+	ctx.pinFailMu.Lock()
+	ctx.pinFailSeq = 0
+	ctx.pinFailMu.Unlock()
+
+	log.Printf("INFO: Wrong PIN threshold reached (%d); pulsing buzzer relay (GPIO %d).", threshold, ctx.GPIOSettings.BuzzerRelayPin)
+	if ctx.GPIO != nil {
+		ctx.GPIO.ActionPulse("buzzer", ctx.Config.BuzzerRelayPulseDuration)
+	} else {
+		log.Println("WARNING: GPIO unavailable; buzzer relay pulse skipped.")
+	}
+}
+
+func triggerCallForHelp(ctx *AppContext) {
+	// Signal the centralized operations center via API/MQTT
+	// to call the user on the IP-based intercom
+}
+
+// --- Structures ---
+
+// OutputConfig defines an output pin, like a door relay or buzzer
+type OutputConfig struct {
+	PinNumber uint8
+	ActiveLow bool // True if the relay triggers on ground/0V (common for opto-relays)
+	Pin       rpio.Pin
+	mu        sync.Mutex // Prevents overlapping pulse routines
+}
+
+// InputConfig defines an input pin, like a door sensor or egress button
+type InputConfig struct {
+	PinNumber    uint8
+	PullUp       bool          // Enable internal pull-up resistor
+	DebounceTime time.Duration // Time to ignore subsequent triggers
+	Pin          rpio.Pin
+	Action       func()    // The function to call when triggered
+	lastTrigger  time.Time // Used for debouncing
+}
+
+// GPIOManager holds the state of all physical IO
+type GPIOManager struct {
+	Outputs map[string]*OutputConfig
+	Inputs  map[string]*InputConfig
+
+	doorSensorPin   rpio.Pin
+	doorSensorReady bool
+}
+
+// --- Initialization ---
+
+func NewGPIOManager() *GPIOManager {
+	return &GPIOManager{
+		Outputs: make(map[string]*OutputConfig),
+		Inputs:  make(map[string]*InputConfig),
+	}
+}
+
+// ConfigureDoorSensor sets up a BCM GPIO as digital input with pull-up for a door contact (call once after rpio.Open).
+// Typical for DoorSensorClosedIsLow wiring; if your "closed" state is active-high only, adjust hardware pull resistors as needed.
+func (m *GPIOManager) ConfigureDoorSensor(bcm uint8) {
+	p := rpio.Pin(bcm)
+	p.Input()
+	p.PullUp()
+	m.doorSensorPin = p
+	m.doorSensorReady = true
+}
+
+// DoorSensorConfigured reports whether ConfigureDoorSensor was called.
+func (m *GPIOManager) DoorSensorConfigured() bool {
+	return m.doorSensorReady
+}
+
+// DoorIsOpen returns true when the door is open. closedIsLow matches DeviceConfig.DoorSensorClosedIsLow.
+func (m *GPIOManager) DoorIsOpen(closedIsLow bool) bool {
+	if !m.doorSensorReady {
+		return false
+	}
+	isLow := m.doorSensorPin.Read() == rpio.Low
+	if closedIsLow {
+		return !isLow
+	}
+	return isLow
+}
+
+// AddOutput registers a new output pin
+func (m *GPIOManager) AddOutput(name string, pin uint8, activeLow bool) {
+	p := rpio.Pin(pin)
+	p.Output()
+
+	cfg := &OutputConfig{
+		PinNumber: pin,
+		ActiveLow: activeLow,
+		Pin:       p,
+	}
+	m.Outputs[name] = cfg
+
+	// Ensure it starts in the "Off" state
+	m.ActionOff(name)
+}
+
+// AddInput registers a new input pin and its callback function
+func (m *GPIOManager) AddInput(name string, pin uint8, pullUp bool, action func()) {
+	p := rpio.Pin(pin)
+	p.Input()
+
+	if pullUp {
+		p.PullUp()
+		p.Detect(rpio.FallEdge) // Detect when pulled to ground
+	} else {
+		p.PullDown()
+		p.Detect(rpio.RiseEdge) // Detect when voltage is applied
+	}
+
+	m.Inputs[name] = &InputConfig{
+		PinNumber:    pin,
+		PullUp:       pullUp,
+		DebounceTime: 300 * time.Millisecond,
+		Pin:          p,
+		Action:       action,
+		lastTrigger:  time.Now(),
+	}
+}
+
+// --- Output Actions ---
+
+// ActionOn turns the output on continuously
+func (m *GPIOManager) ActionOn(name string) {
+	out, exists := m.Outputs[name]
+	if !exists {
+		log.Printf("ERROR: Output '%s' not found", name)
+		return
+	}
+	if out.ActiveLow {
+		out.Pin.Low()
+	} else {
+		out.Pin.High()
+	}
+}
+
+// ActionOff turns the output off continuously
+func (m *GPIOManager) ActionOff(name string) {
+	out, exists := m.Outputs[name]
+	if !exists {
+		return
+	}
+	if out.ActiveLow {
+		out.Pin.High()
+	} else {
+		out.Pin.Low()
+	}
+}
+
+// ActionPulse turns the output on for a duration, then off.
+// Runs concurrently so it doesn't block the main thread.
+func (m *GPIOManager) ActionPulse(name string, duration time.Duration) {
+	out, exists := m.Outputs[name]
+	if !exists {
+		return
+	}
+
+	go func() {
+		// Lock prevents two quick pulses from stepping on each other
+		out.mu.Lock()
+		defer out.mu.Unlock()
+
+		m.ActionOn(name)
+		time.Sleep(duration)
+		m.ActionOff(name)
+	}()
+}
+
+// --- Input Listener ---
+
+// StartListening begins polling for edge detections on configured inputs
+func (m *GPIOManager) StartListening() {
+	log.Println("INFO: Starting GPIO Input Listener...")
+
+	for {
+		for name, in := range m.Inputs {
+			if in.Pin.EdgeDetected() {
+				// Software Debouncing logic
+				if time.Since(in.lastTrigger) > in.DebounceTime {
+					in.lastTrigger = time.Now()
+					log.Printf("DEBUG: GPIO Input '%s' triggered", name)
+
+					// Execute the defined action in a new goroutine
+					// so a slow callback doesn't block other inputs
+					go in.Action()
+				}
+			}
+		}
+		// A small sleep prevents the loop from consuming 100% CPU
+		time.Sleep(10 * time.Millisecond)
+	}
+}
