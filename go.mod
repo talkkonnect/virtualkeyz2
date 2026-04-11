@@ -8,6 +8,7 @@ require (
 	github.com/gvalkov/golang-evdev v0.0.0-20220815104727-7e27d6ce89b6
 	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/stianeikeland/go-rpio/v4 v4.6.0
+	golang.org/x/sys v0.41.0
 	golang.org/x/term v0.40.0
 )
 
@@ -40,7 +41,6 @@ require (
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 )

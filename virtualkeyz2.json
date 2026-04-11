@@ -3,7 +3,7 @@
     "heartbeat_interval": "1m0s",
     "door_open_warning_after": "10s",
     "door_sensor_closed_is_low": true,
-    "sound_card_name": "plughw:1,0",
+    "sound_card_name": "plughw:0,0",
     "sound_startup": "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/startup.wav",
     "sound_shutdown": "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/shutdown.wav",
     "sound_pin_ok": "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/pin_ok.wav",
@@ -38,22 +38,29 @@
     "webhook_heartbeat_url": "",
     "webhook_heartbeat_token_enabled": false,
     "webhook_heartbeat_token": "",
-    "keypad_operation_mode": "access_dual_usb_keypad",
+    "keypad_operation_mode": "elevator_wait_floor_buttons",
     "keypad_evdev_path": "/dev/input/by-id/usb-32c2_2.4G_Wireless_Keyboard___Mouse-event-kbd",
     "keypad_exit_evdev_path": "/dev/input/by-id/usb-413c_Dell_KB216_Wired_Keyboard-event-kbd",
     "pair_peer_role": "none",
     "mqtt_pair_peer_topic": "",
     "pair_peer_token": "",
-    "elevator_floor_wait_timeout": "60s",
-    "elevator_floor_input_pins": "",
+    "elevator_floor_wait_timeout": "20000ms",
+    "elevator_wait_floor_cab_sense": "sense",
+    "elevator_floor_input_pins": "17,18",
     "elevator_predefined_floor": 0,
-    "elevator_dispatch_pulse_duration": "400ms",
+    "elevator_predefined_floors": "",
+    "elevator_dispatch_pulse_duration": "0",
+    "elevator_floor_dispatch_pulse_durations": "",
+    "elevator_enable_pulse_duration": "",
     "dual_keypad_reject_exit_without_entry": false
   },
   "gpio": {
-    "door_relay_pin": 5,
+    "relay_output_mode": "gpio",
+    "mcp23017_i2c_bus": 1,
+    "mcp23017_i2c_addr": 32,
+    "door_relay_pin": 0,
     "door_relay_active_low": false,
-    "buzzer_relay_pin": 10,
+    "buzzer_relay_pin": 11,
     "buzzer_relay_active_low": false,
     "door_sensor_pin": 7,
     "heartbeat_led_pin": 26,
@@ -64,7 +71,40 @@
     "elevator_dispatch_relay_pin": 0,
     "elevator_dispatch_active_low": false,
     "elevator_enable_relay_pin": 0,
-    "elevator_enable_active_low": false
+    "elevator_enable_active_low": false,
+    "elevator_floor_dispatch_pins": "6,12",
+    "elevator_wait_floor_enable_pins": "5,10",
+    "elevator_predefined_enable_pins": ""
   },
-  "tech_menu_prompt": "MeSpace-Siam-5th-Floor-Right-Door"
+  "tech_menu_prompt": "MeSpace-Siam-5th-Floor-Right-Door",
+  "elevator_parameter_modes": {
+    "_documentation": "This object is not used by the application logic — it is a label map so you can see which keys matter for elevator_wait_floor_buttons vs elevator_predefined_floor. It is preserved when you run cfg save from the technician menu.",
+    "legend": {
+      "wait_floor": "Use when device.keypad_operation_mode is elevator_wait_floor_buttons",
+      "wait_floor_sense": "elevator_wait_floor_cab_sense sense (default): read elevator_floor_input_pins, log floor, pulse matching dispatch",
+      "wait_floor_ignore": "elevator_wait_floor_cab_sense ignore: leave elevator_floor_input_pins empty; no cab GPIO; no floor log/dispatch from software",
+      "predefined": "Use when device.keypad_operation_mode is elevator_predefined_floor",
+      "both": "Used in either elevator mode (or as fallback when lists are empty)"
+    },
+    "device": {
+      "keypad_operation_mode": "both — set to elevator_wait_floor_buttons or elevator_predefined_floor (or other access modes)",
+      "elevator_floor_wait_timeout": "wait_floor — how long enable relays stay on after PIN",
+      "elevator_wait_floor_cab_sense": "wait_floor — sense (default) or ignore (sub-mode for cab GPIO)",
+      "elevator_floor_input_pins": "wait_floor + sense only — BCM cab floor inputs (must be empty when ignore)",
+      "elevator_predefined_floor": "predefined",
+      "elevator_predefined_floors": "predefined",
+      "elevator_dispatch_pulse_duration": "both — default length for dispatch pulse",
+      "elevator_floor_dispatch_pulse_durations": "both — per-index durations when gpio.elevator_floor_dispatch_pins is set",
+      "elevator_enable_pulse_duration": "predefined only — pulse length for gpio.elevator_predefined_enable_pins (ignored in wait_floor mode)"
+    },
+    "gpio": {
+      "elevator_dispatch_relay_pin": "both — single dispatch relay if elevator_floor_dispatch_pins is empty",
+      "elevator_dispatch_active_low": "both",
+      "elevator_enable_relay_pin": "wait_floor — legacy one relay for all floors; use only if elevator_wait_floor_enable_pins is empty",
+      "elevator_enable_active_low": "wait_floor (enable relays) and predefined (predefined enable relay)",
+      "elevator_floor_dispatch_pins": "both — wait_floor+sense: one per elevator_floor_input_pins; wait_floor+ignore: one per wait-floor enable channel; predefined: optional when no cab inputs",
+      "elevator_wait_floor_enable_pins": "wait_floor — ground-return relays; sense: one per elevator_floor_input_pins; ignore: one per enabled floor (no cab inputs)",
+      "elevator_predefined_enable_pins": "predefined — relay that simulates the floor call (at most one)"
+    }
+  }
 }

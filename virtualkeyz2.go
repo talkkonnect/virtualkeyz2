@@ -38,6 +38,7 @@ import (
 	"golang.org/x/term"
 
 	"virtualkeyz2/internal/keypadlist"
+	"virtualkeyz2/internal/mcp23017"
 )
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
@@ -54,8 +55,16 @@ const (
 	ModeAccessExitWithEntryButton = "access_exit_with_entry_button"
 	ModeAccessDualUSBKeypad       = "access_dual_usb_keypad"
 	ModeAccessPairedRemoteExit    = "access_paired_remote_exit"
-	ModeElevatorWaitFloorButtons  = "elevator_wait_floor_buttons"
-	ModeElevatorPredefinedFloor   = "elevator_predefined_floor"
+	// ModeElevatorWaitFloorButtons: cab floor buttons are isolated from ground until allowed; after a valid PIN, enable relays hold for elevator_floor_wait_timeout. Sub-mode device.elevator_wait_floor_cab_sense: sense (default) reads elevator_floor_input_pins, logs floor, pulses matching dispatch; ignore skips cab GPIO entirely (leave elevator_floor_input_pins empty).
+	ModeElevatorWaitFloorButtons = "elevator_wait_floor_buttons"
+	// ModeElevatorPredefinedFloor: in-cab floor buttons are not used; one relay output pulses to complete the call circuit for a single predefined floor (no cab wait). At most one floor in elevator_predefined_floors / one predefined enable pin.
+	ModeElevatorPredefinedFloor = "elevator_predefined_floor"
+)
+
+// Relay output backend (gpio.relay_output_mode). Sensor, buttons, and LED pins stay on SoC BCM GPIO.
+const (
+	RelayOutputGPIO     = "gpio"
+	RelayOutputMCP23017 = "mcp23017"
 )
 
 // PairPeerRoleEntry / PairPeerExit used with ModeAccessPairedRemoteExit (MQTT to sibling controller).
@@ -120,6 +129,37 @@ func isElevatorPredefinedMode(mode string) bool {
 	return mode == ModeElevatorPredefinedFloor
 }
 
+// Elevator wait-floor cab sense sub-modes (device.elevator_wait_floor_cab_sense).
+const (
+	ElevatorWaitFloorCabSenseSense  = "sense"
+	ElevatorWaitFloorCabSenseIgnore = "ignore"
+)
+
+// normalizeElevatorWaitFloorCabSense returns ElevatorWaitFloorCabSenseSense or ElevatorWaitFloorCabSenseIgnore.
+func normalizeElevatorWaitFloorCabSense(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case ElevatorWaitFloorCabSenseIgnore, "off", "false", "no":
+		return ElevatorWaitFloorCabSenseIgnore
+	default:
+		return ElevatorWaitFloorCabSenseSense
+	}
+}
+
+func elevatorWaitFloorSenseCabInputs(cfg DeviceConfig) bool {
+	return normalizeElevatorWaitFloorCabSense(cfg.ElevatorWaitFloorCabSense) == ElevatorWaitFloorCabSenseSense
+}
+
+// elevatorWaitFloorEnableChannelCount is the number of independent enable outputs (per-floor list or one legacy relay).
+func elevatorWaitFloorEnableChannelCount(app *AppContext) int {
+	if n := len(app.elevatorWaitFloorEnablePins); n > 0 {
+		return n
+	}
+	if app.GPIOSettings.ElevatorEnableRelayPin != 0 {
+		return 1
+	}
+	return 0
+}
+
 func pairedEntryPublishesToPeer(mode, pairRole string) bool {
 	return mode == ModeAccessPairedRemoteExit && strings.EqualFold(pairRole, PairPeerRoleEntry)
 }
@@ -130,6 +170,13 @@ func pairedExitSubscribesToPeer(mode, pairRole string) bool {
 
 // GPIOSettings holds BCM pin numbers and relay polarity (wiring on the Pi).
 type GPIOSettings struct {
+	// RelayOutputMode: RelayOutputGPIO (door/buzzer/elevator relays on BCM) or RelayOutputMCP23017 (relays on I2C MCP23017, pins 0–15).
+	RelayOutputMode string
+	// MCP23017I2CBus: Linux I2C adapter index (/dev/i2c-<n>), default 1 on Raspberry Pi.
+	MCP23017I2CBus int
+	// MCP23017I2CAddr: 7-bit MCP23017 address, default 0x20 (decimal 32).
+	MCP23017I2CAddr uint8
+
 	DoorRelayPin         uint8
 	DoorRelayActiveLow   bool
 	BuzzerRelayPin       uint8
@@ -142,12 +189,18 @@ type GPIOSettings struct {
 	// EntryButtonPin: inside entry request (mode access_exit_with_entry_button). 0 = disabled.
 	EntryButtonPin       uint8
 	EntryButtonActiveLow bool
-	// ElevatorDispatchRelayPin: pulse for floor dispatch; 0 = use door relay in elevator modes.
+	// ElevatorDispatchRelayPin: single shared dispatch relay when not using per-floor pins; 0 = use door relay in elevator modes.
 	ElevatorDispatchRelayPin       uint8
 	ElevatorDispatchActiveLow      bool
-	// ElevatorEnableRelayPin: hold ON while waiting for cab floor buttons (mode elevator_wait_floor_buttons). 0 = skip.
+	// ElevatorEnableRelayPin: elevator_wait_floor_buttons legacy single relay when elevator_wait_floor_enable_pins is empty—restores ground (or common) for all allowed cab buttons together. 0 = skip.
 	ElevatorEnableRelayPin       uint8
 	ElevatorEnableActiveLow      bool
+	// ElevatorFloorDispatchPins: per-floor dispatch outputs (pulse floor call). elevator_wait_floor_buttons + cab sense: one per elevator_floor_input_pins; + cab ignore: one per wait-floor enable channel. elevator_predefined_floor: at most one entry when no cab inputs; empty = use elevator_dispatch_relay_pin / door.
+	ElevatorFloorDispatchPins string
+	// ElevatorWaitFloorEnablePins: elevator_wait_floor_buttons only—comma relay pins that reconnect ground to each cab floor button; with cab sense count must match elevator_floor_input_pins; with cab ignore count is the number of enabled floors (no cab inputs). Empty = use ElevatorEnableRelayPin only.
+	ElevatorWaitFloorEnablePins string
+	// ElevatorPredefinedEnablePins: elevator_predefined_floor only—at most one relay that pulses to simulate the single floor call (buttons removed at panel). Not used in wait-floor mode.
+	ElevatorPredefinedEnablePins string
 }
 
 // AppContext holds our global connections and configurations
@@ -183,6 +236,15 @@ type AppContext struct {
 	// Dual USB keypad: in-memory occupancy per PIN (entry adds, exit subtracts). Reset on process restart.
 	occupancyMu    sync.Mutex
 	occupancyByPIN map[string]int
+
+	// elevatorFloorDispatchPins: parsed from GPIOSettings.ElevatorFloorDispatchPins; len matches cab floor inputs when non-empty.
+	elevatorFloorDispatchPins []uint8
+	// elevatorPredefinedEnablePins: parsed from GPIOSettings.ElevatorPredefinedEnablePins; at most one pin in predefined mode.
+	elevatorPredefinedEnablePins []uint8
+	// elevatorWaitFloorEnablePins: parsed from GPIOSettings.ElevatorWaitFloorEnablePins; len matches cab floor inputs when set.
+	elevatorWaitFloorEnablePins []uint8
+	// elevatorParameterModesDoc: optional JSON subtree from elevator_parameter_modes; documentation only, preserved on cfg save.
+	elevatorParameterModesDoc json.RawMessage
 }
 
 // logEmitMinSeverity: emit log lines whose severity is >= this (0=DEBUG all, 1=INFO+, 2=WARNING+, 3=ERROR+, 4=CRITICAL only).
@@ -253,7 +315,7 @@ type DeviceConfig struct {
 	WebhookHeartbeatTokenEnabled bool
 	WebhookHeartbeatToken        string
 
-	// KeypadOperationMode: ModeAccess* / ModeElevator* string values (access_*, elevator_* in JSON).
+	// KeypadOperationMode: ModeAccess* / ModeElevator* (see ModeElevatorWaitFloorButtons / ModeElevatorPredefinedFloor comments).
 	KeypadOperationMode string
 	// KeypadEvdevPath: Linux evdev device for primary USB keypad (default /dev/input/event1).
 	KeypadEvdevPath string
@@ -264,23 +326,32 @@ type DeviceConfig struct {
 	// MQTTPairPeerTopic: entry unit publishes unlock hint; exit unit subscribes and pulses door.
 	MQTTPairPeerTopic string
 	PairPeerToken      string
-	// ElevatorFloorWaitTimeout: after valid PIN, wait this long for a floor sense GPIO (elevator_wait_floor_buttons).
+	// ElevatorFloorWaitTimeout: elevator_wait_floor_buttons — after valid PIN, how long enable relays stay on; with cab sense, also the window to read elevator_floor_input_pins.
 	ElevatorFloorWaitTimeout time.Duration
-	// ElevatorFloorInputPins: comma-separated BCM numbers wired to cab floor buttons (active low when pressed).
+	// ElevatorWaitFloorCabSense: elevator_wait_floor_buttons — sense (default): configure and read elevator_floor_input_pins, log selection, pulse dispatch. ignore: leave elevator_floor_input_pins empty; no cab GPIO; timeout only clears enables.
+	ElevatorWaitFloorCabSense string
+	// ElevatorFloorInputPins: BCM inputs wired to in-cab floor buttons (active low when pressed); used when elevator_wait_floor_cab_sense is sense (default).
 	ElevatorFloorInputPins string
-	// ElevatorPredefinedFloor: logical floor number for logs/webhooks (elevator_predefined_floor).
+	// ElevatorPredefinedFloor: in elevator_predefined_floor, index into ElevatorPredefinedFloors when that list has one entry (usually 0); else legacy logical floor label for logs only.
 	ElevatorPredefinedFloor int
-	// ElevatorDispatchPulseDuration: pulse length for dispatch output (defaults to relay_pulse_duration).
+	// ElevatorPredefinedFloors: at most one logical floor label for elevator_predefined_floor; must match gpio.elevator_predefined_enable_pins when that list is set. Empty = legacy single-floor (dispatch index from ElevatorPredefinedFloor only).
+	ElevatorPredefinedFloors []int
+	// ElevatorDispatchPulseDuration: default pulse for elevator dispatch (single relay or per-floor pad).
 	ElevatorDispatchPulseDuration time.Duration
+	// ElevatorFloorDispatchPulseDurations: per-index pulse lengths when gpio.elevator_floor_dispatch_pins is set (order matches cab inputs in wait-floor mode, or predefined floors when no cab inputs); shorter lists pad with ElevatorDispatchPulseDuration.
+	ElevatorFloorDispatchPulseDurations []time.Duration
+	// ElevatorEnablePulseDuration: elevator_predefined_floor: pulse length for elevator_predefined_enable_0 when >0 (ignored for elevator_wait_floor_buttons; wait enables stay on until floor selected or elevator_floor_wait_timeout).
+	ElevatorEnablePulseDuration time.Duration
 	// DualKeypadRejectExitWithoutEntry: in access_dual_usb_keypad, valid PIN on exit with no matching entry count rejects (no door pulse); default false warns only.
 	DualKeypadRejectExitWithoutEntry bool
 }
 
 // virtualkeyz2JSON is the on-disk shape of virtualkeyz2.json (see default file in repo).
 type virtualkeyz2JSON struct {
-	Device         virtualkeyz2DeviceJSON `json:"device"`
-	GPIO           virtualkeyz2GPIOJSON   `json:"gpio"`
-	TechMenuPrompt *string                `json:"tech_menu_prompt"`
+	Device                 virtualkeyz2DeviceJSON `json:"device"`
+	GPIO                   virtualkeyz2GPIOJSON   `json:"gpio"`
+	TechMenuPrompt         *string                `json:"tech_menu_prompt"`
+	ElevatorParameterModes json.RawMessage        `json:"elevator_parameter_modes,omitempty"`
 }
 
 type virtualkeyz2DeviceJSON struct {
@@ -329,13 +400,20 @@ type virtualkeyz2DeviceJSON struct {
 	MQTTPairPeerTopic            *string `json:"mqtt_pair_peer_topic"`
 	PairPeerToken                *string `json:"pair_peer_token"`
 	ElevatorFloorWaitTimeout     *string `json:"elevator_floor_wait_timeout"`
+	ElevatorWaitFloorCabSense    *string `json:"elevator_wait_floor_cab_sense"`
 	ElevatorFloorInputPins       *string `json:"elevator_floor_input_pins"`
 	ElevatorPredefinedFloor      *int    `json:"elevator_predefined_floor"`
+	ElevatorPredefinedFloors     *string `json:"elevator_predefined_floors"`
 	ElevatorDispatchPulseDuration        *string `json:"elevator_dispatch_pulse_duration"`
+	ElevatorFloorDispatchPulseDurations  *string `json:"elevator_floor_dispatch_pulse_durations"`
+	ElevatorEnablePulseDuration          *string `json:"elevator_enable_pulse_duration"`
 	DualKeypadRejectExitWithoutEntry    *bool   `json:"dual_keypad_reject_exit_without_entry"`
 }
 
 type virtualkeyz2GPIOJSON struct {
+	RelayOutputMode               *string `json:"relay_output_mode"`
+	MCP23017I2CBus                *int    `json:"mcp23017_i2c_bus"`
+	MCP23017I2CAddr               *int    `json:"mcp23017_i2c_addr"`
 	DoorRelayPin                  *int  `json:"door_relay_pin"`
 	DoorRelayActiveLow            *bool `json:"door_relay_active_low"`
 	BuzzerRelayPin                *int  `json:"buzzer_relay_pin"`
@@ -350,6 +428,9 @@ type virtualkeyz2GPIOJSON struct {
 	ElevatorDispatchActiveLow     *bool `json:"elevator_dispatch_active_low"`
 	ElevatorEnableRelayPin        *int  `json:"elevator_enable_relay_pin"`
 	ElevatorEnableActiveLow       *bool `json:"elevator_enable_active_low"`
+	ElevatorFloorDispatchPins     *string `json:"elevator_floor_dispatch_pins"`
+	ElevatorPredefinedEnablePins  *string `json:"elevator_predefined_enable_pins"`
+	ElevatorWaitFloorEnablePins   *string `json:"elevator_wait_floor_enable_pins"`
 }
 
 func bcmUint8(field string, v int) (uint8, error) {
@@ -357,6 +438,278 @@ func bcmUint8(field string, v int) (uint8, error) {
 		return 0, fmt.Errorf("gpio.%s: BCM pin %d out of range 0-40", field, v)
 	}
 	return uint8(v), nil
+}
+
+func normalizeRelayOutputMode(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", RelayOutputGPIO, "direct", "bcm":
+		return RelayOutputGPIO
+	case RelayOutputMCP23017, "mcp", "i2c":
+		return RelayOutputMCP23017
+	default:
+		return RelayOutputGPIO
+	}
+}
+
+func isRelayOutputMCP23017(mode string) bool {
+	return normalizeRelayOutputMode(mode) == RelayOutputMCP23017
+}
+
+func relayPinUint8(field string, v int, relayMode string) (uint8, error) {
+	if isRelayOutputMCP23017(relayMode) {
+		if v < 0 || v > 15 {
+			return 0, fmt.Errorf("gpio.%s: MCP23017 port pin %d out of range 0-15", field, v)
+		}
+		return uint8(v), nil
+	}
+	return bcmUint8(field, v)
+}
+
+func normalizeGPIORelaySettings(g *GPIOSettings) {
+	g.RelayOutputMode = normalizeRelayOutputMode(g.RelayOutputMode)
+	if g.MCP23017I2CBus <= 0 {
+		g.MCP23017I2CBus = 1
+	}
+	if g.MCP23017I2CAddr == 0 {
+		g.MCP23017I2CAddr = 0x20
+	}
+}
+
+func elevatorCabFloorCount(s string) int {
+	pins, err := parseBCMPinList(s)
+	if err != nil {
+		return 0
+	}
+	return len(pins)
+}
+
+func parseRelayPinUint8List(field, s string, relayMode string) ([]uint8, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	var out []uint8
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("gpio.%s: invalid integer %q: %w", field, p, err)
+		}
+		u, err := relayPinUint8(field, n, relayMode)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, nil
+}
+
+func parseCommaDurationList(section, field, s string) ([]time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	var out []time.Duration
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		d, err := time.ParseDuration(p)
+		if err != nil {
+			return nil, fmt.Errorf("%s.%s: invalid duration %q: %w", section, field, p, err)
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+func elevatorFloorDispatchOutputName(i int) string {
+	return fmt.Sprintf("elevator_floor_dispatch_%d", i)
+}
+
+func elevatorPredefinedEnableOutputName(i int) string {
+	return fmt.Sprintf("elevator_predefined_enable_%d", i)
+}
+
+func elevatorWaitFloorEnableOutputName(i int) string {
+	return fmt.Sprintf("elevator_wait_floor_enable_%d", i)
+}
+
+func parseCommaIntList(section, field, s string) ([]int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	var out []int
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("%s.%s: invalid integer %q: %w", section, field, p, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func formatIntList(nums []int) string {
+	if len(nums) == 0 {
+		return ""
+	}
+	parts := make([]string, len(nums))
+	for i, n := range nums {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, ",")
+}
+
+func syncElevatorFloorDispatchPulseDurations(app *AppContext) {
+	nDisp := len(app.elevatorFloorDispatchPins)
+	if nDisp == 0 {
+		app.Config.ElevatorFloorDispatchPulseDurations = nil
+		return
+	}
+	def := app.Config.ElevatorDispatchPulseDuration
+	if def <= 0 {
+		def = 400 * time.Millisecond
+	}
+	src := app.Config.ElevatorFloorDispatchPulseDurations
+	out := make([]time.Duration, nDisp)
+	for i := 0; i < nDisp; i++ {
+		if i < len(src) && src[i] > 0 {
+			out[i] = clampDuration(src[i], 50*time.Millisecond, 60*time.Second)
+		} else {
+			out[i] = clampDuration(def, 50*time.Millisecond, 60*time.Second)
+		}
+	}
+	app.Config.ElevatorFloorDispatchPulseDurations = out
+}
+
+func validateElevatorFloorDispatchLayout(app *AppContext) error {
+	nDisp := len(app.elevatorFloorDispatchPins)
+	if nDisp == 0 {
+		return nil
+	}
+	mode := NormalizeKeypadOperationMode(app.Config.KeypadOperationMode)
+	if mode == ModeElevatorWaitFloorButtons && !elevatorWaitFloorSenseCabInputs(app.Config) {
+		nEn := elevatorWaitFloorEnableChannelCount(app)
+		if nEn == 0 {
+			return fmt.Errorf("gpio.elevator_floor_dispatch_pins: set gpio.elevator_wait_floor_enable_pins or gpio.elevator_enable_relay_pin before using per-floor dispatch when device.elevator_wait_floor_cab_sense is ignore")
+		}
+		if nDisp != nEn {
+			return fmt.Errorf("gpio.elevator_floor_dispatch_pins: %d entries must match %d wait-floor enable channel(s) when device.elevator_wait_floor_cab_sense is ignore", nDisp, nEn)
+		}
+		return nil
+	}
+	nCab := elevatorCabFloorCount(app.Config.ElevatorFloorInputPins)
+	nPre := len(app.Config.ElevatorPredefinedFloors)
+	if nCab > 0 {
+		if nDisp != nCab {
+			return fmt.Errorf("gpio.elevator_floor_dispatch_pins: %d entries must match elevator_floor_input_pins (%d)", nDisp, nCab)
+		}
+		return nil
+	}
+	if nPre > 0 {
+		if nDisp != nPre {
+			return fmt.Errorf("gpio.elevator_floor_dispatch_pins: %d entries must match elevator_predefined_floors (%d) when there are no cab input pins", nDisp, nPre)
+		}
+		return nil
+	}
+	if mode == ModeElevatorPredefinedFloor && nDisp <= 1 {
+		return nil
+	}
+	return fmt.Errorf("gpio.elevator_floor_dispatch_pins: %d entries require matching elevator_floor_input_pins, or (no cab inputs) matching elevator_predefined_floors count (%d), or at most one pin in elevator_predefined_floor when predefined floors list is empty", nDisp, nPre)
+}
+
+func validateElevatorPredefinedFloorsLayout(app *AppContext) error {
+	nF := len(app.Config.ElevatorPredefinedFloors)
+	nE := len(app.elevatorPredefinedEnablePins)
+	if nF > 1 {
+		return fmt.Errorf("device.elevator_predefined_floors: at most one floor in elevator_predefined_floor mode")
+	}
+	if nE > 1 {
+		return fmt.Errorf("gpio.elevator_predefined_enable_pins: at most one relay in elevator_predefined_floor mode")
+	}
+	if nF == 0 && nE == 0 {
+		return nil
+	}
+	if nF != nE {
+		return fmt.Errorf("device.elevator_predefined_floors (%d values) must match gpio.elevator_predefined_enable_pins (%d)", nF, nE)
+	}
+	nDisp := len(app.elevatorFloorDispatchPins)
+	nCab := elevatorCabFloorCount(app.Config.ElevatorFloorInputPins)
+	if nDisp > 0 && nF > 0 && nCab == 0 && nDisp != nF {
+		return fmt.Errorf("gpio.elevator_floor_dispatch_pins (%d) must match elevator_predefined_floors (%d) when there are no cab input pins", nDisp, nF)
+	}
+	if nF == 1 && nCab == 0 && nDisp > 1 {
+		return fmt.Errorf("gpio.elevator_floor_dispatch_pins: at most one entry when device.elevator_predefined_floors has one floor and there are no cab inputs")
+	}
+	return nil
+}
+
+func validateElevatorWaitFloorEnableLayout(app *AppContext) error {
+	if len(app.elevatorPredefinedEnablePins) > 0 {
+		return fmt.Errorf("gpio.elevator_predefined_enable_pins is only for elevator_predefined_floor; clear it or set gpio.elevator_wait_floor_enable_pins for per-floor ground-return relays")
+	}
+	nW := len(app.elevatorWaitFloorEnablePins)
+	if elevatorWaitFloorSenseCabInputs(app.Config) {
+		if nW == 0 {
+			return nil
+		}
+		if app.GPIOSettings.ElevatorEnableRelayPin != 0 {
+			return fmt.Errorf("use either gpio.elevator_wait_floor_enable_pins or gpio.elevator_enable_relay_pin, not both")
+		}
+		nCab := elevatorCabFloorCount(app.Config.ElevatorFloorInputPins)
+		if nCab == 0 {
+			return fmt.Errorf("gpio.elevator_wait_floor_enable_pins requires device.elevator_floor_input_pins (same entry count) when device.elevator_wait_floor_cab_sense is sense")
+		}
+		if nW != nCab {
+			return fmt.Errorf("gpio.elevator_wait_floor_enable_pins: %d entries must match elevator_floor_input_pins (%d)", nW, nCab)
+		}
+		return nil
+	}
+	// Cab sense ignore: no BCM cab inputs; enable channel count comes only from relay lists.
+	if strings.TrimSpace(app.Config.ElevatorFloorInputPins) != "" {
+		return fmt.Errorf("device.elevator_floor_input_pins must be empty when device.elevator_wait_floor_cab_sense is ignore")
+	}
+	if nW > 0 {
+		if app.GPIOSettings.ElevatorEnableRelayPin != 0 {
+			return fmt.Errorf("use either gpio.elevator_wait_floor_enable_pins or gpio.elevator_enable_relay_pin, not both")
+		}
+		return nil
+	}
+	if app.GPIOSettings.ElevatorEnableRelayPin == 0 {
+		return fmt.Errorf("device.elevator_wait_floor_cab_sense ignore: set gpio.elevator_wait_floor_enable_pins or gpio.elevator_enable_relay_pin")
+	}
+	return nil
+}
+
+func dispatchPulseDurationForFloor(cfg DeviceConfig, idx int) time.Duration {
+	if idx >= 0 && idx < len(cfg.ElevatorFloorDispatchPulseDurations) {
+		return cfg.ElevatorFloorDispatchPulseDurations[idx]
+	}
+	return cfg.ElevatorDispatchPulseDuration
+}
+
+func formatDurationList(ds []time.Duration) string {
+	if len(ds) == 0 {
+		return ""
+	}
+	parts := make([]string, len(ds))
+	for i, d := range ds {
+		parts[i] = d.String()
+	}
+	return strings.Join(parts, ",")
 }
 
 func applyJSONDuration(dst *time.Duration, section, field string, s *string) error {
@@ -415,6 +768,11 @@ func normalizeKeypadAndPinUX(c *DeviceConfig) {
 
 func normalizeOperationModeConfig(c *DeviceConfig) {
 	c.KeypadOperationMode = NormalizeKeypadOperationMode(c.KeypadOperationMode)
+	if isElevatorWaitFloorMode(c.KeypadOperationMode) {
+		c.ElevatorWaitFloorCabSense = normalizeElevatorWaitFloorCabSense(c.ElevatorWaitFloorCabSense)
+	} else {
+		c.ElevatorWaitFloorCabSense = ""
+	}
 	c.PairPeerRole = normalizePairPeerRole(c.PairPeerRole)
 	if strings.TrimSpace(c.KeypadEvdevPath) == "" {
 		c.KeypadEvdevPath = "/dev/input/event1"
@@ -432,11 +790,24 @@ func normalizeOperationModeConfig(c *DeviceConfig) {
 	} else {
 		c.ElevatorDispatchPulseDuration = clampDuration(c.ElevatorDispatchPulseDuration, 50*time.Millisecond, 60*time.Second)
 	}
-	if c.ElevatorPredefinedFloor < 0 {
-		c.ElevatorPredefinedFloor = 0
+	if n := len(c.ElevatorPredefinedFloors); n > 0 {
+		if c.ElevatorPredefinedFloor < 0 {
+			c.ElevatorPredefinedFloor = 0
+		} else if c.ElevatorPredefinedFloor >= n {
+			c.ElevatorPredefinedFloor = n - 1
+		}
+	} else {
+		if c.ElevatorPredefinedFloor < 0 {
+			c.ElevatorPredefinedFloor = 0
+		}
+		if c.ElevatorPredefinedFloor > 255 {
+			c.ElevatorPredefinedFloor = 255
+		}
 	}
-	if c.ElevatorPredefinedFloor > 255 {
-		c.ElevatorPredefinedFloor = 255
+	if c.ElevatorEnablePulseDuration < 0 {
+		c.ElevatorEnablePulseDuration = 0
+	} else if c.ElevatorEnablePulseDuration > 0 {
+		c.ElevatorEnablePulseDuration = clampDuration(c.ElevatorEnablePulseDuration, 50*time.Millisecond, 60*time.Second)
 	}
 }
 
@@ -560,8 +931,26 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if err := applyJSONDuration(&app.Config.ElevatorFloorWaitTimeout, "device", "elevator_floor_wait_timeout", d.ElevatorFloorWaitTimeout); err != nil {
 		return err
 	}
+	if d.ElevatorWaitFloorCabSense != nil {
+		app.Config.ElevatorWaitFloorCabSense = strings.TrimSpace(*d.ElevatorWaitFloorCabSense)
+	}
 	if err := applyJSONDuration(&app.Config.ElevatorDispatchPulseDuration, "device", "elevator_dispatch_pulse_duration", d.ElevatorDispatchPulseDuration); err != nil {
 		return err
+	}
+	if d.ElevatorEnablePulseDuration != nil {
+		ev := strings.TrimSpace(*d.ElevatorEnablePulseDuration)
+		if ev == "" {
+			app.Config.ElevatorEnablePulseDuration = 0
+		} else if err := applyJSONDuration(&app.Config.ElevatorEnablePulseDuration, "device", "elevator_enable_pulse_duration", d.ElevatorEnablePulseDuration); err != nil {
+			return err
+		}
+	}
+	if d.ElevatorFloorDispatchPulseDurations != nil {
+		ds, err := parseCommaDurationList("device", "elevator_floor_dispatch_pulse_durations", *d.ElevatorFloorDispatchPulseDurations)
+		if err != nil {
+			return err
+		}
+		app.Config.ElevatorFloorDispatchPulseDurations = ds
 	}
 	if d.KeypadOperationMode != nil {
 		app.Config.KeypadOperationMode = *d.KeypadOperationMode
@@ -587,12 +976,35 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.ElevatorPredefinedFloor != nil {
 		app.Config.ElevatorPredefinedFloor = *d.ElevatorPredefinedFloor
 	}
+	if d.ElevatorPredefinedFloors != nil {
+		fl, err := parseCommaIntList("device", "elevator_predefined_floors", *d.ElevatorPredefinedFloors)
+		if err != nil {
+			return err
+		}
+		app.Config.ElevatorPredefinedFloors = fl
+	}
 	if d.DualKeypadRejectExitWithoutEntry != nil {
 		app.Config.DualKeypadRejectExitWithoutEntry = *d.DualKeypadRejectExitWithoutEntry
 	}
 	g := &raw.GPIO
+	if g.RelayOutputMode != nil {
+		app.GPIOSettings.RelayOutputMode = strings.TrimSpace(*g.RelayOutputMode)
+	}
+	if g.MCP23017I2CBus != nil {
+		app.GPIOSettings.MCP23017I2CBus = *g.MCP23017I2CBus
+	}
+	if g.MCP23017I2CAddr != nil {
+		a := *g.MCP23017I2CAddr
+		if a < 0 || a > 255 {
+			return fmt.Errorf("gpio.mcp23017_i2c_addr: %d out of range 0-255", a)
+		}
+		app.GPIOSettings.MCP23017I2CAddr = uint8(a)
+	}
+	normalizeGPIORelaySettings(&app.GPIOSettings)
+	relayMode := normalizeRelayOutputMode(app.GPIOSettings.RelayOutputMode)
+
 	if g.DoorRelayPin != nil {
-		u, err := bcmUint8("door_relay_pin", *g.DoorRelayPin)
+		u, err := relayPinUint8("door_relay_pin", *g.DoorRelayPin, relayMode)
 		if err != nil {
 			return err
 		}
@@ -602,7 +1014,7 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 		app.GPIOSettings.DoorRelayActiveLow = *g.DoorRelayActiveLow
 	}
 	if g.BuzzerRelayPin != nil {
-		u, err := bcmUint8("buzzer_relay_pin", *g.BuzzerRelayPin)
+		u, err := relayPinUint8("buzzer_relay_pin", *g.BuzzerRelayPin, relayMode)
 		if err != nil {
 			return err
 		}
@@ -646,7 +1058,7 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 		app.GPIOSettings.EntryButtonActiveLow = *g.EntryButtonActiveLow
 	}
 	if g.ElevatorDispatchRelayPin != nil {
-		u, err := bcmUint8("elevator_dispatch_relay_pin", *g.ElevatorDispatchRelayPin)
+		u, err := relayPinUint8("elevator_dispatch_relay_pin", *g.ElevatorDispatchRelayPin, relayMode)
 		if err != nil {
 			return err
 		}
@@ -656,7 +1068,7 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 		app.GPIOSettings.ElevatorDispatchActiveLow = *g.ElevatorDispatchActiveLow
 	}
 	if g.ElevatorEnableRelayPin != nil {
-		u, err := bcmUint8("elevator_enable_relay_pin", *g.ElevatorEnableRelayPin)
+		u, err := relayPinUint8("elevator_enable_relay_pin", *g.ElevatorEnableRelayPin, relayMode)
 		if err != nil {
 			return err
 		}
@@ -665,10 +1077,64 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if g.ElevatorEnableActiveLow != nil {
 		app.GPIOSettings.ElevatorEnableActiveLow = *g.ElevatorEnableActiveLow
 	}
+	if g.ElevatorFloorDispatchPins != nil {
+		app.GPIOSettings.ElevatorFloorDispatchPins = strings.TrimSpace(*g.ElevatorFloorDispatchPins)
+	}
+	efPins, err := parseRelayPinUint8List("elevator_floor_dispatch_pins", app.GPIOSettings.ElevatorFloorDispatchPins, relayMode)
+	if err != nil {
+		return err
+	}
+	app.elevatorFloorDispatchPins = efPins
+	if g.ElevatorPredefinedEnablePins != nil {
+		app.GPIOSettings.ElevatorPredefinedEnablePins = strings.TrimSpace(*g.ElevatorPredefinedEnablePins)
+	}
+	preEn, err := parseRelayPinUint8List("elevator_predefined_enable_pins", app.GPIOSettings.ElevatorPredefinedEnablePins, relayMode)
+	if err != nil {
+		return err
+	}
+	app.elevatorPredefinedEnablePins = preEn
+	if g.ElevatorWaitFloorEnablePins != nil {
+		app.GPIOSettings.ElevatorWaitFloorEnablePins = strings.TrimSpace(*g.ElevatorWaitFloorEnablePins)
+	}
+	wfe, err := parseRelayPinUint8List("elevator_wait_floor_enable_pins", app.GPIOSettings.ElevatorWaitFloorEnablePins, relayMode)
+	if err != nil {
+		return err
+	}
+	app.elevatorWaitFloorEnablePins = wfe
 	if raw.TechMenuPrompt != nil {
 		app.TechMenuPrompt = *raw.TechMenuPrompt
 	}
+	if len(raw.ElevatorParameterModes) > 0 {
+		app.elevatorParameterModesDoc = append(json.RawMessage(nil), raw.ElevatorParameterModes...)
+	} else {
+		app.elevatorParameterModesDoc = nil
+	}
 	normalizeKeypadAndPinUX(&app.Config)
+	syncElevatorFloorDispatchPulseDurations(app)
+	if err := validateElevatorConfigsForMode(app); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateElevatorConfigsForMode(app *AppContext) error {
+	if err := validateElevatorFloorDispatchLayout(app); err != nil {
+		return err
+	}
+	mode := NormalizeKeypadOperationMode(app.Config.KeypadOperationMode)
+	if mode == ModeElevatorPredefinedFloor {
+		if len(app.elevatorWaitFloorEnablePins) > 0 {
+			return fmt.Errorf("gpio.elevator_wait_floor_enable_pins applies only to elevator_wait_floor_buttons")
+		}
+		if err := validateElevatorPredefinedFloorsLayout(app); err != nil {
+			return err
+		}
+	}
+	if mode == ModeElevatorWaitFloorButtons {
+		if err := validateElevatorWaitFloorEnableLayout(app); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -695,9 +1161,10 @@ func loadVirtualKeyz2Config(path string, app *AppContext) error {
 
 // virtualkeyz2PersistFile is the full JSON document written by cfg save.
 type virtualkeyz2PersistFile struct {
-	Device         virtualkeyz2PersistDevice `json:"device"`
-	GPIO           virtualkeyz2PersistGPIO   `json:"gpio"`
-	TechMenuPrompt string                    `json:"tech_menu_prompt"`
+	Device                 virtualkeyz2PersistDevice `json:"device"`
+	GPIO                   virtualkeyz2PersistGPIO   `json:"gpio"`
+	TechMenuPrompt         string                    `json:"tech_menu_prompt"`
+	ElevatorParameterModes json.RawMessage           `json:"elevator_parameter_modes,omitempty"`
 }
 
 type virtualkeyz2PersistDevice struct {
@@ -746,13 +1213,20 @@ type virtualkeyz2PersistDevice struct {
 	MQTTPairPeerTopic            string `json:"mqtt_pair_peer_topic"`
 	PairPeerToken                string `json:"pair_peer_token"`
 	ElevatorFloorWaitTimeout     string `json:"elevator_floor_wait_timeout"`
+	ElevatorWaitFloorCabSense    string `json:"elevator_wait_floor_cab_sense,omitempty"`
 	ElevatorFloorInputPins       string `json:"elevator_floor_input_pins"`
 	ElevatorPredefinedFloor      int    `json:"elevator_predefined_floor"`
+	ElevatorPredefinedFloors     string `json:"elevator_predefined_floors"`
 	ElevatorDispatchPulseDuration        string `json:"elevator_dispatch_pulse_duration"`
+	ElevatorFloorDispatchPulseDurations  string `json:"elevator_floor_dispatch_pulse_durations"`
+	ElevatorEnablePulseDuration          string `json:"elevator_enable_pulse_duration"`
 	DualKeypadRejectExitWithoutEntry     bool   `json:"dual_keypad_reject_exit_without_entry"`
 }
 
 type virtualkeyz2PersistGPIO struct {
+	RelayOutputMode           string `json:"relay_output_mode"`
+	MCP23017I2CBus            int    `json:"mcp23017_i2c_bus"`
+	MCP23017I2CAddr           int    `json:"mcp23017_i2c_addr"`
 	DoorRelayPin              int  `json:"door_relay_pin"`
 	DoorRelayActiveLow        bool `json:"door_relay_active_low"`
 	BuzzerRelayPin            int  `json:"buzzer_relay_pin"`
@@ -767,6 +1241,9 @@ type virtualkeyz2PersistGPIO struct {
 	ElevatorDispatchActiveLow bool `json:"elevator_dispatch_active_low"`
 	ElevatorEnableRelayPin    int  `json:"elevator_enable_relay_pin"`
 	ElevatorEnableActiveLow   bool `json:"elevator_enable_active_low"`
+	ElevatorFloorDispatchPins    string `json:"elevator_floor_dispatch_pins"`
+	ElevatorPredefinedEnablePins string `json:"elevator_predefined_enable_pins"`
+	ElevatorWaitFloorEnablePins  string `json:"elevator_wait_floor_enable_pins"`
 }
 
 func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
@@ -821,10 +1298,27 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.MQTTPairPeerTopic = c.MQTTPairPeerTopic
 	out.Device.PairPeerToken = c.PairPeerToken
 	out.Device.ElevatorFloorWaitTimeout = c.ElevatorFloorWaitTimeout.String()
+	if isElevatorWaitFloorMode(NormalizeKeypadOperationMode(c.KeypadOperationMode)) {
+		if normalizeElevatorWaitFloorCabSense(c.ElevatorWaitFloorCabSense) == ElevatorWaitFloorCabSenseIgnore {
+			out.Device.ElevatorWaitFloorCabSense = ElevatorWaitFloorCabSenseIgnore
+		} else {
+			out.Device.ElevatorWaitFloorCabSense = ElevatorWaitFloorCabSenseSense
+		}
+	}
 	out.Device.ElevatorFloorInputPins = c.ElevatorFloorInputPins
 	out.Device.ElevatorPredefinedFloor = c.ElevatorPredefinedFloor
+	out.Device.ElevatorPredefinedFloors = formatIntList(c.ElevatorPredefinedFloors)
 	out.Device.ElevatorDispatchPulseDuration = c.ElevatorDispatchPulseDuration.String()
+	out.Device.ElevatorFloorDispatchPulseDurations = formatDurationList(c.ElevatorFloorDispatchPulseDurations)
+	if c.ElevatorEnablePulseDuration > 0 {
+		out.Device.ElevatorEnablePulseDuration = c.ElevatorEnablePulseDuration.String()
+	} else {
+		out.Device.ElevatorEnablePulseDuration = ""
+	}
 	out.Device.DualKeypadRejectExitWithoutEntry = c.DualKeypadRejectExitWithoutEntry
+	out.GPIO.RelayOutputMode = normalizeRelayOutputMode(g.RelayOutputMode)
+	out.GPIO.MCP23017I2CBus = g.MCP23017I2CBus
+	out.GPIO.MCP23017I2CAddr = int(g.MCP23017I2CAddr)
 	out.GPIO.DoorRelayPin = int(g.DoorRelayPin)
 	out.GPIO.DoorRelayActiveLow = g.DoorRelayActiveLow
 	out.GPIO.BuzzerRelayPin = int(g.BuzzerRelayPin)
@@ -839,6 +1333,12 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.GPIO.ElevatorDispatchActiveLow = g.ElevatorDispatchActiveLow
 	out.GPIO.ElevatorEnableRelayPin = int(g.ElevatorEnableRelayPin)
 	out.GPIO.ElevatorEnableActiveLow = g.ElevatorEnableActiveLow
+	out.GPIO.ElevatorFloorDispatchPins = g.ElevatorFloorDispatchPins
+	out.GPIO.ElevatorPredefinedEnablePins = g.ElevatorPredefinedEnablePins
+	out.GPIO.ElevatorWaitFloorEnablePins = g.ElevatorWaitFloorEnablePins
+	if len(app.elevatorParameterModesDoc) > 0 {
+		out.ElevatorParameterModes = app.elevatorParameterModesDoc
+	}
 	return out
 }
 
@@ -949,7 +1449,7 @@ func reloadVirtualKeyz2ConfigLive(ctx *AppContext) error {
 	ctx.configMu.Unlock()
 	registerTechMenuPrompt(prompt)
 	syncLogFilterFromConfigLevel(lvl)
-	log.Println("INFO: Configuration reloaded from disk (MQTT reconnecting; GPIO pin changes need a full restart).")
+	log.Println("INFO: Configuration reloaded from disk (MQTT reconnecting; GPIO / relay_output_mode changes need a full restart).")
 	ctx.reconnectMQTT()
 	ctx.techHistoryTrimToMax()
 	return nil
@@ -1111,11 +1611,33 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 			ctx.Config.TechMenuHistoryMax = int(n)
 			trimHistoryAfter = true
 		}
+	case "relay_output_mode":
+		ctx.GPIOSettings.RelayOutputMode = value
+		normalizeGPIORelaySettings(&ctx.GPIOSettings)
+	case "mcp23017_i2c_bus":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.GPIOSettings.MCP23017I2CBus = int(n)
+			normalizeGPIORelaySettings(&ctx.GPIOSettings)
+		}
+	case "mcp23017_i2c_addr":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			if n < 0 || n > 255 {
+				err = fmt.Errorf("mcp23017_i2c_addr %d out of range 0-255", n)
+			} else {
+				ctx.GPIOSettings.MCP23017I2CAddr = uint8(n)
+				normalizeGPIORelaySettings(&ctx.GPIOSettings)
+			}
+		}
 	case "door_relay_pin":
 		var n int64
 		n, err = strconv.ParseInt(value, 10, 32)
 		if err == nil {
-			ctx.GPIOSettings.DoorRelayPin, err = bcmUint8("door_relay_pin", int(n))
+			mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+			ctx.GPIOSettings.DoorRelayPin, err = relayPinUint8("door_relay_pin", int(n), mode)
 		}
 	case "door_relay_active_low":
 		ctx.GPIOSettings.DoorRelayActiveLow, err = strconv.ParseBool(value)
@@ -1123,7 +1645,8 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		var n int64
 		n, err = strconv.ParseInt(value, 10, 32)
 		if err == nil {
-			ctx.GPIOSettings.BuzzerRelayPin, err = bcmUint8("buzzer_relay_pin", int(n))
+			mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+			ctx.GPIOSettings.BuzzerRelayPin, err = relayPinUint8("buzzer_relay_pin", int(n), mode)
 		}
 	case "buzzer_relay_active_low":
 		ctx.GPIOSettings.BuzzerRelayActiveLow, err = strconv.ParseBool(value)
@@ -1189,6 +1712,20 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.PairPeerToken = value
 	case "elevator_floor_wait_timeout":
 		err = applyJSONDuration(&ctx.Config.ElevatorFloorWaitTimeout, "device", "elevator_floor_wait_timeout", &value)
+	case "elevator_wait_floor_cab_sense":
+		v := strings.TrimSpace(strings.ToLower(value))
+		if v == "" {
+			ctx.Config.ElevatorWaitFloorCabSense = ""
+		} else {
+			switch v {
+			case "sense", "on", "true", "yes":
+				ctx.Config.ElevatorWaitFloorCabSense = ElevatorWaitFloorCabSenseSense
+			case "ignore", "off", "false", "no":
+				ctx.Config.ElevatorWaitFloorCabSense = ElevatorWaitFloorCabSenseIgnore
+			default:
+				err = fmt.Errorf("elevator_wait_floor_cab_sense: use sense or ignore, got %q", value)
+			}
+		}
 	case "elevator_floor_input_pins":
 		ctx.Config.ElevatorFloorInputPins = value
 	case "elevator_predefined_floor":
@@ -1197,8 +1734,41 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		if err == nil {
 			ctx.Config.ElevatorPredefinedFloor = int(n)
 		}
+	case "elevator_predefined_floors":
+		fl, perr := parseCommaIntList("device", "elevator_predefined_floors", value)
+		if perr != nil {
+			err = perr
+		} else {
+			ctx.Config.ElevatorPredefinedFloors = fl
+		}
 	case "elevator_dispatch_pulse_duration":
 		err = applyJSONDuration(&ctx.Config.ElevatorDispatchPulseDuration, "device", "elevator_dispatch_pulse_duration", &value)
+	case "elevator_floor_dispatch_pulse_durations":
+		ds, perr := parseCommaDurationList("device", "elevator_floor_dispatch_pulse_durations", value)
+		if perr != nil {
+			err = perr
+		} else {
+			ctx.Config.ElevatorFloorDispatchPulseDurations = ds
+		}
+	case "elevator_enable_pulse_duration":
+		ev := strings.TrimSpace(value)
+		if ev == "" {
+			ctx.Config.ElevatorEnablePulseDuration = 0
+		} else {
+			err = applyJSONDuration(&ctx.Config.ElevatorEnablePulseDuration, "device", "elevator_enable_pulse_duration", &value)
+		}
+	case "elevator_floor_dispatch_pins":
+		ctx.GPIOSettings.ElevatorFloorDispatchPins = strings.TrimSpace(value)
+		mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+		ctx.elevatorFloorDispatchPins, err = parseRelayPinUint8List("elevator_floor_dispatch_pins", ctx.GPIOSettings.ElevatorFloorDispatchPins, mode)
+	case "elevator_predefined_enable_pins":
+		ctx.GPIOSettings.ElevatorPredefinedEnablePins = strings.TrimSpace(value)
+		mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+		ctx.elevatorPredefinedEnablePins, err = parseRelayPinUint8List("elevator_predefined_enable_pins", ctx.GPIOSettings.ElevatorPredefinedEnablePins, mode)
+	case "elevator_wait_floor_enable_pins":
+		ctx.GPIOSettings.ElevatorWaitFloorEnablePins = strings.TrimSpace(value)
+		mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+		ctx.elevatorWaitFloorEnablePins, err = parseRelayPinUint8List("elevator_wait_floor_enable_pins", ctx.GPIOSettings.ElevatorWaitFloorEnablePins, mode)
 	case "exit_button_pin":
 		var n int64
 		n, err = strconv.ParseInt(value, 10, 32)
@@ -1219,7 +1789,8 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		var n int64
 		n, err = strconv.ParseInt(value, 10, 32)
 		if err == nil {
-			ctx.GPIOSettings.ElevatorDispatchRelayPin, err = bcmUint8("elevator_dispatch_relay_pin", int(n))
+			mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+			ctx.GPIOSettings.ElevatorDispatchRelayPin, err = relayPinUint8("elevator_dispatch_relay_pin", int(n), mode)
 		}
 	case "elevator_dispatch_active_low":
 		ctx.GPIOSettings.ElevatorDispatchActiveLow, err = strconv.ParseBool(value)
@@ -1227,7 +1798,8 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		var n int64
 		n, err = strconv.ParseInt(value, 10, 32)
 		if err == nil {
-			ctx.GPIOSettings.ElevatorEnableRelayPin, err = bcmUint8("elevator_enable_relay_pin", int(n))
+			mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+			ctx.GPIOSettings.ElevatorEnableRelayPin, err = relayPinUint8("elevator_enable_relay_pin", int(n), mode)
 		}
 	case "elevator_enable_active_low":
 		ctx.GPIOSettings.ElevatorEnableActiveLow, err = strconv.ParseBool(value)
@@ -1240,6 +1812,10 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		return err
 	}
 	normalizeKeypadAndPinUX(&ctx.Config)
+	syncElevatorFloorDispatchPulseDurations(ctx)
+	if err := validateElevatorConfigsForMode(ctx); err != nil {
+		return err
+	}
 	if key == "log_level" {
 		syncLogFilterFromConfigLevel(ctx.Config.LogLevel)
 	}
@@ -1311,26 +1887,36 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   webhook_heartbeat_url             URL for heartbeat callbacks
   webhook_heartbeat_token_enabled   true|false Bearer token on heartbeat POST
   webhook_heartbeat_token           secret when heartbeat token enabled
-  keypad_operation_mode             access_entry|access_exit|access_entry_with_exit_button|access_exit_with_entry_button|access_dual_usb_keypad|access_paired_remote_exit|elevator_wait_floor_buttons|elevator_predefined_floor
+  keypad_operation_mode             access_* modes | elevator_wait_floor_buttons (see elevator_wait_floor_cab_sense) | elevator_predefined_floor (one relay pulse simulates floor call; cab buttons not used)
   keypad_evdev_path                 e.g. /dev/input/event1
   keypad_exit_evdev_path            second keypad for access_dual_usb_keypad
   pair_peer_role                    none|entry|exit (with access_paired_remote_exit + mqtt_pair_peer_topic)
   mqtt_pair_peer_topic              exit unit subscribes; entry unit publishes after PIN
   pair_peer_token                   optional shared secret in pair JSON
-  elevator_floor_wait_timeout       5s–600s wait for cab floor GPIOs
-  elevator_floor_input_pins         comma BCM list e.g. 17,27,22
-  elevator_predefined_floor         logical floor for logs (elevator_predefined_floor mode)
-  elevator_dispatch_pulse_duration  pulse for elevator_dispatch relay or door fallback
+  elevator_floor_wait_timeout       5s–600s enable relay hold (elevator_wait_floor_buttons); with cab sense, window to read floor inputs
+  elevator_wait_floor_cab_sense     elevator_wait_floor_buttons: sense (default) or ignore — ignore = no elevator_floor_input_pins, no floor logging/dispatch from GPIO
+  elevator_floor_input_pins         comma BCM cab floor sense inputs; used only when elevator_wait_floor_cab_sense is sense (default)
+  elevator_predefined_floors        at most one logical floor label; must match elevator_predefined_enable_pins when set
+  elevator_predefined_floor         index into elevator_predefined_floors when set; else legacy logical floor label for logs only
+  elevator_dispatch_pulse_duration  default elevator dispatch pulse (single relay or pad for per-floor list)
+  elevator_floor_dispatch_pulse_durations  comma durations, one per cab floor (with elevator_floor_dispatch_pins); short lists pad with elevator_dispatch_pulse_duration
+  elevator_enable_pulse_duration   elevator_predefined_floor only: pulse length for predefined enable relay; wait-floor holds enables for full elevator_floor_wait_timeout (this key ignored there)
   dual_keypad_reject_exit_without_entry  true|false (dual USB: reject exit PIN if no entry recorded)
+  relay_output_mode                 gpio|mcp23017 (relays on BCM vs MCP23017; sensors/LED stay BCM)
+  mcp23017_i2c_bus                  Linux I2C bus number (default 1 = /dev/i2c-1)
+  mcp23017_i2c_addr                 7-bit address, default 32 (0x20)
   exit_button_pin                   REX GPIO (access_entry_with_exit_button)
   exit_button_active_low            true|false
   entry_button_pin                  GPIO (access_exit_with_entry_button)
   entry_button_active_low           true|false
-  elevator_dispatch_relay_pin       0 = use door relay for elevator pulse
+  elevator_dispatch_relay_pin       0 = use door relay when elevator_floor_dispatch_pins empty
   elevator_dispatch_active_low      true|false
-  elevator_enable_relay_pin       optional hold for cab enable (elevator wait-floor)
+  elevator_floor_dispatch_pins      wait-floor+cab sense: one per elevator_floor_input_pins. wait-floor+cab ignore: one per wait-floor enable channel. predefined: optional single dispatch when no cab inputs (or use elevator_dispatch_relay_pin)
+  elevator_wait_floor_enable_pins   wait-floor: ground-return relays; with cab sense one per elevator_floor_input_pins; with cab ignore one per enabled floor (empty = use elevator_enable_relay_pin)
+  elevator_predefined_enable_pins   predefined only: at most one relay that pulses to simulate the floor call
+  elevator_enable_relay_pin       wait-floor legacy: single relay for all cab floor buttons when elevator_wait_floor_enable_pins empty; not used with per-floor wait enables
   elevator_enable_active_low        true|false
-  door_relay_pin
+  door_relay_pin                    BCM 0-40, or MCP23017 pin 0-15 if relay_output_mode=mcp23017
   door_relay_active_low             true|false
   buzzer_relay_pin
   buzzer_relay_active_low           true|false
@@ -1419,12 +2005,15 @@ func main() {
 			KeypadEvdevPath:     "/dev/input/event1",
 		},
 		GPIOSettings: GPIOSettings{
-			DoorRelayPin:         5,
-			DoorRelayActiveLow:   false,
-			BuzzerRelayPin:       10,
+			RelayOutputMode:     RelayOutputGPIO,
+			MCP23017I2CBus:      1,
+			MCP23017I2CAddr:     0x20,
+			DoorRelayPin:        5,
+			DoorRelayActiveLow:  false,
+			BuzzerRelayPin:      10,
 			BuzzerRelayActiveLow: false,
-			DoorSensorPin:        7,
-			HeartbeatLEDPin:      26,
+			DoorSensorPin:       7,
+			HeartbeatLEDPin:     26,
 		},
 		PinDisplayDigits: make(chan int, 16),
 		TechMenuPrompt:   "MeSpace-Siam-5th-Floor-Right-Door",
@@ -1438,6 +2027,7 @@ func main() {
 	syncLogFilterFromConfigLevel(appCtx.Config.LogLevel)
 	registerTechMenuPrompt(appCtx.TechMenuPrompt)
 	log.Printf("INFO: Keypad operation mode: %s", NormalizeKeypadOperationMode(appCtx.Config.KeypadOperationMode))
+	log.Printf("INFO: Relay output mode: %s", normalizeRelayOutputMode(appCtx.GPIOSettings.RelayOutputMode))
 
 	// 4. Initialize Hardware IO (GPIO, Relays, Heartbeat LED) [cite: 1, 3]
 	err := rpio.Open()
@@ -1447,19 +2037,53 @@ func main() {
 		defer rpio.Close()
 		go manageHardwareHeartbeat(appCtx.GPIOSettings.HeartbeatLEDPin)
 		gpio := NewGPIOManager()
-		gpio.AddOutput("door", appCtx.GPIOSettings.DoorRelayPin, appCtx.GPIOSettings.DoorRelayActiveLow)
-		gpio.AddOutput("buzzer", appCtx.GPIOSettings.BuzzerRelayPin, appCtx.GPIOSettings.BuzzerRelayActiveLow)
-		if appCtx.GPIOSettings.ElevatorDispatchRelayPin != 0 {
-			gpio.AddOutput("elevator_dispatch", appCtx.GPIOSettings.ElevatorDispatchRelayPin, appCtx.GPIOSettings.ElevatorDispatchActiveLow)
+		relayMCPMode := isRelayOutputMCP23017(appCtx.GPIOSettings.RelayOutputMode)
+		useMCP := false
+		if relayMCPMode {
+			bus := appCtx.GPIOSettings.MCP23017I2CBus
+			addr := appCtx.GPIOSettings.MCP23017I2CAddr
+			mcpDev, mcpErr := mcp23017.Open(bus, addr)
+			if mcpErr != nil {
+				log.Printf("WARNING: MCP23017 relay backend (%s / 0x%02x): %v", fmt.Sprintf("/dev/i2c-%d", bus), addr, mcpErr)
+				log.Println("WARNING: Relay outputs disabled (mcp23017 mode but expander not available; pins 0-15 are not valid BCM numbers).")
+			} else {
+				gpio.SetMCP23017(mcpDev)
+				useMCP = true
+				defer mcpDev.Close()
+				log.Printf("INFO: Relay outputs on MCP23017 bus %d address 0x%02x (pins 0-15 = GPA0..GPB7).", bus, addr)
+			}
 		}
-		if appCtx.GPIOSettings.ElevatorEnableRelayPin != 0 {
-			gpio.AddOutput("elevator_enable", appCtx.GPIOSettings.ElevatorEnableRelayPin, appCtx.GPIOSettings.ElevatorEnableActiveLow)
+		if !relayMCPMode || useMCP {
+			gpio.AddOutput("door", appCtx.GPIOSettings.DoorRelayPin, appCtx.GPIOSettings.DoorRelayActiveLow, useMCP)
+			gpio.AddOutput("buzzer", appCtx.GPIOSettings.BuzzerRelayPin, appCtx.GPIOSettings.BuzzerRelayActiveLow, useMCP)
+			if len(appCtx.elevatorFloorDispatchPins) > 0 {
+				for i, pin := range appCtx.elevatorFloorDispatchPins {
+					gpio.AddOutput(elevatorFloorDispatchOutputName(i), pin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useMCP)
+				}
+			} else if appCtx.GPIOSettings.ElevatorDispatchRelayPin != 0 {
+				gpio.AddOutput("elevator_dispatch", appCtx.GPIOSettings.ElevatorDispatchRelayPin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useMCP)
+			}
+			if len(appCtx.elevatorPredefinedEnablePins) > 0 {
+				for i, pin := range appCtx.elevatorPredefinedEnablePins {
+					gpio.AddOutput(elevatorPredefinedEnableOutputName(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useMCP)
+				}
+			}
+			if len(appCtx.elevatorWaitFloorEnablePins) > 0 {
+				for i, pin := range appCtx.elevatorWaitFloorEnablePins {
+					gpio.AddOutput(elevatorWaitFloorEnableOutputName(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useMCP)
+				}
+			} else if appCtx.GPIOSettings.ElevatorEnableRelayPin != 0 {
+				gpio.AddOutput("elevator_enable", appCtx.GPIOSettings.ElevatorEnableRelayPin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useMCP)
+			}
 		}
 		gpio.ConfigureDoorSensor(appCtx.GPIOSettings.DoorSensorPin)
-		if pins, err := parseBCMPinList(appCtx.Config.ElevatorFloorInputPins); err == nil && len(pins) > 0 {
-			gpio.ConfigureElevatorFloorPins(pins)
-		} else if err != nil && strings.TrimSpace(appCtx.Config.ElevatorFloorInputPins) != "" {
-			log.Printf("WARNING: elevator_floor_input_pins: %v", err)
+		waitMode := NormalizeKeypadOperationMode(appCtx.Config.KeypadOperationMode) == ModeElevatorWaitFloorButtons
+		if waitMode && elevatorWaitFloorSenseCabInputs(appCtx.Config) {
+			if pins, err := parseBCMPinList(appCtx.Config.ElevatorFloorInputPins); err == nil && len(pins) > 0 {
+				gpio.ConfigureElevatorFloorPins(pins)
+			} else if err != nil && strings.TrimSpace(appCtx.Config.ElevatorFloorInputPins) != "" {
+				log.Printf("WARNING: elevator_floor_input_pins: %v", err)
+			}
 		}
 		setupOperationModeGPIOInputs(appCtx, gpio)
 		appCtx.GPIO = gpio
@@ -2696,32 +3320,35 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 
 		switch mode {
 		case ModeElevatorWaitFloorButtons:
-			log.Printf("INFO: PIN accepted (elevator wait-floor; %s keypad; credential=%s); cab button window started.", kTag, credTag)
+			cabSense := normalizeElevatorWaitFloorCabSense(cfg.ElevatorWaitFloorCabSense)
+			log.Printf("INFO: PIN accepted (elevator wait-floor; %s keypad; credential=%s); enable window started (cab_sense=%s).", kTag, credTag, cabSense)
 			playSoundSync(cfg, cfg.SoundPinOK)
 			startElevatorFloorWaitGrant(ctx, cfg)
 			fireEventWebhook(ctx, "pin_accepted", map[string]any{
-				"operation_mode":    mode,
-				"keypad_role":       keypadRole,
-				"credential_label":  credLabel,
-				"elevator_phase":    "wait_floor_input",
-				"door_relay_gpio":   int(doorBCM),
-				"floor_wait_until":  cfg.ElevatorFloorWaitTimeout.String(),
+				"operation_mode":               mode,
+				"keypad_role":                  keypadRole,
+				"credential_label":             credLabel,
+				"elevator_phase":               "wait_floor_input",
+				"elevator_wait_floor_cab_sense": cabSense,
+				"door_relay_gpio":              int(doorBCM),
+				"floor_wait_until":             cfg.ElevatorFloorWaitTimeout.String(),
 			})
 			time.Sleep(feedbackDelay)
 			return
 
 		case ModeElevatorPredefinedFloor:
-			log.Printf("INFO: PIN accepted (elevator predefined floor %d; %s keypad; credential=%s).", cfg.ElevatorPredefinedFloor, kTag, credTag)
 			playSoundSync(cfg, cfg.SoundPinOK)
-			pulsed := pulseElevatorOrDoorOutput(ctx, cfg)
-			fireEventWebhook(ctx, "pin_accepted", map[string]any{
+			ex := activateElevatorPredefinedFloor(ctx, cfg, kTag, credTag)
+			wh := map[string]any{
 				"operation_mode":   mode,
 				"keypad_role":      keypadRole,
 				"credential_label": credLabel,
-				"elevator_floor":   cfg.ElevatorPredefinedFloor,
-				"dispatch_pulsed":  pulsed,
 				"door_relay_gpio":  int(doorBCM),
-			})
+			}
+			for k, v := range ex {
+				wh[k] = v
+			}
+			fireEventWebhook(ctx, "pin_accepted", wh)
 			time.Sleep(feedbackDelay)
 			return
 
@@ -3382,9 +4009,27 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	}
 	fmt.Fprintf(w, "  pair_peer_token: %s\n", pptok)
 	fmt.Fprintf(w, "  elevator_floor_wait_timeout: %s\n", c.ElevatorFloorWaitTimeout)
+	if isElevatorWaitFloorMode(NormalizeKeypadOperationMode(c.KeypadOperationMode)) {
+		fmt.Fprintf(w, "  elevator_wait_floor_cab_sense: %s\n", normalizeElevatorWaitFloorCabSense(c.ElevatorWaitFloorCabSense))
+	}
 	fmt.Fprintf(w, "  elevator_floor_input_pins: %q\n", c.ElevatorFloorInputPins)
 	fmt.Fprintf(w, "  elevator_predefined_floor: %d\n", c.ElevatorPredefinedFloor)
+	if s := formatIntList(c.ElevatorPredefinedFloors); s != "" {
+		fmt.Fprintf(w, "  elevator_predefined_floors: %s\n", s)
+	} else {
+		fmt.Fprintf(w, "  elevator_predefined_floors: (unset; legacy single-floor label uses elevator_predefined_floor only)\n")
+	}
 	fmt.Fprintf(w, "  elevator_dispatch_pulse_duration: %s\n", c.ElevatorDispatchPulseDuration)
+	if s := formatDurationList(c.ElevatorFloorDispatchPulseDurations); s != "" {
+		fmt.Fprintf(w, "  elevator_floor_dispatch_pulse_durations: %s\n", s)
+	} else {
+		fmt.Fprintf(w, "  elevator_floor_dispatch_pulse_durations: (unset)\n")
+	}
+	if c.ElevatorEnablePulseDuration > 0 {
+		fmt.Fprintf(w, "  elevator_enable_pulse_duration: %s (elevator_predefined_floor)\n", c.ElevatorEnablePulseDuration)
+	} else {
+		fmt.Fprintf(w, "  elevator_enable_pulse_duration: (unset; predefined mode uses dispatch pulse default)\n")
+	}
 	fmt.Fprintf(w, "  dual_keypad_reject_exit_without_entry: %v\n", c.DualKeypadRejectExitWithoutEntry)
 	fmt.Fprintf(w, "  pin_lockout_enabled: %v\n", c.PinLockoutEnabled)
 	fmt.Fprintf(w, "  pin_lockout_after_attempts: %d\n", c.PinLockoutAfterAttempts)
@@ -3437,7 +4082,10 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 		hbTok = "(set)"
 	}
 	fmt.Fprintf(w, "  webhook_heartbeat_token: %s\n", hbTok)
-	fmt.Fprintf(w, "\n--- GPIO (BCM) ---\n")
+	fmt.Fprintf(w, "\n--- GPIO ---\n")
+	fmt.Fprintf(w, "  relay_output_mode: %s\n", normalizeRelayOutputMode(g.RelayOutputMode))
+	fmt.Fprintf(w, "  mcp23017_i2c_bus: %d\n", g.MCP23017I2CBus)
+	fmt.Fprintf(w, "  mcp23017_i2c_addr: %d\n", int(g.MCP23017I2CAddr))
 	fmt.Fprintf(w, "  door_relay_pin: %d\n", g.DoorRelayPin)
 	fmt.Fprintf(w, "  door_relay_active_low: %v\n", g.DoorRelayActiveLow)
 	fmt.Fprintf(w, "  buzzer_relay_pin: %d\n", g.BuzzerRelayPin)
@@ -3452,6 +4100,21 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  elevator_dispatch_active_low: %v\n", g.ElevatorDispatchActiveLow)
 	fmt.Fprintf(w, "  elevator_enable_relay_pin: %d\n", g.ElevatorEnableRelayPin)
 	fmt.Fprintf(w, "  elevator_enable_active_low: %v\n", g.ElevatorEnableActiveLow)
+	if strings.TrimSpace(g.ElevatorFloorDispatchPins) != "" {
+		fmt.Fprintf(w, "  elevator_floor_dispatch_pins: %q\n", g.ElevatorFloorDispatchPins)
+	} else {
+		fmt.Fprintf(w, "  elevator_floor_dispatch_pins: (unset; use elevator_dispatch_relay_pin / door)\n")
+	}
+	if strings.TrimSpace(g.ElevatorPredefinedEnablePins) != "" {
+		fmt.Fprintf(w, "  elevator_predefined_enable_pins: %q\n", g.ElevatorPredefinedEnablePins)
+	} else {
+		fmt.Fprintf(w, "  elevator_predefined_enable_pins: (unset; elevator_predefined_floor only)\n")
+	}
+	if strings.TrimSpace(g.ElevatorWaitFloorEnablePins) != "" {
+		fmt.Fprintf(w, "  elevator_wait_floor_enable_pins: %q\n", g.ElevatorWaitFloorEnablePins)
+	} else {
+		fmt.Fprintf(w, "  elevator_wait_floor_enable_pins: (unset; use elevator_enable_relay_pin for wait-floor)\n")
+	}
 	if ctx.GPIO == nil {
 		fmt.Fprintln(w, "  gpio_manager_available: false")
 	} else {
@@ -3932,7 +4595,9 @@ type OutputConfig struct {
 	PinNumber uint8
 	ActiveLow bool // True if the relay triggers on ground/0V (common for opto-relays)
 	Pin       rpio.Pin
-	mu        sync.Mutex // Prevents overlapping pulse routines
+	// UseMCP23017: when true, PinNumber is MCP23017 port index 0-15 (GPIOManager.mcp drives the line).
+	UseMCP23017 bool
+	mu          sync.Mutex // Prevents overlapping pulse routines
 }
 
 // InputConfig defines an input pin, like a door sensor or egress button
@@ -3956,6 +4621,8 @@ type GPIOManager struct {
 	Outputs map[string]*OutputConfig
 	Inputs  map[string]*InputConfig
 
+	mcp *mcp23017.Dev
+
 	doorSensorPin   rpio.Pin
 	doorSensorReady bool
 
@@ -3969,6 +4636,11 @@ func NewGPIOManager() *GPIOManager {
 		Outputs: make(map[string]*OutputConfig),
 		Inputs:  make(map[string]*InputConfig),
 	}
+}
+
+// SetMCP23017 attaches an MCP23017 expander for outputs registered with useMCP23017 true.
+func (m *GPIOManager) SetMCP23017(d *mcp23017.Dev) {
+	m.mcp = d
 }
 
 // ConfigureDoorSensor sets up a BCM GPIO as digital input with pull-up for a door contact (call once after rpio.Open).
@@ -4022,12 +4694,18 @@ func (m *GPIOManager) HasElevatorFloorPins() bool {
 
 // AnyElevatorFloorPressed returns true if any configured floor input reads low (pressed).
 func (m *GPIOManager) AnyElevatorFloorPressed() bool {
-	for _, fp := range m.elevatorFloorPins {
+	return len(m.ElevatorCabFloorsPressed()) > 0
+}
+
+// ElevatorCabFloorsPressed returns zero-based indices of cab floor inputs that read low (pressed), in pin order.
+func (m *GPIOManager) ElevatorCabFloorsPressed() []int {
+	var r []int
+	for i, fp := range m.elevatorFloorPins {
 		if fp.Pin.Read() == rpio.Low {
-			return true
+			r = append(r, i)
 		}
 	}
-	return false
+	return r
 }
 
 // HasOutput returns true if a named relay/output was registered.
@@ -4036,15 +4714,17 @@ func (m *GPIOManager) HasOutput(name string) bool {
 	return ok
 }
 
-// AddOutput registers a new output pin
-func (m *GPIOManager) AddOutput(name string, pin uint8, activeLow bool) {
-	p := rpio.Pin(pin)
-	p.Output()
-
+// AddOutput registers a new output pin. useMCP23017 selects MCP23017 port pin PinNumber (0-15); otherwise BCM GPIO.
+func (m *GPIOManager) AddOutput(name string, pin uint8, activeLow bool, useMCP23017 bool) {
 	cfg := &OutputConfig{
-		PinNumber: pin,
-		ActiveLow: activeLow,
-		Pin:       p,
+		PinNumber:   pin,
+		ActiveLow:   activeLow,
+		UseMCP23017: useMCP23017,
+	}
+	if !useMCP23017 {
+		p := rpio.Pin(pin)
+		p.Output()
+		cfg.Pin = p
 	}
 	m.Outputs[name] = cfg
 
@@ -4084,6 +4764,18 @@ func (m *GPIOManager) ActionOn(name string) {
 		log.Printf("ERROR: Output '%s' not found", name)
 		return
 	}
+	if out.UseMCP23017 {
+		if m.mcp == nil {
+			log.Printf("ERROR: Output '%s' uses MCP23017 but device is not initialized", name)
+			return
+		}
+		// Energized: active-low => drive low; active-high => drive high.
+		logicHigh := !out.ActiveLow
+		if err := m.mcp.SetPin(out.PinNumber, logicHigh); err != nil {
+			log.Printf("ERROR: MCP23017 output %q pin %d: %v", name, out.PinNumber, err)
+		}
+		return
+	}
 	if out.ActiveLow {
 		out.Pin.Low()
 	} else {
@@ -4095,6 +4787,14 @@ func (m *GPIOManager) ActionOn(name string) {
 func (m *GPIOManager) ActionOff(name string) {
 	out, exists := m.Outputs[name]
 	if !exists {
+		return
+	}
+	if out.UseMCP23017 {
+		if m.mcp == nil {
+			return
+		}
+		logicHigh := out.ActiveLow
+		_ = m.mcp.SetPin(out.PinNumber, logicHigh)
 		return
 	}
 	if out.ActiveLow {
@@ -4243,7 +4943,16 @@ func clearElevatorGrantState(ctx *AppContext) {
 	ctx.elevatorMu.Lock()
 	ctx.elevatorGrantUntil = time.Time{}
 	ctx.elevatorMu.Unlock()
-	if ctx.GPIO != nil && ctx.GPIO.HasOutput("elevator_enable") {
+	if ctx.GPIO == nil {
+		return
+	}
+	for i := range ctx.elevatorWaitFloorEnablePins {
+		name := elevatorWaitFloorEnableOutputName(i)
+		if ctx.GPIO.HasOutput(name) {
+			ctx.GPIO.ActionOff(name)
+		}
+	}
+	if ctx.GPIO.HasOutput("elevator_enable") {
 		ctx.GPIO.ActionOff("elevator_enable")
 	}
 }
@@ -4252,7 +4961,21 @@ func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
 	ctx.elevatorMu.Lock()
 	ctx.elevatorGrantUntil = time.Now().Add(cfg.ElevatorFloorWaitTimeout)
 	ctx.elevatorMu.Unlock()
-	if ctx.GPIO != nil && ctx.GPIO.HasOutput("elevator_enable") {
+	if ctx.GPIO == nil {
+		return
+	}
+	// Hold ground-return / enable relays for the full wait window (until clearElevatorGrantState on
+	// floor press or timeout). elevator_enable_pulse_duration does not apply here—only elevator_predefined_floor uses it.
+	if len(ctx.elevatorWaitFloorEnablePins) > 0 {
+		for i := range ctx.elevatorWaitFloorEnablePins {
+			name := elevatorWaitFloorEnableOutputName(i)
+			if ctx.GPIO.HasOutput(name) {
+				ctx.GPIO.ActionOn(name)
+			}
+		}
+		return
+	}
+	if ctx.GPIO.HasOutput("elevator_enable") {
 		ctx.GPIO.ActionOn("elevator_enable")
 	}
 }
@@ -4270,12 +4993,137 @@ func pulseElevatorOrDoorOutput(ctx *AppContext, cfg DeviceConfig) bool {
 	return true
 }
 
+// pulseElevatorFloorSelections pulses per-floor dispatch outputs for each cab index, or one legacy dispatch/door pulse.
+func pulseElevatorFloorSelections(ctx *AppContext, cfg DeviceConfig, floorIndices []int) bool {
+	if ctx.GPIO == nil || len(floorIndices) == 0 {
+		return false
+	}
+	perFloor := false
+	for _, idx := range floorIndices {
+		if ctx.GPIO.HasOutput(elevatorFloorDispatchOutputName(idx)) {
+			perFloor = true
+			break
+		}
+	}
+	if !perFloor {
+		return pulseElevatorOrDoorOutput(ctx, cfg)
+	}
+	for _, idx := range floorIndices {
+		name := elevatorFloorDispatchOutputName(idx)
+		if ctx.GPIO.HasOutput(name) {
+			ctx.GPIO.ActionPulse(name, dispatchPulseDurationForFloor(cfg, idx))
+		}
+	}
+	return true
+}
+
+func pulseElevatorPredefinedDispatchAtIndex(ctx *AppContext, cfg DeviceConfig, idx int) (outName string, pin int, ok bool) {
+	if ctx.GPIO == nil {
+		return "", 0, false
+	}
+	n := len(ctx.elevatorFloorDispatchPins)
+	if n == 0 {
+		ok = pulseElevatorOrDoorOutput(ctx, cfg)
+		if ctx.GPIO.HasOutput("elevator_dispatch") {
+			return "elevator_dispatch", int(ctx.GPIOSettings.ElevatorDispatchRelayPin), ok
+		}
+		return "door", int(ctx.GPIOSettings.DoorRelayPin), ok
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	name := elevatorFloorDispatchOutputName(idx)
+	if ctx.GPIO.HasOutput(name) {
+		ctx.GPIO.ActionPulse(name, dispatchPulseDurationForFloor(cfg, idx))
+		return name, int(ctx.elevatorFloorDispatchPins[idx]), true
+	}
+	ok = pulseElevatorOrDoorOutput(ctx, cfg)
+	if ctx.GPIO.HasOutput("elevator_dispatch") {
+		return "elevator_dispatch", int(ctx.GPIOSettings.ElevatorDispatchRelayPin), ok
+	}
+	return "door", int(ctx.GPIOSettings.DoorRelayPin), ok
+}
+
+// activateElevatorPredefinedFloor pulses the enable relay (if configured) and dispatch for the selected predefined floor; returns webhook detail fields.
+func activateElevatorPredefinedFloor(ctx *AppContext, cfg DeviceConfig, kTag, credTag string) map[string]any {
+	extra := map[string]any{}
+	if ctx.GPIO == nil {
+		extra["gpio"] = "unavailable"
+		log.Printf("INFO: PIN accepted (elevator predefined; %s keypad; credential=%s); GPIO unavailable.", kTag, credTag)
+		return extra
+	}
+	nf := len(cfg.ElevatorPredefinedFloors)
+	if nf == 0 {
+		idx := cfg.ElevatorPredefinedFloor
+		if len(ctx.elevatorFloorDispatchPins) > 0 {
+			if idx < 0 {
+				idx = 0
+			}
+			if idx >= len(ctx.elevatorFloorDispatchPins) {
+				log.Printf("WARNING: elevator_predefined_floor %d out of range for %d dispatch relay(s); using index %d.", cfg.ElevatorPredefinedFloor, len(ctx.elevatorFloorDispatchPins), len(ctx.elevatorFloorDispatchPins)-1)
+				idx = len(ctx.elevatorFloorDispatchPins) - 1
+			}
+		}
+		dOut, dPin, dOK := pulseElevatorPredefinedDispatchAtIndex(ctx, cfg, idx)
+		log.Printf("INFO: PIN accepted (elevator predefined legacy; %s keypad; credential=%s); configured_predefined_floors=[] logical_floor_label=%d dispatch_output=%q dispatch_relay_pin=%d dispatch_pulsed=%v",
+			kTag, credTag, cfg.ElevatorPredefinedFloor, dOut, dPin, dOK)
+		extra["elevator_predefined_logical_floor"] = cfg.ElevatorPredefinedFloor
+		extra["dispatch_output"] = dOut
+		extra["dispatch_relay_pin"] = dPin
+		extra["dispatch_pulsed"] = dOK
+		return extra
+	}
+	idx := cfg.ElevatorPredefinedFloor
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= nf {
+		log.Printf("WARNING: elevator_predefined_floor index %d out of range for %d configured floors; using index %d.", cfg.ElevatorPredefinedFloor, nf, nf-1)
+		idx = nf - 1
+	}
+	logical := cfg.ElevatorPredefinedFloors[idx]
+	enOut, enPin := "", 0
+	enName := elevatorPredefinedEnableOutputName(idx)
+	if ctx.GPIO.HasOutput(enName) {
+		enOut = enName
+		if idx < len(ctx.elevatorPredefinedEnablePins) {
+			enPin = int(ctx.elevatorPredefinedEnablePins[idx])
+		}
+		enDur := cfg.ElevatorEnablePulseDuration
+		if enDur <= 0 {
+			enDur = dispatchPulseDurationForFloor(cfg, idx)
+			if enDur <= 0 {
+				enDur = cfg.ElevatorDispatchPulseDuration
+			}
+		}
+		ctx.GPIO.ActionPulse(enName, enDur)
+	}
+	dOut, dPin, dOK := pulseElevatorPredefinedDispatchAtIndex(ctx, cfg, idx)
+	log.Printf("INFO: PIN accepted (elevator predefined; %s keypad; credential=%s); configured_logical_floors=%v selected_index=%d activated_logical_floor=%d enable_output=%q enable_relay_pin=%d dispatch_output=%q dispatch_relay_pin=%d dispatch_pulsed=%v",
+		kTag, credTag, cfg.ElevatorPredefinedFloors, idx, logical, enOut, enPin, dOut, dPin, dOK)
+	extra["elevator_predefined_floors_configured"] = cfg.ElevatorPredefinedFloors
+	extra["elevator_predefined_selected_index"] = idx
+	extra["elevator_predefined_logical_floor"] = logical
+	if enOut != "" {
+		extra["elevator_enable_output"] = enOut
+		extra["elevator_enable_relay_pin"] = enPin
+	}
+	extra["dispatch_output"] = dOut
+	extra["dispatch_relay_pin"] = dPin
+	extra["dispatch_pulsed"] = dOK
+	return extra
+}
+
 func monitorElevatorFloorSelection(ctx *AppContext) {
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for range tick.C {
 		ctx.configMu.RLock()
 		mode := NormalizeKeypadOperationMode(ctx.Config.KeypadOperationMode)
+		senseCab := elevatorWaitFloorSenseCabInputs(ctx.Config)
 		ctx.configMu.RUnlock()
 		if mode != ModeElevatorWaitFloorButtons {
 			continue
@@ -4288,21 +5136,30 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 		}
 		if time.Now().After(until) {
 			clearElevatorGrantState(ctx)
-			log.Println("WARNING: Elevator floor-button wait window expired.")
-			fireEventWebhook(ctx, "elevator_floor_timeout", map[string]any{"operation_mode": mode})
+			if senseCab {
+				log.Println("WARNING: Elevator floor-button wait window expired (cab sense enabled).")
+				fireEventWebhook(ctx, "elevator_floor_timeout", map[string]any{"operation_mode": mode, "elevator_wait_floor_cab_sense": ElevatorWaitFloorCabSenseSense})
+			} else {
+				log.Println("INFO: Elevator wait-floor enable window ended (cab sense disabled; no floor GPIO).")
+				fireEventWebhook(ctx, "elevator_floor_timeout", map[string]any{"operation_mode": mode, "elevator_wait_floor_cab_sense": ElevatorWaitFloorCabSenseIgnore})
+			}
+			continue
+		}
+		if !senseCab {
 			continue
 		}
 		if ctx.GPIO == nil || !ctx.GPIO.HasElevatorFloorPins() {
 			continue
 		}
-		if ctx.GPIO.AnyElevatorFloorPressed() {
+		pressed := ctx.GPIO.ElevatorCabFloorsPressed()
+		if len(pressed) > 0 {
 			clearElevatorGrantState(ctx)
 			ctx.configMu.RLock()
 			cfg := ctx.Config
 			ctx.configMu.RUnlock()
-			pulseElevatorOrDoorOutput(ctx, cfg)
-			log.Println("INFO: Elevator cab floor input active; dispatch pulse sent.")
-			fireEventWebhook(ctx, "elevator_floor_selected", map[string]any{"operation_mode": mode})
+			pulseElevatorFloorSelections(ctx, cfg, pressed)
+			log.Printf("INFO: Elevator cab floor input(s) active %v; dispatch pulse sent.", pressed)
+			fireEventWebhook(ctx, "elevator_floor_selected", map[string]any{"operation_mode": mode, "elevator_floor_indices": pressed})
 		}
 	}
 }
