@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -135,6 +136,13 @@ const (
 	ElevatorWaitFloorCabSenseIgnore = "ignore"
 )
 
+// Cab sense after wait-floor PIN grant: ignore GPIO briefly so enable relays match "ignore" mode (hold
+// until timeout) while hardware energizes; then require a stable active-low window before dispatch.
+const (
+	elevatorCabSenseArmDelay    = 300 * time.Millisecond
+	elevatorCabSenseStableTicks = 3 // 50ms monitor tick → ~150ms same reading
+)
+
 // normalizeElevatorWaitFloorCabSense returns ElevatorWaitFloorCabSenseSense or ElevatorWaitFloorCabSenseIgnore.
 func normalizeElevatorWaitFloorCabSense(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -190,11 +198,11 @@ type GPIOSettings struct {
 	EntryButtonPin       uint8
 	EntryButtonActiveLow bool
 	// ElevatorDispatchRelayPin: single shared dispatch relay when not using per-floor pins; 0 = use door relay in elevator modes.
-	ElevatorDispatchRelayPin       uint8
-	ElevatorDispatchActiveLow      bool
+	ElevatorDispatchRelayPin  uint8
+	ElevatorDispatchActiveLow bool
 	// ElevatorEnableRelayPin: elevator_wait_floor_buttons legacy single relay when elevator_wait_floor_enable_pins is empty—restores ground (or common) for all allowed cab buttons together. 0 = skip.
-	ElevatorEnableRelayPin       uint8
-	ElevatorEnableActiveLow      bool
+	ElevatorEnableRelayPin  uint8
+	ElevatorEnableActiveLow bool
 	// ElevatorFloorDispatchPins: per-floor dispatch outputs (pulse floor call). elevator_wait_floor_buttons + cab sense: one per elevator_floor_input_pins; + cab ignore: one per wait-floor enable channel. elevator_predefined_floor: at most one entry when no cab inputs; empty = use elevator_dispatch_relay_pin / door.
 	ElevatorFloorDispatchPins string
 	// ElevatorWaitFloorEnablePins: elevator_wait_floor_buttons only—comma relay pins that reconnect ground to each cab floor button; with cab sense count must match elevator_floor_input_pins; with cab ignore count is the number of enabled floors (no cab inputs). Empty = use ElevatorEnableRelayPin only.
@@ -225,13 +233,16 @@ type AppContext struct {
 	techHistMu sync.Mutex
 	techHist   []string // technician /dev/tty commands, oldest first (capped by TechMenuHistoryMax)
 
-	keypadLockoutMu          sync.Mutex
-	keypadLockoutUntil       time.Time   // zero = no active lockout
-	keypadLockoutEndTimer    *time.Timer // wall-clock end of lockout period
-	keypadLockoutEndLogOnce  *sync.Once  // ensures single WARNING when lockout period ends
+	keypadLockoutMu         sync.Mutex
+	keypadLockoutUntil      time.Time   // zero = no active lockout
+	keypadLockoutEndTimer   *time.Timer // wall-clock end of lockout period
+	keypadLockoutEndLogOnce *sync.Once  // ensures single WARNING when lockout period ends
 
-	elevatorMu       sync.Mutex
-	elevatorGrantUntil time.Time // non-zero: waiting for cab floor button (elevator_wait_floor_buttons)
+	elevatorMu                   sync.Mutex
+	elevatorGrantUntil           time.Time // non-zero: waiting for cab floor button (elevator_wait_floor_buttons)
+	elevatorGrantStartedAt       time.Time // when the current grant began; used for cab-sense arming/debounce
+	elevatorCabFloorDebounceHeld []int     // pressed indices seen while accumulating elevatorCabFloorDebounceTick
+	elevatorCabFloorDebounceTick int       // consecutive 50ms polls with same held snapshot
 
 	// Dual USB keypad: in-memory occupancy per PIN (entry adds, exit subtracts). Reset on process restart.
 	occupancyMu    sync.Mutex
@@ -302,13 +313,15 @@ type DeviceConfig struct {
 	PinLockoutDuration time.Duration
 	// PinLockoutOverridePin: if non-empty, submitting this PIN clears keypad lockout and wrong-PIN streak without opening the door.
 	PinLockoutOverridePin string
+	// FallbackAccessPin: if non-empty, accepted when no matching enabled row exists in access_pins (legacy fallback).
+	FallbackAccessPin string
 
 	// WebhookEvent*: POST JSON to WebhookEventURL on door/PIN/MQTT events when WebhookEventEnabled and URL is set.
 	// When WebhookEventTokenEnabled, sends Authorization: Bearer <WebhookEventToken>.
-	WebhookEventEnabled       bool
-	WebhookEventURL           string
-	WebhookEventTokenEnabled  bool
-	WebhookEventToken         string
+	WebhookEventEnabled      bool
+	WebhookEventURL          string
+	WebhookEventTokenEnabled bool
+	WebhookEventToken        string
 	// WebhookHeartbeat*: POST JSON on each heartbeat tick (same interval as heartbeat_interval) when enabled and URL set.
 	WebhookHeartbeatEnabled      bool
 	WebhookHeartbeatURL          string
@@ -325,7 +338,7 @@ type DeviceConfig struct {
 	PairPeerRole string
 	// MQTTPairPeerTopic: entry unit publishes unlock hint; exit unit subscribes and pulses door.
 	MQTTPairPeerTopic string
-	PairPeerToken      string
+	PairPeerToken     string
 	// ElevatorFloorWaitTimeout: elevator_wait_floor_buttons — after valid PIN, how long enable relays stay on; with cab sense, also the window to read elevator_floor_input_pins.
 	ElevatorFloorWaitTimeout time.Duration
 	// ElevatorWaitFloorCabSense: elevator_wait_floor_buttons — sense (default): configure and read elevator_floor_input_pins, log selection, pulse dispatch. ignore: leave elevator_floor_input_pins empty; no cab GPIO; timeout only clears enables.
@@ -344,6 +357,13 @@ type DeviceConfig struct {
 	ElevatorEnablePulseDuration time.Duration
 	// DualKeypadRejectExitWithoutEntry: in access_dual_usb_keypad, valid PIN on exit with no matching entry count rejects (no door pulse); default false warns only.
 	DualKeypadRejectExitWithoutEntry bool
+
+	// AccessControlDoorID: logical door (access_doors.id). When set with access_schedule_enforce, PIN must match an enabled access level and time window for this door (direct or via door group).
+	AccessControlDoorID string
+	// AccessScheduleEnforce: when true (default), apply SQLite access_levels/access_time_windows when this door has targets.
+	AccessScheduleEnforce bool
+	// AccessScheduleApplyToFallbackPin: when true, device.fallback_access_pin is subject to schedules; default false (emergency bypass).
+	AccessScheduleApplyToFallbackPin bool
 }
 
 // virtualkeyz2JSON is the on-disk shape of virtualkeyz2.json (see default file in repo).
@@ -355,82 +375,86 @@ type virtualkeyz2JSON struct {
 }
 
 type virtualkeyz2DeviceJSON struct {
-	HeartbeatInterval            *string `json:"heartbeat_interval"`
-	DoorOpenWarningAfter         *string `json:"door_open_warning_after"`
-	DoorSensorClosedIsLow        *bool   `json:"door_sensor_closed_is_low"`
-	SoundCardName                *string `json:"sound_card_name"`
-	SoundStartup                 *string `json:"sound_startup"`
-	SoundShutdown                *string `json:"sound_shutdown"`
-	SoundPinOK                   *string `json:"sound_pin_ok"`
-	SoundPinReject               *string `json:"sound_pin_reject"`
-	SoundKeypress                *string `json:"sound_keypress"`
-	LogLevel                     *string `json:"log_level"`
-	PinLength                    *int    `json:"pin_length"`
-	RelayPulseDuration           *string `json:"relay_pulse_duration"`
-	PinRejectBuzzerAfterAttempts *int    `json:"pin_reject_buzzer_after_attempts"`
-	BuzzerRelayPulseDuration     *string `json:"buzzer_relay_pulse_duration"`
-	MQTTEnabled                  *bool   `json:"mqtt_enabled"`
-	MQTTBroker                   *string `json:"mqtt_broker"`
-	MQTTClientID                 *string `json:"mqtt_client_id"`
-	MQTTUsername                 *string `json:"mqtt_username"`
-	MQTTPassword                 *string `json:"mqtt_password"`
-	MQTTCommandTopic             *string `json:"mqtt_command_topic"`
-	MQTTStatusTopic              *string `json:"mqtt_status_topic"`
-	MQTTCommandToken             *string `json:"mqtt_command_token"`
-	TechMenuHistoryMax           *int    `json:"tech_menu_history_max"`
-	KeypadInterDigitTimeout      *string `json:"keypad_inter_digit_timeout"`
-	KeypadSessionTimeout         *string `json:"keypad_session_timeout"`
-	PinEntryFeedbackDelay        *string `json:"pin_entry_feedback_delay"`
-	PinLockoutEnabled            *bool   `json:"pin_lockout_enabled"`
-	PinLockoutAfterAttempts      *int    `json:"pin_lockout_after_attempts"`
-	PinLockoutDuration           *string `json:"pin_lockout_duration"`
-	PinLockoutOverridePin        *string `json:"pin_lockout_override_pin"`
-	WebhookEventEnabled          *bool   `json:"webhook_event_enabled"`
-	WebhookEventURL              *string `json:"webhook_event_url"`
-	WebhookEventTokenEnabled     *bool   `json:"webhook_event_token_enabled"`
-	WebhookEventToken            *string `json:"webhook_event_token"`
-	WebhookHeartbeatEnabled      *bool   `json:"webhook_heartbeat_enabled"`
-	WebhookHeartbeatURL          *string `json:"webhook_heartbeat_url"`
-	WebhookHeartbeatTokenEnabled *bool   `json:"webhook_heartbeat_token_enabled"`
-	WebhookHeartbeatToken        *string `json:"webhook_heartbeat_token"`
-	KeypadOperationMode          *string `json:"keypad_operation_mode"`
-	KeypadEvdevPath              *string `json:"keypad_evdev_path"`
-	KeypadExitEvdevPath          *string `json:"keypad_exit_evdev_path"`
-	PairPeerRole                 *string `json:"pair_peer_role"`
-	MQTTPairPeerTopic            *string `json:"mqtt_pair_peer_topic"`
-	PairPeerToken                *string `json:"pair_peer_token"`
-	ElevatorFloorWaitTimeout     *string `json:"elevator_floor_wait_timeout"`
-	ElevatorWaitFloorCabSense    *string `json:"elevator_wait_floor_cab_sense"`
-	ElevatorFloorInputPins       *string `json:"elevator_floor_input_pins"`
-	ElevatorPredefinedFloor      *int    `json:"elevator_predefined_floor"`
-	ElevatorPredefinedFloors     *string `json:"elevator_predefined_floors"`
-	ElevatorDispatchPulseDuration        *string `json:"elevator_dispatch_pulse_duration"`
-	ElevatorFloorDispatchPulseDurations  *string `json:"elevator_floor_dispatch_pulse_durations"`
-	ElevatorEnablePulseDuration          *string `json:"elevator_enable_pulse_duration"`
+	HeartbeatInterval                   *string `json:"heartbeat_interval"`
+	DoorOpenWarningAfter                *string `json:"door_open_warning_after"`
+	DoorSensorClosedIsLow               *bool   `json:"door_sensor_closed_is_low"`
+	SoundCardName                       *string `json:"sound_card_name"`
+	SoundStartup                        *string `json:"sound_startup"`
+	SoundShutdown                       *string `json:"sound_shutdown"`
+	SoundPinOK                          *string `json:"sound_pin_ok"`
+	SoundPinReject                      *string `json:"sound_pin_reject"`
+	SoundKeypress                       *string `json:"sound_keypress"`
+	LogLevel                            *string `json:"log_level"`
+	PinLength                           *int    `json:"pin_length"`
+	RelayPulseDuration                  *string `json:"relay_pulse_duration"`
+	PinRejectBuzzerAfterAttempts        *int    `json:"pin_reject_buzzer_after_attempts"`
+	BuzzerRelayPulseDuration            *string `json:"buzzer_relay_pulse_duration"`
+	MQTTEnabled                         *bool   `json:"mqtt_enabled"`
+	MQTTBroker                          *string `json:"mqtt_broker"`
+	MQTTClientID                        *string `json:"mqtt_client_id"`
+	MQTTUsername                        *string `json:"mqtt_username"`
+	MQTTPassword                        *string `json:"mqtt_password"`
+	MQTTCommandTopic                    *string `json:"mqtt_command_topic"`
+	MQTTStatusTopic                     *string `json:"mqtt_status_topic"`
+	MQTTCommandToken                    *string `json:"mqtt_command_token"`
+	TechMenuHistoryMax                  *int    `json:"tech_menu_history_max"`
+	KeypadInterDigitTimeout             *string `json:"keypad_inter_digit_timeout"`
+	KeypadSessionTimeout                *string `json:"keypad_session_timeout"`
+	PinEntryFeedbackDelay               *string `json:"pin_entry_feedback_delay"`
+	PinLockoutEnabled                   *bool   `json:"pin_lockout_enabled"`
+	PinLockoutAfterAttempts             *int    `json:"pin_lockout_after_attempts"`
+	PinLockoutDuration                  *string `json:"pin_lockout_duration"`
+	PinLockoutOverridePin               *string `json:"pin_lockout_override_pin"`
+	FallbackAccessPin                   *string `json:"fallback_access_pin"`
+	WebhookEventEnabled                 *bool   `json:"webhook_event_enabled"`
+	WebhookEventURL                     *string `json:"webhook_event_url"`
+	WebhookEventTokenEnabled            *bool   `json:"webhook_event_token_enabled"`
+	WebhookEventToken                   *string `json:"webhook_event_token"`
+	WebhookHeartbeatEnabled             *bool   `json:"webhook_heartbeat_enabled"`
+	WebhookHeartbeatURL                 *string `json:"webhook_heartbeat_url"`
+	WebhookHeartbeatTokenEnabled        *bool   `json:"webhook_heartbeat_token_enabled"`
+	WebhookHeartbeatToken               *string `json:"webhook_heartbeat_token"`
+	KeypadOperationMode                 *string `json:"keypad_operation_mode"`
+	KeypadEvdevPath                     *string `json:"keypad_evdev_path"`
+	KeypadExitEvdevPath                 *string `json:"keypad_exit_evdev_path"`
+	PairPeerRole                        *string `json:"pair_peer_role"`
+	MQTTPairPeerTopic                   *string `json:"mqtt_pair_peer_topic"`
+	PairPeerToken                       *string `json:"pair_peer_token"`
+	ElevatorFloorWaitTimeout            *string `json:"elevator_floor_wait_timeout"`
+	ElevatorWaitFloorCabSense           *string `json:"elevator_wait_floor_cab_sense"`
+	ElevatorFloorInputPins              *string `json:"elevator_floor_input_pins"`
+	ElevatorPredefinedFloor             *int    `json:"elevator_predefined_floor"`
+	ElevatorPredefinedFloors            *string `json:"elevator_predefined_floors"`
+	ElevatorDispatchPulseDuration       *string `json:"elevator_dispatch_pulse_duration"`
+	ElevatorFloorDispatchPulseDurations *string `json:"elevator_floor_dispatch_pulse_durations"`
+	ElevatorEnablePulseDuration         *string `json:"elevator_enable_pulse_duration"`
 	DualKeypadRejectExitWithoutEntry    *bool   `json:"dual_keypad_reject_exit_without_entry"`
+	AccessControlDoorID                 *string `json:"access_control_door_id,omitempty"`
+	AccessScheduleEnforce               *bool   `json:"access_schedule_enforce,omitempty"`
+	AccessScheduleApplyToFallbackPin      *bool   `json:"access_schedule_apply_to_fallback_pin,omitempty"`
 }
 
 type virtualkeyz2GPIOJSON struct {
-	RelayOutputMode               *string `json:"relay_output_mode"`
-	MCP23017I2CBus                *int    `json:"mcp23017_i2c_bus"`
-	MCP23017I2CAddr               *int    `json:"mcp23017_i2c_addr"`
-	DoorRelayPin                  *int  `json:"door_relay_pin"`
-	DoorRelayActiveLow            *bool `json:"door_relay_active_low"`
-	BuzzerRelayPin                *int  `json:"buzzer_relay_pin"`
-	BuzzerRelayActiveLow          *bool `json:"buzzer_relay_active_low"`
-	DoorSensorPin                 *int  `json:"door_sensor_pin"`
-	HeartbeatLEDPin               *int  `json:"heartbeat_led_pin"`
-	ExitButtonPin                 *int  `json:"exit_button_pin"`
-	ExitButtonActiveLow           *bool `json:"exit_button_active_low"`
-	EntryButtonPin                *int  `json:"entry_button_pin"`
-	EntryButtonActiveLow          *bool `json:"entry_button_active_low"`
-	ElevatorDispatchRelayPin      *int  `json:"elevator_dispatch_relay_pin"`
-	ElevatorDispatchActiveLow     *bool `json:"elevator_dispatch_active_low"`
-	ElevatorEnableRelayPin        *int  `json:"elevator_enable_relay_pin"`
-	ElevatorEnableActiveLow       *bool `json:"elevator_enable_active_low"`
-	ElevatorFloorDispatchPins     *string `json:"elevator_floor_dispatch_pins"`
-	ElevatorPredefinedEnablePins  *string `json:"elevator_predefined_enable_pins"`
-	ElevatorWaitFloorEnablePins   *string `json:"elevator_wait_floor_enable_pins"`
+	RelayOutputMode              *string `json:"relay_output_mode"`
+	MCP23017I2CBus               *int    `json:"mcp23017_i2c_bus"`
+	MCP23017I2CAddr              *int    `json:"mcp23017_i2c_addr"`
+	DoorRelayPin                 *int    `json:"door_relay_pin"`
+	DoorRelayActiveLow           *bool   `json:"door_relay_active_low"`
+	BuzzerRelayPin               *int    `json:"buzzer_relay_pin"`
+	BuzzerRelayActiveLow         *bool   `json:"buzzer_relay_active_low"`
+	DoorSensorPin                *int    `json:"door_sensor_pin"`
+	HeartbeatLEDPin              *int    `json:"heartbeat_led_pin"`
+	ExitButtonPin                *int    `json:"exit_button_pin"`
+	ExitButtonActiveLow          *bool   `json:"exit_button_active_low"`
+	EntryButtonPin               *int    `json:"entry_button_pin"`
+	EntryButtonActiveLow         *bool   `json:"entry_button_active_low"`
+	ElevatorDispatchRelayPin     *int    `json:"elevator_dispatch_relay_pin"`
+	ElevatorDispatchActiveLow    *bool   `json:"elevator_dispatch_active_low"`
+	ElevatorEnableRelayPin       *int    `json:"elevator_enable_relay_pin"`
+	ElevatorEnableActiveLow      *bool   `json:"elevator_enable_active_low"`
+	ElevatorFloorDispatchPins    *string `json:"elevator_floor_dispatch_pins"`
+	ElevatorPredefinedEnablePins *string `json:"elevator_predefined_enable_pins"`
+	ElevatorWaitFloorEnablePins  *string `json:"elevator_wait_floor_enable_pins"`
 }
 
 func bcmUint8(field string, v int) (uint8, error) {
@@ -904,6 +928,9 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.PinLockoutOverridePin != nil {
 		app.Config.PinLockoutOverridePin = *d.PinLockoutOverridePin
 	}
+	if d.FallbackAccessPin != nil {
+		app.Config.FallbackAccessPin = *d.FallbackAccessPin
+	}
 	if d.WebhookEventEnabled != nil {
 		app.Config.WebhookEventEnabled = *d.WebhookEventEnabled
 	}
@@ -985,6 +1012,15 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if d.DualKeypadRejectExitWithoutEntry != nil {
 		app.Config.DualKeypadRejectExitWithoutEntry = *d.DualKeypadRejectExitWithoutEntry
+	}
+	if d.AccessControlDoorID != nil {
+		app.Config.AccessControlDoorID = strings.TrimSpace(*d.AccessControlDoorID)
+	}
+	if d.AccessScheduleEnforce != nil {
+		app.Config.AccessScheduleEnforce = *d.AccessScheduleEnforce
+	}
+	if d.AccessScheduleApplyToFallbackPin != nil {
+		app.Config.AccessScheduleApplyToFallbackPin = *d.AccessScheduleApplyToFallbackPin
 	}
 	g := &raw.GPIO
 	if g.RelayOutputMode != nil {
@@ -1168,79 +1204,83 @@ type virtualkeyz2PersistFile struct {
 }
 
 type virtualkeyz2PersistDevice struct {
-	HeartbeatInterval            string `json:"heartbeat_interval"`
-	DoorOpenWarningAfter         string `json:"door_open_warning_after"`
-	DoorSensorClosedIsLow        bool   `json:"door_sensor_closed_is_low"`
-	SoundCardName                string `json:"sound_card_name"`
-	SoundStartup                 string `json:"sound_startup"`
-	SoundShutdown                string `json:"sound_shutdown"`
-	SoundPinOK                   string `json:"sound_pin_ok"`
-	SoundPinReject               string `json:"sound_pin_reject"`
-	SoundKeypress                string `json:"sound_keypress"`
-	LogLevel                     string `json:"log_level"`
-	PinLength                    int    `json:"pin_length"`
-	RelayPulseDuration           string `json:"relay_pulse_duration"`
-	PinRejectBuzzerAfterAttempts int    `json:"pin_reject_buzzer_after_attempts"`
-	BuzzerRelayPulseDuration     string `json:"buzzer_relay_pulse_duration"`
-	MQTTEnabled                  bool   `json:"mqtt_enabled"`
-	MQTTBroker                   string `json:"mqtt_broker"`
-	MQTTClientID                 string `json:"mqtt_client_id"`
-	MQTTUsername                 string `json:"mqtt_username"`
-	MQTTPassword                 string `json:"mqtt_password"`
-	MQTTCommandTopic             string `json:"mqtt_command_topic"`
-	MQTTStatusTopic              string `json:"mqtt_status_topic"`
-	MQTTCommandToken             string `json:"mqtt_command_token"`
-	TechMenuHistoryMax           int    `json:"tech_menu_history_max"`
-	KeypadInterDigitTimeout      string `json:"keypad_inter_digit_timeout"`
-	KeypadSessionTimeout         string `json:"keypad_session_timeout"`
-	PinEntryFeedbackDelay        string `json:"pin_entry_feedback_delay"`
-	PinLockoutEnabled            bool   `json:"pin_lockout_enabled"`
-	PinLockoutAfterAttempts      int    `json:"pin_lockout_after_attempts"`
-	PinLockoutDuration           string `json:"pin_lockout_duration"`
-	PinLockoutOverridePin        string `json:"pin_lockout_override_pin"`
-	WebhookEventEnabled          bool   `json:"webhook_event_enabled"`
-	WebhookEventURL              string `json:"webhook_event_url"`
-	WebhookEventTokenEnabled     bool   `json:"webhook_event_token_enabled"`
-	WebhookEventToken            string `json:"webhook_event_token"`
-	WebhookHeartbeatEnabled      bool   `json:"webhook_heartbeat_enabled"`
-	WebhookHeartbeatURL          string `json:"webhook_heartbeat_url"`
-	WebhookHeartbeatTokenEnabled bool   `json:"webhook_heartbeat_token_enabled"`
-	WebhookHeartbeatToken        string `json:"webhook_heartbeat_token"`
-	KeypadOperationMode          string `json:"keypad_operation_mode"`
-	KeypadEvdevPath              string `json:"keypad_evdev_path"`
-	KeypadExitEvdevPath          string `json:"keypad_exit_evdev_path"`
-	PairPeerRole                 string `json:"pair_peer_role"`
-	MQTTPairPeerTopic            string `json:"mqtt_pair_peer_topic"`
-	PairPeerToken                string `json:"pair_peer_token"`
-	ElevatorFloorWaitTimeout     string `json:"elevator_floor_wait_timeout"`
-	ElevatorWaitFloorCabSense    string `json:"elevator_wait_floor_cab_sense,omitempty"`
-	ElevatorFloorInputPins       string `json:"elevator_floor_input_pins"`
-	ElevatorPredefinedFloor      int    `json:"elevator_predefined_floor"`
-	ElevatorPredefinedFloors     string `json:"elevator_predefined_floors"`
-	ElevatorDispatchPulseDuration        string `json:"elevator_dispatch_pulse_duration"`
-	ElevatorFloorDispatchPulseDurations  string `json:"elevator_floor_dispatch_pulse_durations"`
-	ElevatorEnablePulseDuration          string `json:"elevator_enable_pulse_duration"`
-	DualKeypadRejectExitWithoutEntry     bool   `json:"dual_keypad_reject_exit_without_entry"`
+	HeartbeatInterval                   string `json:"heartbeat_interval"`
+	DoorOpenWarningAfter                string `json:"door_open_warning_after"`
+	DoorSensorClosedIsLow               bool   `json:"door_sensor_closed_is_low"`
+	SoundCardName                       string `json:"sound_card_name"`
+	SoundStartup                        string `json:"sound_startup"`
+	SoundShutdown                       string `json:"sound_shutdown"`
+	SoundPinOK                          string `json:"sound_pin_ok"`
+	SoundPinReject                      string `json:"sound_pin_reject"`
+	SoundKeypress                       string `json:"sound_keypress"`
+	LogLevel                            string `json:"log_level"`
+	PinLength                           int    `json:"pin_length"`
+	RelayPulseDuration                  string `json:"relay_pulse_duration"`
+	PinRejectBuzzerAfterAttempts        int    `json:"pin_reject_buzzer_after_attempts"`
+	BuzzerRelayPulseDuration            string `json:"buzzer_relay_pulse_duration"`
+	MQTTEnabled                         bool   `json:"mqtt_enabled"`
+	MQTTBroker                          string `json:"mqtt_broker"`
+	MQTTClientID                        string `json:"mqtt_client_id"`
+	MQTTUsername                        string `json:"mqtt_username"`
+	MQTTPassword                        string `json:"mqtt_password"`
+	MQTTCommandTopic                    string `json:"mqtt_command_topic"`
+	MQTTStatusTopic                     string `json:"mqtt_status_topic"`
+	MQTTCommandToken                    string `json:"mqtt_command_token"`
+	TechMenuHistoryMax                  int    `json:"tech_menu_history_max"`
+	KeypadInterDigitTimeout             string `json:"keypad_inter_digit_timeout"`
+	KeypadSessionTimeout                string `json:"keypad_session_timeout"`
+	PinEntryFeedbackDelay               string `json:"pin_entry_feedback_delay"`
+	PinLockoutEnabled                   bool   `json:"pin_lockout_enabled"`
+	PinLockoutAfterAttempts             int    `json:"pin_lockout_after_attempts"`
+	PinLockoutDuration                  string `json:"pin_lockout_duration"`
+	PinLockoutOverridePin               string `json:"pin_lockout_override_pin"`
+	FallbackAccessPin                   string `json:"fallback_access_pin"`
+	WebhookEventEnabled                 bool   `json:"webhook_event_enabled"`
+	WebhookEventURL                     string `json:"webhook_event_url"`
+	WebhookEventTokenEnabled            bool   `json:"webhook_event_token_enabled"`
+	WebhookEventToken                   string `json:"webhook_event_token"`
+	WebhookHeartbeatEnabled             bool   `json:"webhook_heartbeat_enabled"`
+	WebhookHeartbeatURL                 string `json:"webhook_heartbeat_url"`
+	WebhookHeartbeatTokenEnabled        bool   `json:"webhook_heartbeat_token_enabled"`
+	WebhookHeartbeatToken               string `json:"webhook_heartbeat_token"`
+	KeypadOperationMode                 string `json:"keypad_operation_mode"`
+	KeypadEvdevPath                     string `json:"keypad_evdev_path"`
+	KeypadExitEvdevPath                 string `json:"keypad_exit_evdev_path"`
+	PairPeerRole                        string `json:"pair_peer_role"`
+	MQTTPairPeerTopic                   string `json:"mqtt_pair_peer_topic"`
+	PairPeerToken                       string `json:"pair_peer_token"`
+	ElevatorFloorWaitTimeout            string `json:"elevator_floor_wait_timeout"`
+	ElevatorWaitFloorCabSense           string `json:"elevator_wait_floor_cab_sense,omitempty"`
+	ElevatorFloorInputPins              string `json:"elevator_floor_input_pins"`
+	ElevatorPredefinedFloor             int    `json:"elevator_predefined_floor"`
+	ElevatorPredefinedFloors            string `json:"elevator_predefined_floors"`
+	ElevatorDispatchPulseDuration       string `json:"elevator_dispatch_pulse_duration"`
+	ElevatorFloorDispatchPulseDurations string `json:"elevator_floor_dispatch_pulse_durations"`
+	ElevatorEnablePulseDuration         string `json:"elevator_enable_pulse_duration"`
+	DualKeypadRejectExitWithoutEntry    bool   `json:"dual_keypad_reject_exit_without_entry"`
+	AccessControlDoorID              string `json:"access_control_door_id,omitempty"`
+	AccessScheduleEnforce            bool   `json:"access_schedule_enforce"`
+	AccessScheduleApplyToFallbackPin bool   `json:"access_schedule_apply_to_fallback_pin"`
 }
 
 type virtualkeyz2PersistGPIO struct {
-	RelayOutputMode           string `json:"relay_output_mode"`
-	MCP23017I2CBus            int    `json:"mcp23017_i2c_bus"`
-	MCP23017I2CAddr           int    `json:"mcp23017_i2c_addr"`
-	DoorRelayPin              int  `json:"door_relay_pin"`
-	DoorRelayActiveLow        bool `json:"door_relay_active_low"`
-	BuzzerRelayPin            int  `json:"buzzer_relay_pin"`
-	BuzzerRelayActiveLow      bool `json:"buzzer_relay_active_low"`
-	DoorSensorPin             int  `json:"door_sensor_pin"`
-	HeartbeatLEDPin           int  `json:"heartbeat_led_pin"`
-	ExitButtonPin             int  `json:"exit_button_pin"`
-	ExitButtonActiveLow       bool `json:"exit_button_active_low"`
-	EntryButtonPin            int  `json:"entry_button_pin"`
-	EntryButtonActiveLow      bool `json:"entry_button_active_low"`
-	ElevatorDispatchRelayPin  int  `json:"elevator_dispatch_relay_pin"`
-	ElevatorDispatchActiveLow bool `json:"elevator_dispatch_active_low"`
-	ElevatorEnableRelayPin    int  `json:"elevator_enable_relay_pin"`
-	ElevatorEnableActiveLow   bool `json:"elevator_enable_active_low"`
+	RelayOutputMode              string `json:"relay_output_mode"`
+	MCP23017I2CBus               int    `json:"mcp23017_i2c_bus"`
+	MCP23017I2CAddr              int    `json:"mcp23017_i2c_addr"`
+	DoorRelayPin                 int    `json:"door_relay_pin"`
+	DoorRelayActiveLow           bool   `json:"door_relay_active_low"`
+	BuzzerRelayPin               int    `json:"buzzer_relay_pin"`
+	BuzzerRelayActiveLow         bool   `json:"buzzer_relay_active_low"`
+	DoorSensorPin                int    `json:"door_sensor_pin"`
+	HeartbeatLEDPin              int    `json:"heartbeat_led_pin"`
+	ExitButtonPin                int    `json:"exit_button_pin"`
+	ExitButtonActiveLow          bool   `json:"exit_button_active_low"`
+	EntryButtonPin               int    `json:"entry_button_pin"`
+	EntryButtonActiveLow         bool   `json:"entry_button_active_low"`
+	ElevatorDispatchRelayPin     int    `json:"elevator_dispatch_relay_pin"`
+	ElevatorDispatchActiveLow    bool   `json:"elevator_dispatch_active_low"`
+	ElevatorEnableRelayPin       int    `json:"elevator_enable_relay_pin"`
+	ElevatorEnableActiveLow      bool   `json:"elevator_enable_active_low"`
 	ElevatorFloorDispatchPins    string `json:"elevator_floor_dispatch_pins"`
 	ElevatorPredefinedEnablePins string `json:"elevator_predefined_enable_pins"`
 	ElevatorWaitFloorEnablePins  string `json:"elevator_wait_floor_enable_pins"`
@@ -1283,6 +1323,7 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.PinLockoutAfterAttempts = c.PinLockoutAfterAttempts
 	out.Device.PinLockoutDuration = c.PinLockoutDuration.String()
 	out.Device.PinLockoutOverridePin = c.PinLockoutOverridePin
+	out.Device.FallbackAccessPin = c.FallbackAccessPin
 	out.Device.WebhookEventEnabled = c.WebhookEventEnabled
 	out.Device.WebhookEventURL = c.WebhookEventURL
 	out.Device.WebhookEventTokenEnabled = c.WebhookEventTokenEnabled
@@ -1316,6 +1357,9 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 		out.Device.ElevatorEnablePulseDuration = ""
 	}
 	out.Device.DualKeypadRejectExitWithoutEntry = c.DualKeypadRejectExitWithoutEntry
+	out.Device.AccessControlDoorID = c.AccessControlDoorID
+	out.Device.AccessScheduleEnforce = c.AccessScheduleEnforce
+	out.Device.AccessScheduleApplyToFallbackPin = c.AccessScheduleApplyToFallbackPin
 	out.GPIO.RelayOutputMode = normalizeRelayOutputMode(g.RelayOutputMode)
 	out.GPIO.MCP23017I2CBus = g.MCP23017I2CBus
 	out.GPIO.MCP23017I2CAddr = int(g.MCP23017I2CAddr)
@@ -1682,6 +1726,8 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		}
 	case "pin_lockout_override_pin":
 		ctx.Config.PinLockoutOverridePin = value
+	case "fallback_access_pin":
+		ctx.Config.FallbackAccessPin = value
 	case "webhook_event_enabled":
 		ctx.Config.WebhookEventEnabled, err = strconv.ParseBool(value)
 	case "webhook_event_url":
@@ -1805,6 +1851,12 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.GPIOSettings.ElevatorEnableActiveLow, err = strconv.ParseBool(value)
 	case "dual_keypad_reject_exit_without_entry":
 		ctx.Config.DualKeypadRejectExitWithoutEntry, err = strconv.ParseBool(value)
+	case "access_control_door_id":
+		ctx.Config.AccessControlDoorID = value
+	case "access_schedule_enforce":
+		ctx.Config.AccessScheduleEnforce, err = strconv.ParseBool(value)
+	case "access_schedule_apply_to_fallback_pin":
+		ctx.Config.AccessScheduleApplyToFallbackPin, err = strconv.ParseBool(value)
 	default:
 		return fmt.Errorf("unknown key %q (try: cfg keys)", key)
 	}
@@ -1879,6 +1931,7 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   pin_lockout_after_attempts        0=off, else 3–5 failed PINs, default 5
   pin_lockout_duration              30s–300s keypad ignore, default 60s
   pin_lockout_override_pin          clears lockout when submitted (empty=disabled)
+  fallback_access_pin               PIN accepted when no access_pins DB match (empty=disabled)
   webhook_event_enabled             true|false POST JSON on PIN/door/MQTT events
   webhook_event_url                 HTTPS/HTTP URL (empty = no event webhooks)
   webhook_event_token_enabled       true|false send Authorization: Bearer token
@@ -1902,6 +1955,9 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   elevator_floor_dispatch_pulse_durations  comma durations, one per cab floor (with elevator_floor_dispatch_pins); short lists pad with elevator_dispatch_pulse_duration
   elevator_enable_pulse_duration   elevator_predefined_floor only: pulse length for predefined enable relay; wait-floor holds enables for full elevator_floor_wait_timeout (this key ignored there)
   dual_keypad_reject_exit_without_entry  true|false (dual USB: reject exit PIN if no entry recorded)
+  access_control_door_id            logical door id (access_doors.id); empty = PIN-only, no schedule enforcement
+  access_schedule_enforce           true|false (default true): when door id set, enforce access_levels + time windows if DB maps this door
+  access_schedule_apply_to_fallback_pin  true|false (default false): subject device.fallback_access_pin to schedules
   relay_output_mode                 gpio|mcp23017 (relays on BCM vs MCP23017; sensors/LED stay BCM)
   mcp23017_i2c_bus                  Linux I2C bus number (default 1 = /dev/i2c-1)
   mcp23017_i2c_addr                 7-bit address, default 32 (0x20)
@@ -1997,23 +2053,25 @@ func main() {
 			PinLockoutAfterAttempts:      5,
 			PinLockoutDuration:           60 * time.Second,
 			PinLockoutOverridePin:        "",
+			FallbackAccessPin:            "",
 			WebhookEventEnabled:          false,
 			WebhookEventTokenEnabled:     false,
 			WebhookHeartbeatEnabled:      false,
 			WebhookHeartbeatTokenEnabled: false,
-			KeypadOperationMode: ModeAccessEntry,
-			KeypadEvdevPath:     "/dev/input/event1",
+			AccessScheduleEnforce:        true,
+			KeypadOperationMode:          ModeAccessEntry,
+			KeypadEvdevPath:              "/dev/input/event1",
 		},
 		GPIOSettings: GPIOSettings{
-			RelayOutputMode:     RelayOutputGPIO,
-			MCP23017I2CBus:      1,
-			MCP23017I2CAddr:     0x20,
-			DoorRelayPin:        5,
-			DoorRelayActiveLow:  false,
-			BuzzerRelayPin:      10,
+			RelayOutputMode:      RelayOutputGPIO,
+			MCP23017I2CBus:       1,
+			MCP23017I2CAddr:      0x20,
+			DoorRelayPin:         5,
+			DoorRelayActiveLow:   false,
+			BuzzerRelayPin:       10,
 			BuzzerRelayActiveLow: false,
-			DoorSensorPin:       7,
-			HeartbeatLEDPin:     26,
+			DoorSensorPin:        7,
+			HeartbeatLEDPin:      26,
 		},
 		PinDisplayDigits: make(chan int, 16),
 		TechMenuPrompt:   "MeSpace-Siam-5th-Floor-Right-Door",
@@ -2094,11 +2152,11 @@ func main() {
 	appCtx.MQTTClient = initMQTT(appCtx)
 
 	// 6. Start Concurrent Subsystems
-	go startHeartbeatAPI(appCtx)   // Regular heartbeat via API [cite: 9]
+	go startHeartbeatAPI(appCtx) // Regular heartbeat via API [cite: 9]
 	go startKeypadListeners(appCtx)
 	go monitorElevatorFloorSelection(appCtx)
-	go monitorDoorSensors(appCtx)  // Door open timers & warnings
-	go displayController(appCtx)   // Manage DSI Screen and random QR codes [cite: 3, 10, 11]
+	go monitorDoorSensors(appCtx) // Door open timers & warnings
+	go displayController(appCtx)  // Manage DSI Screen and random QR codes [cite: 3, 10, 11]
 
 	// 7. Start Web Server (Web UI & REST HTTP API with token support) [cite: 6, 7]
 	srv := startWebServer(appCtx)
@@ -2410,9 +2468,296 @@ func (c *colorLogWriter) writeColoredLine(line []byte) {
 	techUILock.Unlock()
 }
 
+// Access scheduling (SQLite): see access_time_profiles, access_levels, access_level_targets in initAccessScheduleSchema.
+//
+// Model: access_doors / door_groups — what opens (device.access_control_door_id = access_doors.id).
+// access_user_groups + access_user_group_members — who (PIN in access_pins).
+// access_time_profiles + access_time_windows — named schedules; weekday 0–6 Sun–Sat or 7 = any day; minutes 0–1439; start>end crosses midnight.
+// access_levels + access_level_targets — time profile + user group + door or door_group targets.
+//
+// Example Mon–Fri 8:45–17:00 for door "east", group "staff", PIN 123456:
+//
+//	INSERT INTO access_doors VALUES ('east','East entry');
+//	INSERT INTO access_user_groups VALUES ('staff','Staff');
+//	INSERT INTO access_pins VALUES ('123456','Alice',1);
+//	INSERT INTO access_user_group_members VALUES ('staff','123456');
+//	INSERT INTO access_time_profiles VALUES ('biz','Standard Business','','');
+//	INSERT INTO access_time_windows (time_profile_id,weekday,start_minute,end_minute) VALUES
+//	  ('biz',1,525,1020),('biz',2,525,1020),('biz',3,525,1020),('biz',4,525,1020),('biz',5,525,1020);
+//	INSERT INTO access_levels VALUES ('L1','Staff business hours','biz','staff',1);
+//	INSERT INTO access_level_targets (access_level_id,door_id,door_group_id) VALUES ('L1','east',NULL);
+
+// initAccessScheduleSchema creates tables for named time profiles, user groups, door groups, and access levels.
+func initAccessScheduleSchema(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		return fmt.Errorf("pragma foreign_keys: %w", err)
+	}
+
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS access_doors (
+			id TEXT PRIMARY KEY NOT NULL,
+			display_name TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_door_groups (
+			id TEXT PRIMARY KEY NOT NULL,
+			display_name TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_door_group_members (
+			door_group_id TEXT NOT NULL REFERENCES access_door_groups(id) ON DELETE CASCADE,
+			door_id TEXT NOT NULL REFERENCES access_doors(id) ON DELETE CASCADE,
+			PRIMARY KEY (door_group_id, door_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_user_groups (
+			id TEXT PRIMARY KEY NOT NULL,
+			display_name TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_user_group_members (
+			group_id TEXT NOT NULL REFERENCES access_user_groups(id) ON DELETE CASCADE,
+			pin TEXT NOT NULL,
+			PRIMARY KEY (group_id, pin),
+			FOREIGN KEY (pin) REFERENCES access_pins(pin) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_time_profiles (
+			id TEXT PRIMARY KEY NOT NULL,
+			display_name TEXT,
+			description TEXT,
+			iana_timezone TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_time_windows (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			time_profile_id TEXT NOT NULL REFERENCES access_time_profiles(id) ON DELETE CASCADE,
+			weekday INTEGER NOT NULL,
+			start_minute INTEGER NOT NULL,
+			end_minute INTEGER NOT NULL,
+			CHECK (weekday >= 0 AND weekday <= 7),
+			CHECK (start_minute >= 0 AND start_minute <= 1439),
+			CHECK (end_minute >= 0 AND end_minute <= 1439)
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_levels (
+			id TEXT PRIMARY KEY NOT NULL,
+			display_name TEXT,
+			time_profile_id TEXT NOT NULL REFERENCES access_time_profiles(id),
+			user_group_id TEXT NOT NULL REFERENCES access_user_groups(id),
+			enabled INTEGER NOT NULL DEFAULT 1
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_level_targets (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			access_level_id TEXT NOT NULL REFERENCES access_levels(id) ON DELETE CASCADE,
+			door_id TEXT REFERENCES access_doors(id) ON DELETE CASCADE,
+			door_group_id TEXT REFERENCES access_door_groups(id) ON DELETE CASCADE,
+			CHECK (
+				(door_id IS NOT NULL AND door_group_id IS NULL)
+				OR (door_id IS NULL AND door_group_id IS NOT NULL)
+			)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_level ON access_level_targets(access_level_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_door ON access_level_targets(door_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_time_windows_profile ON access_time_windows(time_profile_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_user_group_members_pin ON access_user_group_members(pin)`,
+	}
+	for _, q := range stmts {
+		if _, err := db.Exec(q); err != nil {
+			return fmt.Errorf("access schedule schema: %w", err)
+		}
+	}
+	log.Println("INFO: SQLite access schedule tables ready (doors, time profiles, user groups, access levels).")
+	return nil
+}
+
+func accessScheduleTimeLocation(iana string) *time.Location {
+	s := strings.TrimSpace(iana)
+	if s == "" {
+		return time.Local
+	}
+	loc, err := time.LoadLocation(s)
+	if err != nil {
+		log.Printf("WARNING: access_time_profiles.iana_timezone %q invalid (%v); using local time.", s, err)
+		return time.Local
+	}
+	return loc
+}
+
+// minuteMatchesWindow reports whether minute-of-day m is inside [start, end] inclusive.
+// If start > end, the window crosses midnight (e.g. 22:00–06:00).
+func minuteMatchesWindow(m, start, end int) bool {
+	if start <= end {
+		return m >= start && m <= end
+	}
+	return m >= start || m <= end
+}
+
+// timeMatchesProfileWindows returns true if t (already in the profile location) matches any window.
+// weekday is Go's time.Weekday() (Sunday=0). SQL weekday 7 means "any day".
+func timeMatchesProfileWindows(weekday time.Weekday, minuteOfDay int, rows []struct {
+	weekday      int
+	start, end int
+}) bool {
+	wd := int(weekday)
+	for _, r := range rows {
+		w := r.weekday
+		if w != 7 && w != wd {
+			continue
+		}
+		if minuteMatchesWindow(minuteOfDay, r.start, r.end) {
+			return true
+		}
+	}
+	return false
+}
+
+func accessScheduleHasTargetsForDoor(db *sql.DB, doorID string) (bool, error) {
+	if db == nil || strings.TrimSpace(doorID) == "" {
+		return false, nil
+	}
+	var n int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT 1
+			FROM access_levels al
+			INNER JOIN access_level_targets t ON t.access_level_id = al.id
+			WHERE al.enabled = 1 AND (
+				t.door_id = ?
+				OR EXISTS (
+					SELECT 1 FROM access_door_group_members dgm
+					WHERE dgm.door_group_id = t.door_group_id AND dgm.door_id = ?
+				)
+			)
+			LIMIT 1
+		)`, doorID, doorID).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// accessScheduleAllows returns whether PIN may open the given door at atTime under schedule rules.
+// When scheduling does not apply, returns (true, "").
+func (ctx *AppContext) accessScheduleAllows(pin, doorID string, atTime time.Time, viaFallback bool) (bool, string) {
+	pin = strings.TrimSpace(pin)
+	doorID = strings.TrimSpace(doorID)
+	ctx.configMu.RLock()
+	enforce := ctx.Config.AccessScheduleEnforce
+	applyFallback := ctx.Config.AccessScheduleApplyToFallbackPin
+	ctx.configMu.RUnlock()
+
+	if ctx.DB == nil || doorID == "" || !enforce {
+		return true, ""
+	}
+	if viaFallback && !applyFallback {
+		return true, ""
+	}
+	hasRules, err := accessScheduleHasTargetsForDoor(ctx.DB, doorID)
+	if err != nil {
+		log.Printf("WARNING: access schedule door target check: %v", err)
+		return false, "schedule_db_error"
+	}
+	if !hasRules {
+		return true, ""
+	}
+
+	rows, err := ctx.DB.Query(`
+		SELECT DISTINCT al.time_profile_id, tp.iana_timezone
+		FROM access_levels al
+		INNER JOIN access_time_profiles tp ON tp.id = al.time_profile_id
+		INNER JOIN access_level_targets t ON t.access_level_id = al.id
+		INNER JOIN access_user_group_members ugm ON ugm.group_id = al.user_group_id AND ugm.pin = ?
+		WHERE al.enabled = 1 AND (
+			t.door_id = ?
+			OR EXISTS (
+				SELECT 1 FROM access_door_group_members dgm
+				WHERE dgm.door_group_id = t.door_group_id AND dgm.door_id = ?
+			)
+		)`, pin, doorID, doorID)
+	if err != nil {
+		log.Printf("WARNING: access schedule level query: %v", err)
+		return false, "schedule_db_error"
+	}
+	defer rows.Close()
+
+	type profTZ struct {
+		id  string
+		tz  string
+		key string
+	}
+	var list []profTZ
+	for rows.Next() {
+		var pid, iana string
+		if err := rows.Scan(&pid, &iana); err != nil {
+			log.Printf("WARNING: access schedule scan: %v", err)
+			continue
+		}
+		list = append(list, profTZ{id: strings.TrimSpace(pid), tz: strings.TrimSpace(iana), key: strings.TrimSpace(pid) + "\x00" + strings.TrimSpace(iana)})
+	}
+	if err := rows.Err(); err != nil {
+		return false, "schedule_db_error"
+	}
+	if len(list) == 0 {
+		return false, "no_access_level_for_credential"
+	}
+
+	seen := make(map[string]struct{})
+	for _, pt := range list {
+		if _, ok := seen[pt.key]; ok {
+			continue
+		}
+		seen[pt.key] = struct{}{}
+
+		loc := accessScheduleTimeLocation(pt.tz)
+		tLocal := atTime.In(loc)
+		minuteOfDay := tLocal.Hour()*60 + tLocal.Minute()
+		wd := tLocal.Weekday()
+
+		wrows, err := ctx.DB.Query(`
+			SELECT weekday, start_minute, end_minute
+			FROM access_time_windows
+			WHERE time_profile_id = ?
+			ORDER BY id`, pt.id)
+		if err != nil {
+			log.Printf("WARNING: access schedule windows: %v", err)
+			return false, "schedule_db_error"
+		}
+		var wins []struct {
+			weekday      int
+			start, end int
+		}
+		for wrows.Next() {
+			var wk, sm, em int
+			if err := wrows.Scan(&wk, &sm, &em); err != nil {
+				_ = wrows.Close()
+				return false, "schedule_db_error"
+			}
+			wins = append(wins, struct {
+				weekday      int
+				start, end int
+			}{wk, sm, em})
+		}
+		if err := wrows.Close(); err != nil {
+			return false, "schedule_db_error"
+		}
+
+		if len(wins) == 0 {
+			continue
+		}
+		if timeMatchesProfileWindows(wd, minuteOfDay, wins) {
+			return true, ""
+		}
+	}
+
+	return false, "outside_scheduled_hours"
+}
+
+func (ctx *AppContext) effectiveAccessDoorID() string {
+	ctx.configMu.RLock()
+	defer ctx.configMu.RUnlock()
+	return strings.TrimSpace(ctx.Config.AccessControlDoorID)
+}
+
 func initDatabase() *sql.DB {
 	// Initialize SQLite for storing logs, configs, and access control lists [cite: 6, 7]
-	db, err := sql.Open("sqlite3", "./access_control.db")
+	db, err := sql.Open("sqlite3", "file:./access_control.db?_fk=1")
 	if err != nil {
 		releaseStartupLogBuffer(os.Stdout)
 		log.Fatalf("CRITICAL: Failed to open database: %v", err)
@@ -2424,31 +2769,44 @@ func initDatabase() *sql.DB {
 	)`); err != nil {
 		log.Printf("WARNING: access_pins table: %v", err)
 	} else {
-		log.Println("INFO: SQLite access_pins table ready (PINs optional; legacy test PIN still works if no row matches).")
+		log.Println("INFO: SQLite access_pins table ready (PINs optional; device.fallback_access_pin used when set and no row matches).")
+	}
+	if err := initAccessScheduleSchema(db); err != nil {
+		log.Printf("WARNING: access schedule schema: %v", err)
 	}
 	return db
 }
 
-// accessCredentialForPIN returns true if the PIN is allowed: row in access_pins with enabled=1, or legacy validAccessPIN when no DB match.
-func (ctx *AppContext) accessCredentialForPIN(pin string) (ok bool, label string) {
+// accessPinLookupResult is the outcome of validating a PIN against access_pins and optional fallback.
+type accessPinLookupResult struct {
+	OK          bool
+	Label       string
+	ViaFallback bool
+}
+
+// accessCredentialForPIN returns whether the PIN is allowed: row in access_pins with enabled=1, or FallbackAccessPin when set and no DB match.
+func (ctx *AppContext) accessCredentialForPIN(pin string) accessPinLookupResult {
 	pin = strings.TrimSpace(pin)
 	if pin == "" {
-		return false, ""
+		return accessPinLookupResult{}
 	}
 	if ctx.DB != nil {
 		var lbl sql.NullString
 		err := ctx.DB.QueryRow(`SELECT label FROM access_pins WHERE pin = ? AND enabled = 1`, pin).Scan(&lbl)
 		if err == nil {
-			return true, strings.TrimSpace(lbl.String)
+			return accessPinLookupResult{OK: true, Label: strings.TrimSpace(lbl.String)}
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			log.Printf("WARNING: access_pins lookup: %v", err)
 		}
 	}
-	if pin == validAccessPIN {
-		return true, ""
+	ctx.configMu.RLock()
+	fallback := strings.TrimSpace(ctx.Config.FallbackAccessPin)
+	ctx.configMu.RUnlock()
+	if fallback != "" && pin == fallback {
+		return accessPinLookupResult{OK: true, ViaFallback: true}
 	}
-	return false, ""
+	return accessPinLookupResult{}
 }
 
 // adjustDualKeypadOccupancy updates per-PIN "inside" counts for access_dual_usb_keypad (entry +1, exit −1). Returns total people across all PINs and this PIN's inside count after the change.
@@ -3209,8 +3567,6 @@ func runKeypadListener(ctx *AppContext, devicePath, keypadRole string) {
 	}
 }
 
-const validAccessPIN = "123456"
-
 // pinRejectWithStreak plays reject sound, increments wrong-PIN streak, fires webhook, optional buzzer/lockout.
 func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, buzzerBCM uint8, feedbackDelay time.Duration, webhookReason string, extra map[string]any) {
 	playSoundSync(cfg, cfg.SoundPinReject)
@@ -3293,7 +3649,9 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		return
 	}
 
-	pinOK, credLabel := ctx.accessCredentialForPIN(pin)
+	cred := ctx.accessCredentialForPIN(pin)
+	pinOK := cred.OK
+	credLabel := cred.Label
 	modePre := NormalizeKeypadOperationMode(cfg.KeypadOperationMode)
 	if pinOK && modePre == ModeAccessDualUSBKeypad && keypadRole == "exit" && cfg.DualKeypadRejectExitWithoutEntry && ctx.dualKeypadExitWouldMismatch(pin) {
 		log.Printf("INFO: PIN rejected (exit keypad; no recorded entry for this credential; door not opened).")
@@ -3306,6 +3664,17 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 	}
 
 	if pinOK {
+		doorID := ctx.effectiveAccessDoorID()
+		if ok, schedReason := ctx.accessScheduleAllows(pin, doorID, time.Now(), cred.ViaFallback); !ok {
+			log.Printf("INFO: PIN rejected (access schedule: %s; door=%q).", schedReason, doorID)
+			ex := map[string]any{"schedule_reason": schedReason, "access_control_door_id": doorID}
+			if credLabel != "" {
+				ex["credential_label"] = credLabel
+			}
+			ctx.pinRejectWithStreak(cfg, keypadRole, buzzerBCM, feedbackDelay, "access_schedule", ex)
+			return
+		}
+
 		ctx.pinFailMu.Lock()
 		ctx.pinFailSeq = 0
 		ctx.pinFailMu.Unlock()
@@ -3325,13 +3694,13 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			playSoundSync(cfg, cfg.SoundPinOK)
 			startElevatorFloorWaitGrant(ctx, cfg)
 			fireEventWebhook(ctx, "pin_accepted", map[string]any{
-				"operation_mode":               mode,
-				"keypad_role":                  keypadRole,
-				"credential_label":             credLabel,
-				"elevator_phase":               "wait_floor_input",
+				"operation_mode":                mode,
+				"keypad_role":                   keypadRole,
+				"credential_label":              credLabel,
+				"elevator_phase":                "wait_floor_input",
 				"elevator_wait_floor_cab_sense": cabSense,
-				"door_relay_gpio":              int(doorBCM),
-				"floor_wait_until":             cfg.ElevatorFloorWaitTimeout.String(),
+				"door_relay_gpio":               int(doorBCM),
+				"floor_wait_until":              cfg.ElevatorFloorWaitTimeout.String(),
 			})
 			time.Sleep(feedbackDelay)
 			return
@@ -4031,6 +4400,10 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 		fmt.Fprintf(w, "  elevator_enable_pulse_duration: (unset; predefined mode uses dispatch pulse default)\n")
 	}
 	fmt.Fprintf(w, "  dual_keypad_reject_exit_without_entry: %v\n", c.DualKeypadRejectExitWithoutEntry)
+	fmt.Fprintf(w, "\n--- Access schedule (SQLite) ---\n")
+	fmt.Fprintf(w, "  access_control_door_id: %q\n", c.AccessControlDoorID)
+	fmt.Fprintf(w, "  access_schedule_enforce: %v\n", c.AccessScheduleEnforce)
+	fmt.Fprintf(w, "  access_schedule_apply_to_fallback_pin: %v\n", c.AccessScheduleApplyToFallbackPin)
 	fmt.Fprintf(w, "  pin_lockout_enabled: %v\n", c.PinLockoutEnabled)
 	fmt.Fprintf(w, "  pin_lockout_after_attempts: %d\n", c.PinLockoutAfterAttempts)
 	fmt.Fprintf(w, "  pin_lockout_duration: %s\n", c.PinLockoutDuration)
@@ -4942,6 +5315,9 @@ func startKeypadListeners(ctx *AppContext) {
 func clearElevatorGrantState(ctx *AppContext) {
 	ctx.elevatorMu.Lock()
 	ctx.elevatorGrantUntil = time.Time{}
+	ctx.elevatorGrantStartedAt = time.Time{}
+	ctx.elevatorCabFloorDebounceHeld = nil
+	ctx.elevatorCabFloorDebounceTick = 0
 	ctx.elevatorMu.Unlock()
 	if ctx.GPIO == nil {
 		return
@@ -4960,6 +5336,9 @@ func clearElevatorGrantState(ctx *AppContext) {
 func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
 	ctx.elevatorMu.Lock()
 	ctx.elevatorGrantUntil = time.Now().Add(cfg.ElevatorFloorWaitTimeout)
+	ctx.elevatorGrantStartedAt = time.Now()
+	ctx.elevatorCabFloorDebounceHeld = nil
+	ctx.elevatorCabFloorDebounceTick = 0
 	ctx.elevatorMu.Unlock()
 	if ctx.GPIO == nil {
 		return
@@ -5151,16 +5530,52 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 		if ctx.GPIO == nil || !ctx.GPIO.HasElevatorFloorPins() {
 			continue
 		}
-		pressed := ctx.GPIO.ElevatorCabFloorsPressed()
-		if len(pressed) > 0 {
-			clearElevatorGrantState(ctx)
-			ctx.configMu.RLock()
-			cfg := ctx.Config
-			ctx.configMu.RUnlock()
-			pulseElevatorFloorSelections(ctx, cfg, pressed)
-			log.Printf("INFO: Elevator cab floor input(s) active %v; dispatch pulse sent.", pressed)
-			fireEventWebhook(ctx, "elevator_floor_selected", map[string]any{"operation_mode": mode, "elevator_floor_indices": pressed})
+		ctx.elevatorMu.Lock()
+		if ctx.elevatorGrantUntil.IsZero() || time.Now().After(ctx.elevatorGrantUntil) {
+			ctx.elevatorMu.Unlock()
+			continue
 		}
+		if ctx.elevatorGrantStartedAt.IsZero() || time.Since(ctx.elevatorGrantStartedAt) < elevatorCabSenseArmDelay {
+			ctx.elevatorMu.Unlock()
+			continue
+		}
+		ctx.elevatorMu.Unlock()
+
+		pressed := ctx.GPIO.ElevatorCabFloorsPressed()
+		var toDispatch []int
+		ctx.elevatorMu.Lock()
+		if ctx.elevatorGrantUntil.IsZero() || time.Now().After(ctx.elevatorGrantUntil) {
+			ctx.elevatorCabFloorDebounceHeld = nil
+			ctx.elevatorCabFloorDebounceTick = 0
+			ctx.elevatorMu.Unlock()
+			continue
+		}
+		if len(pressed) == 0 {
+			ctx.elevatorCabFloorDebounceHeld = nil
+			ctx.elevatorCabFloorDebounceTick = 0
+			ctx.elevatorMu.Unlock()
+			continue
+		}
+		if slices.Equal(ctx.elevatorCabFloorDebounceHeld, pressed) {
+			ctx.elevatorCabFloorDebounceTick++
+		} else {
+			ctx.elevatorCabFloorDebounceHeld = slices.Clone(pressed)
+			ctx.elevatorCabFloorDebounceTick = 1
+		}
+		if ctx.elevatorCabFloorDebounceTick >= elevatorCabSenseStableTicks {
+			toDispatch = slices.Clone(ctx.elevatorCabFloorDebounceHeld)
+		}
+		ctx.elevatorMu.Unlock()
+		if len(toDispatch) == 0 {
+			continue
+		}
+		clearElevatorGrantState(ctx)
+		ctx.configMu.RLock()
+		cfg := ctx.Config
+		ctx.configMu.RUnlock()
+		pulseElevatorFloorSelections(ctx, cfg, toDispatch)
+		log.Printf("INFO: Elevator cab floor input(s) active %v; dispatch pulse sent.", toDispatch)
+		fireEventWebhook(ctx, "elevator_floor_selected", map[string]any{"operation_mode": mode, "elevator_floor_indices": toDispatch})
 	}
 }
 
