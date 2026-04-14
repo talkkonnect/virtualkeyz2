@@ -12,6 +12,8 @@ func TestTechMenuTabCompleteLine(t *testing.T) {
 		{"cfg l", "cfg li", false},
 		{"cfg lis", "cfg list ", false},
 		{"cfg set log_le", "cfg set log_level ", false},
+		{"acl su", "acl summary ", false},
+		{"acl door a", "acl door add ", false},
 		{"kb ", "kb all ", false},
 		{"9", "9 ", false},
 	}

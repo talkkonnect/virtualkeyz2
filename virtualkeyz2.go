@@ -2054,6 +2054,7 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   tech_menu_prompt
 
 Commands:
+  acl help                          SQLite access control (doors, PINs, schedules); Tab completes subcommands
   cfg keys                          this list
   cfg list                          current values (one line per parameter)
   cfg set <key> <value>             change in memory
@@ -4678,6 +4679,7 @@ func techMenuRootCommands() []string {
 	return []string{
 		"...", "…",
 		"1", "2", "3", "4", "5", "6", "7", "8", "9",
+		"acl",
 		"c", "cfg", "ch", "clear", "cls",
 		"exit",
 		"h", "help", "i", "kb", "kbd", "keypads",
@@ -4748,6 +4750,9 @@ func techMenuLongestCommonPrefix(strs []string) string {
 }
 
 func techMenuCompleteAddTrailingSpace(prefixLower []string, completed string) bool {
+	if len(prefixLower) >= 1 && prefixLower[0] == "acl" {
+		return techMenuACLCompleteAddSpace(prefixLower, completed)
+	}
 	c := strings.ToLower(completed)
 	if c == "..." || c == "…" {
 		return false
@@ -4774,6 +4779,12 @@ func techMenuTabCompleteLine(line string) (newLine string, bell bool) {
 
 	var matches []string
 	switch {
+	case len(pl) >= 1 && pl[0] == "acl":
+		var ok bool
+		matches, ok = techMenuACLTabMatches(prefix, partial, trail)
+		if !ok {
+			matches = nil
+		}
 	case len(pl) == 0 && !trail:
 		matches = techMenuFilterPrefixLower(techMenuRootCommands(), strings.ToLower(partial))
 	case len(pl) == 1 && pl[0] == "cfg" && trail:
@@ -4789,6 +4800,10 @@ func techMenuTabCompleteLine(line string) (newLine string, bell bool) {
 	case len(pl) == 1 && pl[0] == "kb" && !trail:
 		matches = techMenuFilterPrefixLower([]string{"all"}, strings.ToLower(partial))
 	default:
+		return line, true
+	}
+
+	if len(pl) >= 1 && pl[0] == "acl" && len(matches) == 0 {
 		return line, true
 	}
 
@@ -4992,7 +5007,7 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
   VirtualKeyz Version 2.0.0 by Suvir Kumar <suvir@dits.co.th>
 --------------------------------------------------------------------------------
   Up/Down       Recall previous commands (see tech_menu_history_max in config)
-  Tab           Complete commands (cfg, cfg subcommands, cfg set keys, kb all)
+  Tab           Complete commands (acl, cfg, cfg subcommands, cfg set keys, kb all)
   h   Redraw Main Menu
   c   Clear Screen 
   z Clear command history 
@@ -5014,6 +5029,7 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
   v   Software build version & release date (UTC)
   ch  Show changelog.txt (revision history)
 --------------------------------------------------------------------------------
+  acl help      SQLite access control: doors, PINs, groups, schedules, levels (Tab: acl …)
   cfg           Config help (same as: cfg keys)
   cfg list      Full settings (MQTT, log level, paths)
   cfg set K V   Set one key (snake_case); then: cfg apply | cfg save
@@ -5060,6 +5076,11 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
 		parts := strings.Fields(line)
 		if len(parts) > 0 && strings.EqualFold(parts[0], "cfg") {
 			techMenuHandleCfg(ctx, line, parts)
+			continue
+		}
+
+		if len(parts) > 0 && strings.EqualFold(parts[0], "acl") {
+			techMenuHandleACL(ctx, line, parts)
 			continue
 		}
 
@@ -6639,4 +6660,968 @@ func publishMQTTPairPeerPulse(ctx *AppContext, cfg DeviceConfig) {
 		return
 	}
 	log.Printf("INFO: pair-peer MQTT: published exit-unlock hint to %q", topic)
+}
+
+// aclDBMu serializes interactive ACL mutations against SQLite (avoids SQLITE_BUSY vs audit log inserts).
+var aclDBMu sync.Mutex
+
+func techMenuACLTopLevel() []string {
+	return []string{
+		"bind", "door", "door_group", "elevator", "elevator_group", "group", "help", "level", "pin", "profile", "summary", "target", "window",
+	}
+}
+
+// techMenuACLSecondLevel returns verbs or nouns after "acl <category> ".
+func techMenuACLSecondLevel(category string) []string {
+	switch strings.ToLower(strings.TrimSpace(category)) {
+	case "bind":
+		return []string{"door", "elevator"}
+	case "door", "elevator", "door_group", "elevator_group":
+		return []string{"add", "list"}
+	case "pin":
+		return []string{"add", "disable", "enable", "list"}
+	case "group":
+		return []string{"add", "join", "leave", "list"}
+	case "profile":
+		return []string{"add", "list"}
+	case "window":
+		return []string{"add"}
+	case "level":
+		return []string{"add", "disable", "enable", "list"}
+	case "target":
+		return []string{"door", "door_group", "elevator", "elevator_group", "list"}
+	default:
+		return nil
+	}
+}
+
+// techMenuACLCompleteAddSpace returns whether Tab should append a space after completing `completed`.
+func techMenuACLCompleteAddSpace(prefixLower []string, completed string) bool {
+	if len(prefixLower) == 0 || prefixLower[0] != "acl" {
+		return false
+	}
+	if len(prefixLower) == 1 {
+		return true
+	}
+	cat := prefixLower[1]
+	if sub := techMenuACLSecondLevel(cat); len(prefixLower) == 2 && len(sub) > 0 {
+		return true
+	}
+	// acl <cat> <verb>
+	if len(prefixLower) == 3 {
+		switch cat {
+		case "door", "elevator", "door_group", "elevator_group":
+			if prefixLower[2] == "add" || prefixLower[2] == "list" {
+				return true
+			}
+		case "pin":
+			if prefixLower[2] == "add" || prefixLower[2] == "list" ||
+				prefixLower[2] == "enable" || prefixLower[2] == "disable" {
+				return true
+			}
+		case "group":
+			if prefixLower[2] == "add" || prefixLower[2] == "list" ||
+				prefixLower[2] == "join" || prefixLower[2] == "leave" {
+				return true
+			}
+		case "profile":
+			if prefixLower[2] == "add" || prefixLower[2] == "list" {
+				return true
+			}
+		case "window":
+			if prefixLower[2] == "add" {
+				return true
+			}
+		case "level":
+			if prefixLower[2] == "add" || prefixLower[2] == "list" ||
+				prefixLower[2] == "enable" || prefixLower[2] == "disable" {
+				return true
+			}
+		case "target":
+			if prefixLower[2] == "door" || prefixLower[2] == "elevator" ||
+				prefixLower[2] == "door_group" || prefixLower[2] == "elevator_group" ||
+				prefixLower[2] == "list" {
+				return true
+			}
+		case "bind":
+			if prefixLower[2] == "door" || prefixLower[2] == "elevator" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func techMenuACLTabMatches(prefix []string, partial string, trailingSpace bool) (matches []string, ok bool) {
+	pl := techMenuLowerPrefixSlice(prefix)
+	if len(pl) < 1 || pl[0] != "acl" {
+		return nil, false
+	}
+	lowPart := strings.ToLower(partial)
+	if trailingSpace {
+		lowPart = ""
+	}
+	switch len(pl) {
+	case 1:
+		if trailingSpace {
+			return append([]string(nil), techMenuACLTopLevel()...), true
+		}
+		return techMenuFilterPrefixLower(techMenuACLTopLevel(), lowPart), true
+	case 2:
+		if trailingSpace {
+			s := techMenuACLSecondLevel(pl[1])
+			if s == nil {
+				return nil, true
+			}
+			return append([]string(nil), s...), true
+		}
+		s := techMenuACLSecondLevel(pl[1])
+		if s == nil {
+			return nil, true
+		}
+		return techMenuFilterPrefixLower(s, lowPart), true
+	default:
+		// Deeper tokens are user data (ids, numbers); no completion.
+		return nil, true
+	}
+}
+
+func techMenuPrintACLHelp(w io.Writer) {
+	fmt.Fprint(w, `
+Access control (SQLite access_control.db + device binding)
+  Use Tab after "acl " and "acl door " (etc.) to see subcommands.
+
+Binding (which logical door/elevator this controller enforces — saved with cfg save):
+  acl bind door <id>              → same as: cfg set access_control_door_id <id>
+  acl bind elevator <id>          → same as: cfg set access_control_elevator_id <id>
+  Then: cfg save                  persist JSON; door/elevator rows must exist in DB (see below).
+
+Discover:
+  acl summary                     current bind ids + row counts
+  acl door list | acl elevator list | acl pin list | acl group list
+  acl profile list | acl level list | acl target list
+
+Typical setup (door + schedule + PIN + group + level + target):
+  1) acl door add east Main_Entrance
+  2) acl pin add 123456 Alice
+  3) acl group add staff Staff
+  4) acl group join staff 123456
+  5) acl profile add biz Business_Hours
+  6) acl window add biz 1 525 1020        (Mon 08:45–17:00; weekday 0=Sun … 6=Sat, 7=any)
+  7) acl level add L1 biz staff L1_label  (time_profile user_group [display_name])
+  8) acl target door L1 east
+  9) acl bind door east
+ 10) cfg set access_schedule_enforce true
+ 11) cfg save
+
+Notes:
+  • Use underscores instead of spaces in display names (e.g. Main_Entrance).
+  • Times are minutes from midnight (0–1439). Profile timezone: acl profile add id name Asia/Bangkok
+  • Enforce schedules only when access_control_*_id matches a row and access_levels target that door/elevator.
+  • PINs are stored in access_pins; they are never echoed by these list commands beyond what you typed.
+
+Commands (detail):
+  acl help                        this text
+  acl summary
+  acl bind door|elevator <id>
+  acl door add <id> [display_name]
+  acl door_group add <id> [display_name]
+  acl elevator add <id> [display_name]
+  acl elevator_group add <id> [display_name]
+  acl pin add <pin> [label]       label optional; enabled by default
+  acl pin enable|disable <pin>
+  acl group add <id> [display_name]
+  acl group join|leave <group_id> <pin>
+  acl profile add <id> [display_name [iana_timezone]]
+  acl window add <profile_id> <weekday> <start_minute> <end_minute>
+  acl level add <level_id> <time_profile_id> <user_group_id> [display_name]
+  acl level enable|disable <level_id>
+  acl target door|elevator|door_group|elevator_group <level_id> <target_id>
+  acl target list
+`)
+}
+
+func techMenuHandleACL(ctx *AppContext, line string, parts []string) {
+	if ctx == nil {
+		return
+	}
+	if len(parts) < 2 {
+		techMenuSyncPrint(func(w io.Writer) { techMenuPrintACLHelp(w) })
+		return
+	}
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch sub {
+	case "help", "h", "?":
+		techMenuSyncPrint(func(w io.Writer) { techMenuPrintACLHelp(w) })
+	case "summary":
+		techMenuACLSummary(ctx)
+	default:
+		if err := techMenuACLDispatch(ctx, parts); err != nil {
+			log.Printf("WARNING: acl: %v", err)
+			techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "acl: %v\n", err) })
+		}
+	}
+}
+
+func techMenuACLSummary(ctx *AppContext) {
+	ctx.configMu.RLock()
+	door := strings.TrimSpace(ctx.Config.AccessControlDoorID)
+	elev := strings.TrimSpace(ctx.Config.AccessControlElevatorID)
+	enforce := ctx.Config.AccessScheduleEnforce
+	ctx.configMu.RUnlock()
+
+	techMenuSyncPrint(func(w io.Writer) {
+		fmt.Fprintf(w, "Device binding: access_control_door_id=%q access_control_elevator_id=%q access_schedule_enforce=%v\n",
+			door, elev, enforce)
+		if ctx.DB == nil {
+			fmt.Fprintln(w, "SQLite: (no database)")
+			return
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		type pair struct {
+			label string
+			table string
+		}
+		counts := []pair{
+			{"doors", "access_doors"},
+			{"door_groups", "access_door_groups"},
+			{"elevators", "access_elevators"},
+			{"elevator_groups", "access_elevator_groups"},
+			{"pins", "access_pins"},
+			{"user_groups", "access_user_groups"},
+			{"user_group_members", "access_user_group_members"},
+			{"time_profiles", "access_time_profiles"},
+			{"time_windows", "access_time_windows"},
+			{"access_levels", "access_levels"},
+			{"level_targets", "access_level_targets"},
+			{"audit_logs", "logs"},
+		}
+		for _, c := range counts {
+			var n int
+			_ = ctx.DB.QueryRow(`SELECT COUNT(*) FROM ` + c.table).Scan(&n)
+			fmt.Fprintf(w, "  %-20s %d\n", c.label+":", n)
+		}
+	})
+	log.Println("INFO: Technician menu: acl summary")
+}
+
+func techMenuACLDispatch(ctx *AppContext, parts []string) error {
+	if len(parts) < 2 {
+		return nil
+	}
+	if ctx.DB == nil {
+		return fmt.Errorf("database not available")
+	}
+	cat := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch cat {
+	case "bind":
+		return techMenuACLCmdBind(ctx, parts)
+	case "door":
+		return techMenuACLCmdDoor(ctx, parts)
+	case "door_group":
+		return techMenuACLCmdDoorGroup(ctx, parts)
+	case "elevator":
+		return techMenuACLCmdElevator(ctx, parts)
+	case "elevator_group":
+		return techMenuACLCmdElevatorGroup(ctx, parts)
+	case "pin":
+		return techMenuACLCmdPin(ctx, parts)
+	case "group":
+		return techMenuACLCmdGroup(ctx, parts)
+	case "profile":
+		return techMenuACLCmdProfile(ctx, parts)
+	case "window":
+		return techMenuACLCmdWindow(ctx, parts)
+	case "level":
+		return techMenuACLCmdLevel(ctx, parts)
+	case "target":
+		return techMenuACLCmdTarget(ctx, parts)
+	default:
+		return fmt.Errorf("unknown acl %q — try: acl help (Tab completes subcommands)", parts[1])
+	}
+}
+
+func techMenuACLCmdBind(ctx *AppContext, parts []string) error {
+	if len(parts) < 4 {
+		return fmt.Errorf(`usage: acl bind door <id>  |  acl bind elevator <id>
+same as cfg set access_control_*_id — use cfg save to persist JSON`)
+	}
+	kind := strings.ToLower(parts[2])
+	id := strings.TrimSpace(parts[3])
+	if id == "" {
+		return fmt.Errorf("id must not be empty")
+	}
+	var key string
+	switch kind {
+	case "door":
+		key = "access_control_door_id"
+	case "elevator":
+		key = "access_control_elevator_id"
+	default:
+		return fmt.Errorf("bind: want door or elevator, got %q", parts[2])
+	}
+	if err := techMenuCfgSetValue(ctx, key, id); err != nil {
+		return err
+	}
+	log.Printf("INFO: Technician menu: acl bind %s %q (in memory; cfg save to persist)", kind, id)
+	techMenuSyncPrint(func(w io.Writer) {
+		fmt.Fprintf(w, "Set %s=%q in memory. Run: cfg save\n", key, id)
+		if kind == "door" {
+			fmt.Fprintln(w, "Hint: create row if missing: acl door add <id> [display_name]")
+		} else {
+			fmt.Fprintln(w, "Hint: create row if missing: acl elevator add <id> [display_name]")
+		}
+	})
+	return nil
+}
+
+func techMenuACLCmdDoor(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl door add <id> [display_name] | acl door list")
+	}
+	verb := strings.ToLower(parts[2])
+	switch verb {
+	case "list":
+		return techMenuACLQueryStrings(ctx, "access_doors", "id", "display_name")
+	case "add":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl door add <id> [display_name]")
+		}
+		id := strings.TrimSpace(parts[3])
+		name := ""
+		if len(parts) > 4 {
+			name = strings.TrimSpace(strings.Join(parts[4:], " "))
+		}
+		if id == "" {
+			return fmt.Errorf("door id must not be empty")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_doors (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl door add %q", id)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "Door %q saved. Bind with: acl bind door %s\n", id, id) })
+		return nil
+	default:
+		return fmt.Errorf("door: use add or list (Tab after 'acl door ')")
+	}
+}
+
+func techMenuACLCmdDoorGroup(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl door_group add <id> [display_name] | acl door_group list")
+	}
+	verb := strings.ToLower(parts[2])
+	switch verb {
+	case "list":
+		return techMenuACLQueryStrings(ctx, "access_door_groups", "id", "display_name")
+	case "add":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl door_group add <id> [display_name]")
+		}
+		id := strings.TrimSpace(parts[3])
+		name := ""
+		if len(parts) > 4 {
+			name = strings.TrimSpace(strings.Join(parts[4:], " "))
+		}
+		if id == "" {
+			return fmt.Errorf("door_group id must not be empty")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_door_groups (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl door_group add %q", id)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "Door group %q saved. acl target door_group <level_id> %s\n", id, id) })
+		return nil
+	default:
+		return fmt.Errorf("door_group: use add or list")
+	}
+}
+
+func techMenuACLCmdElevator(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl elevator add <id> [display_name] | acl elevator list")
+	}
+	verb := strings.ToLower(parts[2])
+	switch verb {
+	case "list":
+		return techMenuACLQueryStrings(ctx, "access_elevators", "id", "display_name")
+	case "add":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl elevator add <id> [display_name]")
+		}
+		id := strings.TrimSpace(parts[3])
+		name := ""
+		if len(parts) > 4 {
+			name = strings.TrimSpace(strings.Join(parts[4:], " "))
+		}
+		if id == "" {
+			return fmt.Errorf("elevator id must not be empty")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_elevators (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl elevator add %q", id)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "Elevator %q saved. Bind with: acl bind elevator %s\n", id, id) })
+		return nil
+	default:
+		return fmt.Errorf("elevator: use add or list")
+	}
+}
+
+func techMenuACLCmdElevatorGroup(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl elevator_group add <id> [display_name] | acl elevator_group list")
+	}
+	verb := strings.ToLower(parts[2])
+	switch verb {
+	case "list":
+		return techMenuACLQueryStrings(ctx, "access_elevator_groups", "id", "display_name")
+	case "add":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl elevator_group add <id> [display_name]")
+		}
+		id := strings.TrimSpace(parts[3])
+		name := ""
+		if len(parts) > 4 {
+			name = strings.TrimSpace(strings.Join(parts[4:], " "))
+		}
+		if id == "" {
+			return fmt.Errorf("elevator_group id must not be empty")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_elevator_groups (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl elevator_group add %q", id)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "Elevator group %q saved. acl target elevator_group <level_id> %s\n", id, id) })
+		return nil
+	default:
+		return fmt.Errorf("elevator_group: use add or list")
+	}
+}
+
+func nullIfEmpty(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
+}
+
+func techMenuACLCmdPin(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl pin add|list|enable|disable …")
+	}
+	verb := strings.ToLower(parts[2])
+	switch verb {
+	case "list":
+		return techMenuACLQueryStrings(ctx, "access_pins", "pin", "label", "enabled")
+	case "add":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl pin add <pin> [label]")
+		}
+		pin := strings.TrimSpace(parts[3])
+		label := ""
+		if len(parts) > 4 {
+			label = strings.TrimSpace(strings.Join(parts[4:], " "))
+		}
+		if pin == "" {
+			return fmt.Errorf("pin must not be empty")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_pins (pin, label, enabled) VALUES (?, ?, 1)`, pin, nullIfEmpty(label))
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl pin add (enabled)")
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintln(w, "PIN saved (enabled). Add to a user group: acl group join <group_id> <pin>")
+		})
+		return nil
+	case "enable", "disable":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl pin %s <pin>", verb)
+		}
+		pin := strings.TrimSpace(parts[3])
+		if pin == "" {
+			return fmt.Errorf("pin must not be empty")
+		}
+		en := 1
+		if verb == "disable" {
+			en = 0
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		res, err := ctx.DB.Exec(`UPDATE access_pins SET enabled = ? WHERE pin = ?`, en, pin)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("no access_pins row for pin %q — use: acl pin add %s", pin, pin)
+		}
+		log.Printf("INFO: Technician menu: acl pin %s", verb)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "PIN %q enabled=%d\n", pin, en) })
+		return nil
+	default:
+		return fmt.Errorf("pin: use add, list, enable, or disable")
+	}
+}
+
+func techMenuACLCmdGroup(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl group add|list|join|leave …")
+	}
+	verb := strings.ToLower(parts[2])
+	switch verb {
+	case "list":
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		rows, err := ctx.DB.Query(`SELECT g.id, g.display_name, COUNT(m.pin) FROM access_user_groups g LEFT JOIN access_user_group_members m ON m.group_id = g.id GROUP BY g.id ORDER BY g.id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintln(w, "user_group id | display_name | member_pins")
+			for rows.Next() {
+				var id, dn sql.NullString
+				var cnt int
+				if err := rows.Scan(&id, &dn, &cnt); err != nil {
+					fmt.Fprintf(w, "(scan error: %v)\n", err)
+					return
+				}
+				disp := ""
+				if dn.Valid {
+					disp = dn.String
+				}
+				fmt.Fprintf(w, "  %s | %s | %d\n", id.String, disp, cnt)
+			}
+		})
+		log.Println("INFO: Technician menu: acl group list")
+		return rows.Err()
+	case "add":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl group add <id> [display_name]")
+		}
+		id := strings.TrimSpace(parts[3])
+		name := ""
+		if len(parts) > 4 {
+			name = strings.TrimSpace(strings.Join(parts[4:], " "))
+		}
+		if id == "" {
+			return fmt.Errorf("group id must not be empty")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_user_groups (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl group add %q", id)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "User group %q saved. acl group join %s <pin>\n", id, id) })
+		return nil
+	case "join":
+		if len(parts) < 5 {
+			return fmt.Errorf("usage: acl group join <group_id> <pin>")
+		}
+		gid := strings.TrimSpace(parts[3])
+		pin := strings.TrimSpace(parts[4])
+		if gid == "" || pin == "" {
+			return fmt.Errorf("group_id and pin must not be empty")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		if err := techMenuACLEnsureFK(ctx, "access_user_groups", "id", gid, "user group"); err != nil {
+			return err
+		}
+		if err := techMenuACLEnsureFK(ctx, "access_pins", "pin", pin, "PIN"); err != nil {
+			return err
+		}
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_user_group_members (group_id, pin) VALUES (?, ?)`, gid, pin)
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl group join %q %q", gid, pin)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "PIN %q added to group %q\n", pin, gid) })
+		return nil
+	case "leave":
+		if len(parts) < 5 {
+			return fmt.Errorf("usage: acl group leave <group_id> <pin>")
+		}
+		gid := strings.TrimSpace(parts[3])
+		pin := strings.TrimSpace(parts[4])
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		_, err := ctx.DB.Exec(`DELETE FROM access_user_group_members WHERE group_id = ? AND pin = ?`, gid, pin)
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl group leave %q %q", gid, pin)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "Removed PIN %q from group %q (if it was present)\n", pin, gid) })
+		return nil
+	default:
+		return fmt.Errorf("group: use add, list, join, or leave")
+	}
+}
+
+func techMenuACLCreateHint(table string) string {
+	switch table {
+	case "access_doors":
+		return "acl door add <id>"
+	case "access_door_groups":
+		return "acl door_group add <id>"
+	case "access_elevators":
+		return "acl elevator add <id>"
+	case "access_elevator_groups":
+		return "acl elevator_group add <id>"
+	case "access_pins":
+		return "acl pin add <pin>"
+	case "access_user_groups":
+		return "acl group add <id>"
+	case "access_time_profiles":
+		return "acl profile add <id>"
+	case "access_levels":
+		return "acl level add <level_id> <time_profile_id> <user_group_id>"
+	default:
+		return "acl help"
+	}
+}
+
+func techMenuACLEnsureFK(ctx *AppContext, table, col, id, what string) error {
+	var dummy string
+	err := ctx.DB.QueryRow(`SELECT `+col+` FROM `+table+` WHERE `+col+` = ? LIMIT 1`, id).Scan(&dummy)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("unknown %s %q — create it first (%s)", what, id, techMenuACLCreateHint(table))
+	}
+	return err
+}
+
+func techMenuACLCmdProfile(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl profile add|list …")
+	}
+	verb := strings.ToLower(parts[2])
+	switch verb {
+	case "list":
+		return techMenuACLQueryStrings(ctx, "access_time_profiles", "id", "display_name", "iana_timezone")
+	case "add":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl profile add <id> [display_name [iana_timezone]]")
+		}
+		id := strings.TrimSpace(parts[3])
+		if id == "" {
+			return fmt.Errorf("profile id must not be empty")
+		}
+		display := ""
+		tz := ""
+		switch len(parts) {
+		case 4:
+			break
+		case 5:
+			display = strings.TrimSpace(parts[4])
+		default:
+			display = strings.TrimSpace(parts[4])
+			tz = strings.TrimSpace(strings.Join(parts[5:], " "))
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_time_profiles (id, display_name, description, iana_timezone) VALUES (?, ?, ?, ?)`,
+			id, nullIfEmpty(display), nil, tz)
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl profile add %q", id)
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintf(w, "Time profile %q saved. Add windows: acl window add %s <weekday> <start_min> <end_min>\n", id, id)
+			fmt.Fprintln(w, "  weekday: 0=Sun … 6=Sat, 7=any day; minutes 0–1439 (start>end crosses midnight)")
+		})
+		return nil
+	default:
+		return fmt.Errorf("profile: use add or list")
+	}
+}
+
+func techMenuACLCmdWindow(ctx *AppContext, parts []string) error {
+	if len(parts) < 7 {
+		return fmt.Errorf(`usage: acl window add <profile_id> <weekday> <start_minute> <end_minute>
+example: acl window add biz 1 525 1020   (Mon 08:45–17:00)
+hint: acl profile list — use existing profile_id`)
+	}
+	if strings.ToLower(parts[2]) != "add" {
+		return fmt.Errorf("window: only add is supported")
+	}
+	pid := strings.TrimSpace(parts[3])
+	wd, err := strconv.Atoi(parts[4])
+	if err != nil {
+		return fmt.Errorf("weekday: integer 0–7: %w", err)
+	}
+	sm, err := strconv.Atoi(parts[5])
+	if err != nil {
+		return fmt.Errorf("start_minute: %w", err)
+	}
+	em, err := strconv.Atoi(parts[6])
+	if err != nil {
+		return fmt.Errorf("end_minute: %w", err)
+	}
+	if wd < 0 || wd > 7 || sm < 0 || sm > 1439 || em < 0 || em > 1439 {
+		return fmt.Errorf("weekday must be 0–7, minutes 0–1439")
+	}
+	aclDBMu.Lock()
+	defer aclDBMu.Unlock()
+	if err := techMenuACLEnsureFK(ctx, "access_time_profiles", "id", pid, "time profile"); err != nil {
+		return err
+	}
+	_, err = ctx.DB.Exec(`INSERT INTO access_time_windows (time_profile_id, weekday, start_minute, end_minute) VALUES (?, ?, ?, ?)`, pid, wd, sm, em)
+	if err != nil {
+		return err
+	}
+	log.Printf("INFO: Technician menu: acl window add profile=%s weekday=%d %d-%d", pid, wd, sm, em)
+	techMenuSyncPrint(func(w io.Writer) {
+		fmt.Fprintf(w, "Time window added for profile %q. Next: acl level add <level_id> %s <user_group_id> [name]\n", pid, pid)
+	})
+	return nil
+}
+
+func techMenuACLCmdLevel(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl level add|list|enable|disable …")
+	}
+	verb := strings.ToLower(parts[2])
+	switch verb {
+	case "list":
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		rows, err := ctx.DB.Query(`SELECT id, display_name, time_profile_id, user_group_id, enabled FROM access_levels ORDER BY id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintln(w, "id | display_name | time_profile_id | user_group_id | enabled")
+			for rows.Next() {
+				var id, dn, tp, ug string
+				var en int
+				if err := rows.Scan(&id, &dn, &tp, &ug, &en); err != nil {
+					fmt.Fprintf(w, "(scan error: %v)\n", err)
+					return
+				}
+				fmt.Fprintf(w, "  %s | %s | %s | %s | %d\n", id, dn, tp, ug, en)
+			}
+		})
+		log.Println("INFO: Technician menu: acl level list")
+		return rows.Err()
+	case "add":
+		if len(parts) < 6 {
+			return fmt.Errorf(`usage: acl level add <level_id> <time_profile_id> <user_group_id> [display_name]
+hint: acl profile list | acl group list`)
+		}
+		lid := strings.TrimSpace(parts[3])
+		tpid := strings.TrimSpace(parts[4])
+		ugid := strings.TrimSpace(parts[5])
+		dname := ""
+		if len(parts) > 6 {
+			dname = strings.TrimSpace(strings.Join(parts[6:], " "))
+		}
+		if lid == "" || tpid == "" || ugid == "" {
+			return fmt.Errorf("level_id, time_profile_id, and user_group_id must not be empty")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		if err := techMenuACLEnsureFK(ctx, "access_time_profiles", "id", tpid, "time profile"); err != nil {
+			return err
+		}
+		if err := techMenuACLEnsureFK(ctx, "access_user_groups", "id", ugid, "user group"); err != nil {
+			return err
+		}
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_levels (id, display_name, time_profile_id, user_group_id, enabled) VALUES (?, ?, ?, ?, 1)`,
+			lid, nullIfEmpty(dname), tpid, ugid)
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl level add %q", lid)
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintf(w, "Access level %q saved (enabled). Grant door/elevator: acl target door %s <door_id>\n", lid, lid)
+		})
+		return nil
+	case "enable", "disable":
+		if len(parts) < 4 {
+			return fmt.Errorf("usage: acl level %s <level_id>", verb)
+		}
+		lid := strings.TrimSpace(parts[3])
+		en := 1
+		if verb == "disable" {
+			en = 0
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		res, err := ctx.DB.Exec(`UPDATE access_levels SET enabled = ? WHERE id = ?`, en, lid)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("no access_levels row for id %q — acl level list", lid)
+		}
+		log.Printf("INFO: Technician menu: acl level %s %q", verb, lid)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "Level %q enabled=%d\n", lid, en) })
+		return nil
+	default:
+		return fmt.Errorf("level: use add, list, enable, or disable")
+	}
+}
+
+func techMenuACLCmdTarget(ctx *AppContext, parts []string) error {
+	if len(parts) < 3 {
+		return fmt.Errorf("usage: acl target door|elevator|door_group|elevator_group <level_id> <id> | acl target list")
+	}
+	verb := strings.ToLower(parts[2])
+	if verb == "list" {
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		rows, err := ctx.DB.Query(`
+			SELECT t.id, t.access_level_id, t.door_id, t.door_group_id, t.elevator_id, t.elevator_group_id
+			FROM access_level_targets t ORDER BY t.access_level_id, t.id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintln(w, "row_id | level_id | door_id | door_group_id | elevator_id | elevator_group_id")
+			for rows.Next() {
+				var rid int
+				var lid string
+				var did, dgid, eid, egid sql.NullString
+				if err := rows.Scan(&rid, &lid, &did, &dgid, &eid, &egid); err != nil {
+					fmt.Fprintf(w, "(scan error: %v)\n", err)
+					return
+				}
+				fmt.Fprintf(w, "  %d | %s | %v | %v | %v | %v\n", rid, lid, ns(did), ns(dgid), ns(eid), ns(egid))
+			}
+		})
+		log.Println("INFO: Technician menu: acl target list")
+		return rows.Err()
+	}
+	if len(parts) < 5 {
+		return fmt.Errorf("usage: acl target %s <level_id> <target_id>", verb)
+	}
+	lid := strings.TrimSpace(parts[3])
+	tid := strings.TrimSpace(parts[4])
+	if lid == "" || tid == "" {
+		return fmt.Errorf("level_id and target id must not be empty")
+	}
+	aclDBMu.Lock()
+	defer aclDBMu.Unlock()
+	if err := techMenuACLEnsureFK(ctx, "access_levels", "id", lid, "access level"); err != nil {
+		return err
+	}
+	var err error
+	switch verb {
+	case "door":
+		if err := techMenuACLEnsureFK(ctx, "access_doors", "id", tid, "door"); err != nil {
+			return err
+		}
+		_, err = ctx.DB.Exec(`INSERT INTO access_level_targets (access_level_id, door_id, door_group_id, elevator_id, elevator_group_id) VALUES (?, ?, NULL, NULL, NULL)`, lid, tid)
+	case "door_group":
+		if err := techMenuACLEnsureFK(ctx, "access_door_groups", "id", tid, "door group"); err != nil {
+			return err
+		}
+		_, err = ctx.DB.Exec(`INSERT INTO access_level_targets (access_level_id, door_id, door_group_id, elevator_id, elevator_group_id) VALUES (?, NULL, ?, NULL, NULL)`, lid, tid)
+	case "elevator":
+		if err := techMenuACLEnsureFK(ctx, "access_elevators", "id", tid, "elevator"); err != nil {
+			return err
+		}
+		_, err = ctx.DB.Exec(`INSERT INTO access_level_targets (access_level_id, door_id, door_group_id, elevator_id, elevator_group_id) VALUES (?, NULL, NULL, ?, NULL)`, lid, tid)
+	case "elevator_group":
+		if err := techMenuACLEnsureFK(ctx, "access_elevator_groups", "id", tid, "elevator group"); err != nil {
+			return err
+		}
+		_, err = ctx.DB.Exec(`INSERT INTO access_level_targets (access_level_id, door_id, door_group_id, elevator_id, elevator_group_id) VALUES (?, NULL, NULL, NULL, ?)`, lid, tid)
+	default:
+		return fmt.Errorf("target: use door, elevator, door_group, elevator_group, or list")
+	}
+	if err != nil {
+		return err
+	}
+	log.Printf("INFO: Technician menu: acl target %s level=%q target=%q", verb, lid, tid)
+	techMenuSyncPrint(func(w io.Writer) {
+		fmt.Fprintf(w, "Target row added. Bind device: acl bind door|elevator <id> (must match this target)\n")
+	})
+	return nil
+}
+
+func ns(s sql.NullString) string {
+	if s.Valid {
+		return s.String
+	}
+	return ""
+}
+
+func techMenuACLQueryStrings(ctx *AppContext, table string, cols ...string) error {
+	if len(cols) == 0 {
+		return fmt.Errorf("internal: no columns")
+	}
+	aclDBMu.Lock()
+	defer aclDBMu.Unlock()
+	sb := strings.Builder{}
+	for i, c := range cols {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(c)
+	}
+	q := `SELECT ` + sb.String() + ` FROM ` + table + ` ORDER BY 1`
+	rows, err := ctx.DB.Query(q)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	techMenuSyncPrint(func(w io.Writer) {
+		fmt.Fprintln(w, strings.Join(cols, " | "))
+		for rows.Next() {
+			scans := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range cols {
+				ptrs[i] = &scans[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				fmt.Fprintf(w, "(scan error: %v)\n", err)
+				return
+			}
+			for i, v := range scans {
+				if i > 0 {
+					fmt.Fprint(w, " | ")
+				}
+				fmt.Fprint(w, techMenuACLFormatCell(v))
+			}
+			fmt.Fprintln(w)
+		}
+	})
+	log.Printf("INFO: Technician menu: acl list %s", table)
+	return rows.Err()
+}
+
+func techMenuACLFormatCell(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case []byte:
+		return string(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	default:
+		return fmt.Sprint(x)
+	}
 }
