@@ -45,8 +45,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.05"
-	SoftwareReleaseUTC = "2026-04-14T04:58:17Z"
+	SoftwareVersion    = "0.06"
+	SoftwareReleaseUTC = "2026-04-14T05:53:47Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -3353,7 +3353,7 @@ func (ctx *AppContext) elevatorPredefinedDispatchIndexForACL(cfg DeviceConfig) i
 
 func initDatabase() *sql.DB {
 	// Initialize SQLite for storing logs, configs, and access control lists [cite: 6, 7]
-	db, err := sql.Open("sqlite3", "file:./access_control.db?_fk=1")
+	db, err := sql.Open("sqlite3", "file:./access_control.db?_fk=1&_busy_timeout=5000")
 	if err != nil {
 		releaseStartupLogBuffer(os.Stdout)
 		log.Fatalf("CRITICAL: Failed to open database: %v", err)
@@ -3369,6 +3369,24 @@ func initDatabase() *sql.DB {
 	}
 	if err := initAccessScheduleSchema(db); err != nil {
 		log.Printf("WARNING: access schedule schema: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		created_at TEXT NOT NULL,
+		event_type TEXT NOT NULL DEFAULT 'event',
+		event_name TEXT NOT NULL,
+		device_client_id TEXT,
+		detail_json TEXT NOT NULL DEFAULT '{}'
+	)`); err != nil {
+		log.Printf("WARNING: logs table: %v", err)
+	} else {
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at)`); err != nil {
+			log.Printf("WARNING: logs index idx_logs_created_at: %v", err)
+		}
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_event_name ON logs(event_name)`); err != nil {
+			log.Printf("WARNING: logs index idx_logs_event_name: %v", err)
+		}
+		log.Println("INFO: SQLite logs table ready (audit trail for event activities).")
 	}
 	return db
 }
@@ -3663,6 +3681,37 @@ func mqttPublishRemoteAck(ctx *AppContext, ack mqttRemoteAck) {
 // webhookHTTPClient is used for configurable event and heartbeat callback POSTs.
 var webhookHTTPClient = &http.Client{Timeout: 25 * time.Second}
 
+// auditLogInsertMu serializes SQLite inserts into logs to reduce SQLITE_BUSY contention.
+var auditLogInsertMu sync.Mutex
+
+// auditLogEvent records an event activity row in logs (same semantic events as webhooks). Runs even when
+// webhook_event_enabled is false. detail_json matches webhook detail maps (no PINs or secrets).
+func auditLogEvent(ctx *AppContext, event string, detail map[string]any) {
+	if ctx == nil || ctx.DB == nil || strings.TrimSpace(event) == "" {
+		return
+	}
+	ctx.configMu.RLock()
+	cid := ctx.Config.MQTTClientID
+	ctx.configMu.RUnlock()
+	det := detail
+	if det == nil {
+		det = map[string]any{}
+	}
+	b, err := json.Marshal(det)
+	if err != nil {
+		log.Printf("WARNING: audit log JSON marshal: %v", err)
+		return
+	}
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	auditLogInsertMu.Lock()
+	_, err = ctx.DB.Exec(`INSERT INTO logs (created_at, event_type, event_name, device_client_id, detail_json) VALUES (?, ?, ?, ?, ?)`,
+		ts, "event", event, cid, string(b))
+	auditLogInsertMu.Unlock()
+	if err != nil {
+		log.Printf("WARNING: audit log insert: %v", err)
+	}
+}
+
 func webhookPostJSONAsync(url string, tokenEnabled bool, token string, payload map[string]any) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -3699,6 +3748,7 @@ func webhookPostJSONAsync(url string, tokenEnabled bool, token string, payload m
 // fireEventWebhook POSTs JSON to webhook_event_url when webhook_event_enabled and URL are set.
 // Payload never includes PINs or tokens. Optional Bearer token when webhook_event_token_enabled and token non-empty.
 func fireEventWebhook(ctx *AppContext, event string, detail map[string]any) {
+	auditLogEvent(ctx, event, detail)
 	ctx.configMu.RLock()
 	if !ctx.Config.WebhookEventEnabled {
 		ctx.configMu.RUnlock()

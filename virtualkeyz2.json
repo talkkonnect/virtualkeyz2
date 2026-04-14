@@ -63,7 +63,7 @@
     "mcp23017_i2c_addr": 32,
     "xl9535_i2c_bus": 1,
     "xl9535_i2c_addr": 32,
-    "door_relay_pin": 7,
+    "door_relay_pin": 5,
     "door_relay_active_low": false,
     "buzzer_relay_pin": 11,
     "buzzer_relay_active_low": false,

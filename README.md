@@ -1,5 +1,7 @@
 # VirtualKeyz2 — Operator Guide
 
+Virtualkeyz2 is an opensource door and elevator PIN based access control using USB keypads and I2C expander boards for the hardware layer.
+
 This document is for installers and operators who configure and run the service on a Raspberry Pi (or similar Linux host). It describes behaviour, configuration keys, SQLite access control, and practical wiring notes. Authoritative JSON field names match `virtualkeyz2.json`.
 
 ---
