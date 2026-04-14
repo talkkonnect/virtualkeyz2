@@ -4096,9 +4096,9 @@ func runKeypadListener(ctx *AppContext, devicePath, keypadRole string) {
 				restartInterDigit()
 
 				ctx.configMu.RLock()
-				cfg := ctx.Config
+				//cfg := ctx.Config
 				ctx.configMu.RUnlock()
-				playSoundSync(cfg, cfg.SoundKeypress)
+				//playSoundAsync(cfg, cfg.SoundKeypress)
 
 				ke := evdev.NewKeyEvent(ev)
 				char := ""
