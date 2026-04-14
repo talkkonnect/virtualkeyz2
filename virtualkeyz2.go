@@ -40,12 +40,13 @@ import (
 
 	"virtualkeyz2/internal/keypadlist"
 	"virtualkeyz2/internal/mcp23017"
+	"virtualkeyz2/internal/xl9535"
 )
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.04"
-	SoftwareReleaseUTC = "2026-04-09T10:47:00Z"
+	SoftwareVersion    = "0.05"
+	SoftwareReleaseUTC = "2026-04-14T04:58:17Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -66,6 +67,7 @@ const (
 const (
 	RelayOutputGPIO     = "gpio"
 	RelayOutputMCP23017 = "mcp23017"
+	RelayOutputXL9535   = "xl9535"
 )
 
 // PairPeerRoleEntry / PairPeerExit used with ModeAccessPairedRemoteExit (MQTT to sibling controller).
@@ -130,6 +132,10 @@ func isElevatorPredefinedMode(mode string) bool {
 	return mode == ModeElevatorPredefinedFloor
 }
 
+func isElevatorKeypadMode(mode string) bool {
+	return isElevatorWaitFloorMode(mode) || isElevatorPredefinedMode(mode)
+}
+
 // Elevator wait-floor cab sense sub-modes (device.elevator_wait_floor_cab_sense).
 const (
 	ElevatorWaitFloorCabSenseSense  = "sense"
@@ -178,12 +184,15 @@ func pairedExitSubscribesToPeer(mode, pairRole string) bool {
 
 // GPIOSettings holds BCM pin numbers and relay polarity (wiring on the Pi).
 type GPIOSettings struct {
-	// RelayOutputMode: RelayOutputGPIO (door/buzzer/elevator relays on BCM) or RelayOutputMCP23017 (relays on I2C MCP23017, pins 0–15).
+	// RelayOutputMode: RelayOutputGPIO (BCM), RelayOutputMCP23017, or RelayOutputXL9535 (I2C expanders, relay pins 0–15).
 	RelayOutputMode string
-	// MCP23017I2CBus: Linux I2C adapter index (/dev/i2c-<n>), default 1 on Raspberry Pi.
+	// MCP23017I2CBus: Linux I2C adapter index (/dev/i2c-<n>), default 1 on Raspberry Pi (used when relay_output_mode=mcp23017).
 	MCP23017I2CBus int
 	// MCP23017I2CAddr: 7-bit MCP23017 address, default 0x20 (decimal 32).
 	MCP23017I2CAddr uint8
+	// XL9535I2CBus / XL9535I2CAddr: used when relay_output_mode=xl9535 (defaults match MCP23017).
+	XL9535I2CBus  int
+	XL9535I2CAddr uint8
 
 	DoorRelayPin         uint8
 	DoorRelayActiveLow   bool
@@ -243,6 +252,10 @@ type AppContext struct {
 	elevatorGrantStartedAt       time.Time // when the current grant began; used for cab-sense arming/debounce
 	elevatorCabFloorDebounceHeld []int     // pressed indices seen while accumulating elevatorCabFloorDebounceTick
 	elevatorCabFloorDebounceTick int       // consecutive 50ms polls with same held snapshot
+	elevatorGrantPIN             string    // credential used for current wait-floor grant (for DB floor ACL)
+	elevatorGrantViaFallback     bool
+	elevatorGrantFloorsRestricted bool // true when access_elevator_pin_floors has rows for this PIN+elevator
+	elevatorGrantAllowedFloors   map[int]bool
 
 	// Dual USB keypad: in-memory occupancy per PIN (entry adds, exit subtracts). Reset on process restart.
 	occupancyMu    sync.Mutex
@@ -360,7 +373,9 @@ type DeviceConfig struct {
 
 	// AccessControlDoorID: logical door (access_doors.id). When set with access_schedule_enforce, PIN must match an enabled access level and time window for this door (direct or via door group).
 	AccessControlDoorID string
-	// AccessScheduleEnforce: when true (default), apply SQLite access_levels/access_time_windows when this door has targets.
+	// AccessControlElevatorID: logical elevator (access_elevators.id). When set with access_schedule_enforce and keypad is in an elevator mode, PIN must match an enabled access level and time window for this elevator (direct or via elevator group).
+	AccessControlElevatorID string
+	// AccessScheduleEnforce: when true (default), apply SQLite access_levels/access_time_windows when the configured door or elevator has targets.
 	AccessScheduleEnforce bool
 	// AccessScheduleApplyToFallbackPin: when true, device.fallback_access_pin is subject to schedules; default false (emergency bypass).
 	AccessScheduleApplyToFallbackPin bool
@@ -430,6 +445,7 @@ type virtualkeyz2DeviceJSON struct {
 	ElevatorEnablePulseDuration         *string `json:"elevator_enable_pulse_duration"`
 	DualKeypadRejectExitWithoutEntry    *bool   `json:"dual_keypad_reject_exit_without_entry"`
 	AccessControlDoorID                 *string `json:"access_control_door_id,omitempty"`
+	AccessControlElevatorID             *string `json:"access_control_elevator_id,omitempty"`
 	AccessScheduleEnforce               *bool   `json:"access_schedule_enforce,omitempty"`
 	AccessScheduleApplyToFallbackPin      *bool   `json:"access_schedule_apply_to_fallback_pin,omitempty"`
 }
@@ -438,6 +454,8 @@ type virtualkeyz2GPIOJSON struct {
 	RelayOutputMode              *string `json:"relay_output_mode"`
 	MCP23017I2CBus               *int    `json:"mcp23017_i2c_bus"`
 	MCP23017I2CAddr              *int    `json:"mcp23017_i2c_addr"`
+	XL9535I2CBus                 *int    `json:"xl9535_i2c_bus"`
+	XL9535I2CAddr                *int    `json:"xl9535_i2c_addr"`
 	DoorRelayPin                 *int    `json:"door_relay_pin"`
 	DoorRelayActiveLow           *bool   `json:"door_relay_active_low"`
 	BuzzerRelayPin               *int    `json:"buzzer_relay_pin"`
@@ -468,21 +486,30 @@ func normalizeRelayOutputMode(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", RelayOutputGPIO, "direct", "bcm":
 		return RelayOutputGPIO
-	case RelayOutputMCP23017, "mcp", "i2c":
+	case RelayOutputMCP23017, "mcp":
+		return RelayOutputMCP23017
+	case RelayOutputXL9535, "xinluda":
+		return RelayOutputXL9535
+	case "i2c":
 		return RelayOutputMCP23017
 	default:
 		return RelayOutputGPIO
 	}
 }
 
-func isRelayOutputMCP23017(mode string) bool {
-	return normalizeRelayOutputMode(mode) == RelayOutputMCP23017
+func isRelayOutputI2CExpander(mode string) bool {
+	switch normalizeRelayOutputMode(mode) {
+	case RelayOutputMCP23017, RelayOutputXL9535:
+		return true
+	default:
+		return false
+	}
 }
 
 func relayPinUint8(field string, v int, relayMode string) (uint8, error) {
-	if isRelayOutputMCP23017(relayMode) {
+	if isRelayOutputI2CExpander(relayMode) {
 		if v < 0 || v > 15 {
-			return 0, fmt.Errorf("gpio.%s: MCP23017 port pin %d out of range 0-15", field, v)
+			return 0, fmt.Errorf("gpio.%s: I2C relay expander pin %d out of range 0-15", field, v)
 		}
 		return uint8(v), nil
 	}
@@ -496,6 +523,12 @@ func normalizeGPIORelaySettings(g *GPIOSettings) {
 	}
 	if g.MCP23017I2CAddr == 0 {
 		g.MCP23017I2CAddr = 0x20
+	}
+	if g.XL9535I2CBus <= 0 {
+		g.XL9535I2CBus = 1
+	}
+	if g.XL9535I2CAddr == 0 {
+		g.XL9535I2CAddr = 0x20
 	}
 }
 
@@ -1016,6 +1049,9 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.AccessControlDoorID != nil {
 		app.Config.AccessControlDoorID = strings.TrimSpace(*d.AccessControlDoorID)
 	}
+	if d.AccessControlElevatorID != nil {
+		app.Config.AccessControlElevatorID = strings.TrimSpace(*d.AccessControlElevatorID)
+	}
 	if d.AccessScheduleEnforce != nil {
 		app.Config.AccessScheduleEnforce = *d.AccessScheduleEnforce
 	}
@@ -1035,6 +1071,16 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 			return fmt.Errorf("gpio.mcp23017_i2c_addr: %d out of range 0-255", a)
 		}
 		app.GPIOSettings.MCP23017I2CAddr = uint8(a)
+	}
+	if g.XL9535I2CBus != nil {
+		app.GPIOSettings.XL9535I2CBus = *g.XL9535I2CBus
+	}
+	if g.XL9535I2CAddr != nil {
+		a := *g.XL9535I2CAddr
+		if a < 0 || a > 255 {
+			return fmt.Errorf("gpio.xl9535_i2c_addr: %d out of range 0-255", a)
+		}
+		app.GPIOSettings.XL9535I2CAddr = uint8(a)
 	}
 	normalizeGPIORelaySettings(&app.GPIOSettings)
 	relayMode := normalizeRelayOutputMode(app.GPIOSettings.RelayOutputMode)
@@ -1259,6 +1305,7 @@ type virtualkeyz2PersistDevice struct {
 	ElevatorEnablePulseDuration         string `json:"elevator_enable_pulse_duration"`
 	DualKeypadRejectExitWithoutEntry    bool   `json:"dual_keypad_reject_exit_without_entry"`
 	AccessControlDoorID              string `json:"access_control_door_id,omitempty"`
+	AccessControlElevatorID          string `json:"access_control_elevator_id,omitempty"`
 	AccessScheduleEnforce            bool   `json:"access_schedule_enforce"`
 	AccessScheduleApplyToFallbackPin bool   `json:"access_schedule_apply_to_fallback_pin"`
 }
@@ -1267,6 +1314,8 @@ type virtualkeyz2PersistGPIO struct {
 	RelayOutputMode              string `json:"relay_output_mode"`
 	MCP23017I2CBus               int    `json:"mcp23017_i2c_bus"`
 	MCP23017I2CAddr              int    `json:"mcp23017_i2c_addr"`
+	XL9535I2CBus                 int    `json:"xl9535_i2c_bus"`
+	XL9535I2CAddr                int    `json:"xl9535_i2c_addr"`
 	DoorRelayPin                 int    `json:"door_relay_pin"`
 	DoorRelayActiveLow           bool   `json:"door_relay_active_low"`
 	BuzzerRelayPin               int    `json:"buzzer_relay_pin"`
@@ -1358,11 +1407,14 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	}
 	out.Device.DualKeypadRejectExitWithoutEntry = c.DualKeypadRejectExitWithoutEntry
 	out.Device.AccessControlDoorID = c.AccessControlDoorID
+	out.Device.AccessControlElevatorID = c.AccessControlElevatorID
 	out.Device.AccessScheduleEnforce = c.AccessScheduleEnforce
 	out.Device.AccessScheduleApplyToFallbackPin = c.AccessScheduleApplyToFallbackPin
 	out.GPIO.RelayOutputMode = normalizeRelayOutputMode(g.RelayOutputMode)
 	out.GPIO.MCP23017I2CBus = g.MCP23017I2CBus
 	out.GPIO.MCP23017I2CAddr = int(g.MCP23017I2CAddr)
+	out.GPIO.XL9535I2CBus = g.XL9535I2CBus
+	out.GPIO.XL9535I2CAddr = int(g.XL9535I2CAddr)
 	out.GPIO.DoorRelayPin = int(g.DoorRelayPin)
 	out.GPIO.DoorRelayActiveLow = g.DoorRelayActiveLow
 	out.GPIO.BuzzerRelayPin = int(g.BuzzerRelayPin)
@@ -1676,6 +1728,24 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 				normalizeGPIORelaySettings(&ctx.GPIOSettings)
 			}
 		}
+	case "xl9535_i2c_bus":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.GPIOSettings.XL9535I2CBus = int(n)
+			normalizeGPIORelaySettings(&ctx.GPIOSettings)
+		}
+	case "xl9535_i2c_addr":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			if n < 0 || n > 255 {
+				err = fmt.Errorf("xl9535_i2c_addr %d out of range 0-255", n)
+			} else {
+				ctx.GPIOSettings.XL9535I2CAddr = uint8(n)
+				normalizeGPIORelaySettings(&ctx.GPIOSettings)
+			}
+		}
 	case "door_relay_pin":
 		var n int64
 		n, err = strconv.ParseInt(value, 10, 32)
@@ -1853,6 +1923,8 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.DualKeypadRejectExitWithoutEntry, err = strconv.ParseBool(value)
 	case "access_control_door_id":
 		ctx.Config.AccessControlDoorID = value
+	case "access_control_elevator_id":
+		ctx.Config.AccessControlElevatorID = value
 	case "access_schedule_enforce":
 		ctx.Config.AccessScheduleEnforce, err = strconv.ParseBool(value)
 	case "access_schedule_apply_to_fallback_pin":
@@ -1956,11 +2028,14 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   elevator_enable_pulse_duration   elevator_predefined_floor only: pulse length for predefined enable relay; wait-floor holds enables for full elevator_floor_wait_timeout (this key ignored there)
   dual_keypad_reject_exit_without_entry  true|false (dual USB: reject exit PIN if no entry recorded)
   access_control_door_id            logical door id (access_doors.id); empty = PIN-only, no schedule enforcement
-  access_schedule_enforce           true|false (default true): when door id set, enforce access_levels + time windows if DB maps this door
+  access_control_elevator_id        logical elevator id (access_elevators.id); empty = no elevator schedule; used in elevator_* keypad modes when set
+  access_schedule_enforce           true|false (default true): when door/elevator id set, enforce access_levels + time windows if DB maps that target
   access_schedule_apply_to_fallback_pin  true|false (default false): subject device.fallback_access_pin to schedules
-  relay_output_mode                 gpio|mcp23017 (relays on BCM vs MCP23017; sensors/LED stay BCM)
-  mcp23017_i2c_bus                  Linux I2C bus number (default 1 = /dev/i2c-1)
-  mcp23017_i2c_addr                 7-bit address, default 32 (0x20)
+  relay_output_mode                 gpio|mcp23017|xl9535 (relays on BCM vs I2C expander; sensors/LED stay BCM)
+  mcp23017_i2c_bus                  MCP23017: Linux I2C bus (default 1)
+  mcp23017_i2c_addr                 MCP23017: 7-bit address, default 32 (0x20)
+  xl9535_i2c_bus                    XL9535: Linux I2C bus (default 1)
+  xl9535_i2c_addr                   XL9535: 7-bit address, default 32 (0x20)
   exit_button_pin                   REX GPIO (access_entry_with_exit_button)
   exit_button_active_low            true|false
   entry_button_pin                  GPIO (access_exit_with_entry_button)
@@ -1972,7 +2047,7 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   elevator_predefined_enable_pins   predefined only: at most one relay that pulses to simulate the floor call
   elevator_enable_relay_pin       wait-floor legacy: single relay for all cab floor buttons when elevator_wait_floor_enable_pins empty; not used with per-floor wait enables
   elevator_enable_active_low        true|false
-  door_relay_pin                    BCM 0-40, or MCP23017 pin 0-15 if relay_output_mode=mcp23017
+  door_relay_pin                    BCM 0-40, or expander pin 0-15 if relay_output_mode=mcp23017 or xl9535
   door_relay_active_low             true|false
   buzzer_relay_pin
   buzzer_relay_active_low           true|false
@@ -2066,6 +2141,8 @@ func main() {
 			RelayOutputMode:      RelayOutputGPIO,
 			MCP23017I2CBus:       1,
 			MCP23017I2CAddr:      0x20,
+			XL9535I2CBus:         1,
+			XL9535I2CAddr:        0x20,
 			DoorRelayPin:         5,
 			DoorRelayActiveLow:   false,
 			BuzzerRelayPin:       10,
@@ -2095,43 +2172,60 @@ func main() {
 		defer rpio.Close()
 		go manageHardwareHeartbeat(appCtx.GPIOSettings.HeartbeatLEDPin)
 		gpio := NewGPIOManager()
-		relayMCPMode := isRelayOutputMCP23017(appCtx.GPIOSettings.RelayOutputMode)
-		useMCP := false
-		if relayMCPMode {
-			bus := appCtx.GPIOSettings.MCP23017I2CBus
-			addr := appCtx.GPIOSettings.MCP23017I2CAddr
-			mcpDev, mcpErr := mcp23017.Open(bus, addr)
-			if mcpErr != nil {
-				log.Printf("WARNING: MCP23017 relay backend (%s / 0x%02x): %v", fmt.Sprintf("/dev/i2c-%d", bus), addr, mcpErr)
-				log.Println("WARNING: Relay outputs disabled (mcp23017 mode but expander not available; pins 0-15 are not valid BCM numbers).")
-			} else {
-				gpio.SetMCP23017(mcpDev)
-				useMCP = true
-				defer mcpDev.Close()
-				log.Printf("INFO: Relay outputs on MCP23017 bus %d address 0x%02x (pins 0-15 = GPA0..GPB7).", bus, addr)
+		relayI2CMode := isRelayOutputI2CExpander(appCtx.GPIOSettings.RelayOutputMode)
+		useI2CExpander := false
+		relayOutMode := normalizeRelayOutputMode(appCtx.GPIOSettings.RelayOutputMode)
+		if relayI2CMode {
+			switch relayOutMode {
+			case RelayOutputMCP23017:
+				bus := appCtx.GPIOSettings.MCP23017I2CBus
+				addr := appCtx.GPIOSettings.MCP23017I2CAddr
+				mcpDev, mcpErr := mcp23017.Open(bus, addr)
+				if mcpErr != nil {
+					log.Printf("WARNING: MCP23017 relay backend (%s / 0x%02x): %v", fmt.Sprintf("/dev/i2c-%d", bus), addr, mcpErr)
+					log.Println("WARNING: Relay outputs disabled (mcp23017 mode but expander not available; pins 0-15 are not valid BCM numbers).")
+				} else {
+					gpio.SetI2CRelayExpander(mcpDev)
+					useI2CExpander = true
+					defer mcpDev.Close()
+					log.Printf("INFO: Relay outputs on MCP23017 bus %d address 0x%02x (pins 0-15 = GPA0..GPB7).", bus, addr)
+				}
+			case RelayOutputXL9535:
+				bus := appCtx.GPIOSettings.XL9535I2CBus
+				addr := appCtx.GPIOSettings.XL9535I2CAddr
+				xlDev, xlErr := xl9535.Open(bus, addr)
+				if xlErr != nil {
+					log.Printf("WARNING: XL9535 relay backend (%s / 0x%02x): %v", fmt.Sprintf("/dev/i2c-%d", bus), addr, xlErr)
+					log.Println("WARNING: Relay outputs disabled (xl9535 mode but expander not available; pins 0-15 are not valid BCM numbers).")
+				} else {
+					gpio.SetI2CRelayExpander(xlDev)
+					useI2CExpander = true
+					defer xlDev.Close()
+					log.Printf("INFO: Relay outputs on XL9535 bus %d address 0x%02x (pins 0-7 = port0, 8-15 = port1).", bus, addr)
+				}
 			}
 		}
-		if !relayMCPMode || useMCP {
-			gpio.AddOutput("door", appCtx.GPIOSettings.DoorRelayPin, appCtx.GPIOSettings.DoorRelayActiveLow, useMCP)
-			gpio.AddOutput("buzzer", appCtx.GPIOSettings.BuzzerRelayPin, appCtx.GPIOSettings.BuzzerRelayActiveLow, useMCP)
+		if !relayI2CMode || useI2CExpander {
+			gpio.AddOutput("door", appCtx.GPIOSettings.DoorRelayPin, appCtx.GPIOSettings.DoorRelayActiveLow, useI2CExpander)
+			gpio.AddOutput("buzzer", appCtx.GPIOSettings.BuzzerRelayPin, appCtx.GPIOSettings.BuzzerRelayActiveLow, useI2CExpander)
 			if len(appCtx.elevatorFloorDispatchPins) > 0 {
 				for i, pin := range appCtx.elevatorFloorDispatchPins {
-					gpio.AddOutput(elevatorFloorDispatchOutputName(i), pin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useMCP)
+					gpio.AddOutput(elevatorFloorDispatchOutputName(i), pin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useI2CExpander)
 				}
 			} else if appCtx.GPIOSettings.ElevatorDispatchRelayPin != 0 {
-				gpio.AddOutput("elevator_dispatch", appCtx.GPIOSettings.ElevatorDispatchRelayPin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useMCP)
+				gpio.AddOutput("elevator_dispatch", appCtx.GPIOSettings.ElevatorDispatchRelayPin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useI2CExpander)
 			}
 			if len(appCtx.elevatorPredefinedEnablePins) > 0 {
 				for i, pin := range appCtx.elevatorPredefinedEnablePins {
-					gpio.AddOutput(elevatorPredefinedEnableOutputName(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useMCP)
+					gpio.AddOutput(elevatorPredefinedEnableOutputName(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
 				}
 			}
 			if len(appCtx.elevatorWaitFloorEnablePins) > 0 {
 				for i, pin := range appCtx.elevatorWaitFloorEnablePins {
-					gpio.AddOutput(elevatorWaitFloorEnableOutputName(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useMCP)
+					gpio.AddOutput(elevatorWaitFloorEnableOutputName(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
 				}
 			} else if appCtx.GPIOSettings.ElevatorEnableRelayPin != 0 {
-				gpio.AddOutput("elevator_enable", appCtx.GPIOSettings.ElevatorEnableRelayPin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useMCP)
+				gpio.AddOutput("elevator_enable", appCtx.GPIOSettings.ElevatorEnableRelayPin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
 			}
 		}
 		gpio.ConfigureDoorSensor(appCtx.GPIOSettings.DoorSensorPin)
@@ -2228,6 +2322,9 @@ var (
 	techBottomLineEnabled bool
 	techTerminalRows      int
 
+	// techMenuInputDraft is the current in-progress line from readTechMenuLine; repainted after log lines (same lock as UI).
+	techMenuInputDraft []byte
+
 	startupLogMu        sync.Mutex
 	startupLogBuffer    [][]byte
 	startupLogsReleased bool // after menu banner or -notechmenu; further log lines are not buffered
@@ -2304,6 +2401,15 @@ func paintTechPromptRowUnlocked(w io.Writer) {
 	_, _ = fmt.Fprint(w, "> ")
 }
 
+// paintTechPromptAndInputDraftUnlocked redraws the status prompt and any in-progress technician input.
+// Caller must hold techUILock.
+func paintTechPromptAndInputDraftUnlocked(w io.Writer) {
+	paintTechPromptRowUnlocked(w)
+	if len(techMenuInputDraft) > 0 {
+		_, _ = w.Write(techMenuInputDraft)
+	}
+}
+
 func enableTechBottomTerminalLayout() {
 	rows := queryTerminalRows()
 	if rows < 2 {
@@ -2314,7 +2420,7 @@ func enableTechBottomTerminalLayout() {
 	techBottomLineEnabled = true
 	// Scroll only lines 1..rows-1; bottom row stays fixed. Home cursor in scroll region for new logs.
 	_, _ = fmt.Fprintf(os.Stdout, "\033[1;%dr\033[1;1H", rows-1)
-	paintTechPromptRowUnlocked(os.Stdout)
+	paintTechPromptAndInputDraftUnlocked(os.Stdout)
 	techUILock.Unlock()
 }
 
@@ -2352,7 +2458,7 @@ func techMenuClearScreenAndRelayout() {
 	techBottomLineEnabled = true
 	_, _ = fmt.Fprint(os.Stdout, "\033[2J\033[1;1H")
 	_, _ = fmt.Fprintf(os.Stdout, "\033[1;%dr\033[1;1H", rows-1)
-	paintTechPromptRowUnlocked(os.Stdout)
+	paintTechPromptAndInputDraftUnlocked(os.Stdout)
 }
 
 // bufferStartupLogLine returns true if the line was buffered (caller should not emit yet).
@@ -2383,7 +2489,7 @@ func releaseStartupLogBuffer(w io.Writer) {
 		techUILock.Lock()
 		moveToScrollRegionBottomUnlocked(w)
 		_, _ = w.Write(ln)
-		paintTechPromptRowUnlocked(w)
+		paintTechPromptAndInputDraftUnlocked(w)
 		techUILock.Unlock()
 	}
 }
@@ -2394,7 +2500,7 @@ func techMenuSyncPrint(f func(w io.Writer)) {
 	defer techUILock.Unlock()
 	moveToScrollRegionBottomUnlocked(os.Stdout)
 	f(os.Stdout)
-	paintTechPromptRowUnlocked(os.Stdout)
+	paintTechPromptAndInputDraftUnlocked(os.Stdout)
 }
 
 type colorLogWriter struct {
@@ -2442,7 +2548,7 @@ func (c *colorLogWriter) writePlainLogLine(line []byte) {
 	techUILock.Lock()
 	moveToScrollRegionBottomUnlocked(c.w)
 	_, _ = c.w.Write(line)
-	paintTechPromptRowUnlocked(c.w)
+	paintTechPromptAndInputDraftUnlocked(c.w)
 	techUILock.Unlock()
 }
 
@@ -2464,16 +2570,17 @@ func (c *colorLogWriter) writeColoredLine(line []byte) {
 	techUILock.Lock()
 	moveToScrollRegionBottomUnlocked(c.w)
 	_, _ = io.WriteString(c.w, colored)
-	paintTechPromptRowUnlocked(c.w)
+	paintTechPromptAndInputDraftUnlocked(c.w)
 	techUILock.Unlock()
 }
 
 // Access scheduling (SQLite): see access_time_profiles, access_levels, access_level_targets in initAccessScheduleSchema.
 //
-// Model: access_doors / door_groups — what opens (device.access_control_door_id = access_doors.id).
+// Model: access_doors / door_groups — door strikes (device.access_control_door_id = access_doors.id).
+// access_elevators / elevator_groups — elevator banks (device.access_control_elevator_id = access_elevators.id; used in elevator_* keypad modes).
 // access_user_groups + access_user_group_members — who (PIN in access_pins).
 // access_time_profiles + access_time_windows — named schedules; weekday 0–6 Sun–Sat or 7 = any day; minutes 0–1439; start>end crosses midnight.
-// access_levels + access_level_targets — time profile + user group + door or door_group targets.
+// access_levels + access_level_targets — time profile + user group + exactly one target: door, door_group, elevator, or elevator_group.
 //
 // Example Mon–Fri 8:45–17:00 for door "east", group "staff", PIN 123456:
 //
@@ -2485,9 +2592,88 @@ func (c *colorLogWriter) writeColoredLine(line []byte) {
 //	INSERT INTO access_time_windows (time_profile_id,weekday,start_minute,end_minute) VALUES
 //	  ('biz',1,525,1020),('biz',2,525,1020),('biz',3,525,1020),('biz',4,525,1020),('biz',5,525,1020);
 //	INSERT INTO access_levels VALUES ('L1','Staff business hours','biz','staff',1);
-//	INSERT INTO access_level_targets (access_level_id,door_id,door_group_id) VALUES ('L1','east',NULL);
+//	INSERT INTO access_level_targets (access_level_id,door_id,door_group_id,elevator_id,elevator_group_id) VALUES ('L1','east',NULL,NULL,NULL);
+//
+// Elevator-only target example:
+//
+//	INSERT INTO access_elevators VALUES ('cab_a','Lobby car A');
+//	INSERT INTO access_level_targets (access_level_id,door_id,door_group_id,elevator_id,elevator_group_id) VALUES ('L1',NULL,NULL,'cab_a',NULL);
+//
+// Per-PIN allowed floors (optional): access_elevator_pin_floors — only when device.access_control_elevator_id matches elevator_id.
+// floor_index is 0-based in the same order as device.elevator_floor_input_pins / gpio.elevator_wait_floor_enable_pins / gpio.elevator_floor_dispatch_pins.
+// If there are no rows for a PIN+elevator pair, all floors are allowed (backward compatible). If one or more rows exist, only listed indices are allowed.
+//
+//	INSERT INTO access_elevator_pin_floors (pin,elevator_id,floor_index) VALUES ('123456','cab_a',0),('123456','cab_a',2);
 
-// initAccessScheduleSchema creates tables for named time profiles, user groups, door groups, and access levels.
+func accessLevelTargetsTableHasElevatorColumns(db *sql.DB) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(access_level_targets)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == "elevator_id" {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// migrateAccessLevelTargetsElevatorSupport rebuilds access_level_targets when upgrading from a schema
+// that only had door targets, so elevator_id / elevator_group_id and the four-way CHECK apply.
+func migrateAccessLevelTargetsElevatorSupport(db *sql.DB) error {
+	ok, err := accessLevelTargetsTableHasElevatorColumns(db)
+	if err != nil || ok {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmts := []string{
+		`CREATE TABLE access_level_targets_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			access_level_id TEXT NOT NULL REFERENCES access_levels(id) ON DELETE CASCADE,
+			door_id TEXT REFERENCES access_doors(id) ON DELETE CASCADE,
+			door_group_id TEXT REFERENCES access_door_groups(id) ON DELETE CASCADE,
+			elevator_id TEXT REFERENCES access_elevators(id) ON DELETE CASCADE,
+			elevator_group_id TEXT REFERENCES access_elevator_groups(id) ON DELETE CASCADE,
+			CHECK (
+				(door_id IS NOT NULL AND door_group_id IS NULL AND elevator_id IS NULL AND elevator_group_id IS NULL)
+				OR (door_id IS NULL AND door_group_id IS NOT NULL AND elevator_id IS NULL AND elevator_group_id IS NULL)
+				OR (door_id IS NULL AND door_group_id IS NULL AND elevator_id IS NOT NULL AND elevator_group_id IS NULL)
+				OR (door_id IS NULL AND door_group_id IS NULL AND elevator_id IS NULL AND elevator_group_id IS NOT NULL)
+			)
+		)`,
+		`INSERT INTO access_level_targets_new (id, access_level_id, door_id, door_group_id, elevator_id, elevator_group_id)
+			SELECT id, access_level_id, door_id, door_group_id, NULL, NULL FROM access_level_targets`,
+		`DROP TABLE access_level_targets`,
+		`ALTER TABLE access_level_targets_new RENAME TO access_level_targets`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.Exec(q); err != nil {
+			return fmt.Errorf("migrate access_level_targets for elevators: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Println("INFO: Migrated access_level_targets for elevator access control columns.")
+	return nil
+}
+
+// initAccessScheduleSchema creates tables for named time profiles, user groups, door/elevator groups, and access levels.
 func initAccessScheduleSchema(db *sql.DB) error {
 	if db == nil {
 		return nil
@@ -2496,7 +2682,7 @@ func initAccessScheduleSchema(db *sql.DB) error {
 		return fmt.Errorf("pragma foreign_keys: %w", err)
 	}
 
-	stmts := []string{
+	tableStmts := []string{
 		`CREATE TABLE IF NOT EXISTS access_doors (
 			id TEXT PRIMARY KEY NOT NULL,
 			display_name TEXT
@@ -2509,6 +2695,27 @@ func initAccessScheduleSchema(db *sql.DB) error {
 			door_group_id TEXT NOT NULL REFERENCES access_door_groups(id) ON DELETE CASCADE,
 			door_id TEXT NOT NULL REFERENCES access_doors(id) ON DELETE CASCADE,
 			PRIMARY KEY (door_group_id, door_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevators (
+			id TEXT PRIMARY KEY NOT NULL,
+			display_name TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevator_groups (
+			id TEXT PRIMARY KEY NOT NULL,
+			display_name TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevator_group_members (
+			elevator_group_id TEXT NOT NULL REFERENCES access_elevator_groups(id) ON DELETE CASCADE,
+			elevator_id TEXT NOT NULL REFERENCES access_elevators(id) ON DELETE CASCADE,
+			PRIMARY KEY (elevator_group_id, elevator_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevator_pin_floors (
+			pin TEXT NOT NULL,
+			elevator_id TEXT NOT NULL REFERENCES access_elevators(id) ON DELETE CASCADE,
+			floor_index INTEGER NOT NULL,
+			PRIMARY KEY (pin, elevator_id, floor_index),
+			FOREIGN KEY (pin) REFERENCES access_pins(pin) ON DELETE CASCADE,
+			CHECK (floor_index >= 0)
 		)`,
 		`CREATE TABLE IF NOT EXISTS access_user_groups (
 			id TEXT PRIMARY KEY NOT NULL,
@@ -2548,22 +2755,38 @@ func initAccessScheduleSchema(db *sql.DB) error {
 			access_level_id TEXT NOT NULL REFERENCES access_levels(id) ON DELETE CASCADE,
 			door_id TEXT REFERENCES access_doors(id) ON DELETE CASCADE,
 			door_group_id TEXT REFERENCES access_door_groups(id) ON DELETE CASCADE,
+			elevator_id TEXT REFERENCES access_elevators(id) ON DELETE CASCADE,
+			elevator_group_id TEXT REFERENCES access_elevator_groups(id) ON DELETE CASCADE,
 			CHECK (
-				(door_id IS NOT NULL AND door_group_id IS NULL)
-				OR (door_id IS NULL AND door_group_id IS NOT NULL)
+				(door_id IS NOT NULL AND door_group_id IS NULL AND elevator_id IS NULL AND elevator_group_id IS NULL)
+				OR (door_id IS NULL AND door_group_id IS NOT NULL AND elevator_id IS NULL AND elevator_group_id IS NULL)
+				OR (door_id IS NULL AND door_group_id IS NULL AND elevator_id IS NOT NULL AND elevator_group_id IS NULL)
+				OR (door_id IS NULL AND door_group_id IS NULL AND elevator_id IS NULL AND elevator_group_id IS NOT NULL)
 			)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_level ON access_level_targets(access_level_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_door ON access_level_targets(door_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_access_time_windows_profile ON access_time_windows(time_profile_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_access_user_group_members_pin ON access_user_group_members(pin)`,
 	}
-	for _, q := range stmts {
+	for _, q := range tableStmts {
 		if _, err := db.Exec(q); err != nil {
 			return fmt.Errorf("access schedule schema: %w", err)
 		}
 	}
-	log.Println("INFO: SQLite access schedule tables ready (doors, time profiles, user groups, access levels).")
+	if err := migrateAccessLevelTargetsElevatorSupport(db); err != nil {
+		return fmt.Errorf("access schedule schema: %w", err)
+	}
+	indexStmts := []string{
+		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_level ON access_level_targets(access_level_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_door ON access_level_targets(door_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_elevator ON access_level_targets(elevator_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_elevator_pin_floors_lookup ON access_elevator_pin_floors(elevator_id, pin)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_time_windows_profile ON access_time_windows(time_profile_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_user_group_members_pin ON access_user_group_members(pin)`,
+	}
+	for _, q := range indexStmts {
+		if _, err := db.Exec(q); err != nil {
+			return fmt.Errorf("access schedule schema: %w", err)
+		}
+	}
+	log.Println("INFO: SQLite access schedule tables ready (doors, elevators, time profiles, user groups, access levels).")
 	return nil
 }
 
@@ -2749,10 +2972,235 @@ func (ctx *AppContext) accessScheduleAllows(pin, doorID string, atTime time.Time
 	return false, "outside_scheduled_hours"
 }
 
+func accessScheduleHasTargetsForElevator(db *sql.DB, elevatorID string) (bool, error) {
+	if db == nil || strings.TrimSpace(elevatorID) == "" {
+		return false, nil
+	}
+	var n int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT 1
+			FROM access_levels al
+			INNER JOIN access_level_targets t ON t.access_level_id = al.id
+			WHERE al.enabled = 1 AND (
+				t.elevator_id = ?
+				OR EXISTS (
+					SELECT 1 FROM access_elevator_group_members egm
+					WHERE egm.elevator_group_id = t.elevator_group_id AND egm.elevator_id = ?
+				)
+			)
+			LIMIT 1
+		)`, elevatorID, elevatorID).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// accessScheduleAllowsElevator returns whether PIN may use elevator control at atTime under schedule rules.
+// When scheduling does not apply, returns (true, "").
+func (ctx *AppContext) accessScheduleAllowsElevator(pin, elevatorID string, atTime time.Time, viaFallback bool) (bool, string) {
+	pin = strings.TrimSpace(pin)
+	elevatorID = strings.TrimSpace(elevatorID)
+	ctx.configMu.RLock()
+	enforce := ctx.Config.AccessScheduleEnforce
+	applyFallback := ctx.Config.AccessScheduleApplyToFallbackPin
+	ctx.configMu.RUnlock()
+
+	if ctx.DB == nil || elevatorID == "" || !enforce {
+		return true, ""
+	}
+	if viaFallback && !applyFallback {
+		return true, ""
+	}
+	hasRules, err := accessScheduleHasTargetsForElevator(ctx.DB, elevatorID)
+	if err != nil {
+		log.Printf("WARNING: access schedule elevator target check: %v", err)
+		return false, "schedule_db_error"
+	}
+	if !hasRules {
+		return true, ""
+	}
+
+	rows, err := ctx.DB.Query(`
+		SELECT DISTINCT al.time_profile_id, tp.iana_timezone
+		FROM access_levels al
+		INNER JOIN access_time_profiles tp ON tp.id = al.time_profile_id
+		INNER JOIN access_level_targets t ON t.access_level_id = al.id
+		INNER JOIN access_user_group_members ugm ON ugm.group_id = al.user_group_id AND ugm.pin = ?
+		WHERE al.enabled = 1 AND (
+			t.elevator_id = ?
+			OR EXISTS (
+				SELECT 1 FROM access_elevator_group_members egm
+				WHERE egm.elevator_group_id = t.elevator_group_id AND egm.elevator_id = ?
+			)
+		)`, pin, elevatorID, elevatorID)
+	if err != nil {
+		log.Printf("WARNING: access schedule elevator level query: %v", err)
+		return false, "schedule_db_error"
+	}
+	defer rows.Close()
+
+	type profTZ struct {
+		id  string
+		tz  string
+		key string
+	}
+	var list []profTZ
+	for rows.Next() {
+		var pid, iana string
+		if err := rows.Scan(&pid, &iana); err != nil {
+			log.Printf("WARNING: access schedule elevator scan: %v", err)
+			continue
+		}
+		list = append(list, profTZ{id: strings.TrimSpace(pid), tz: strings.TrimSpace(iana), key: strings.TrimSpace(pid) + "\x00" + strings.TrimSpace(iana)})
+	}
+	if err := rows.Err(); err != nil {
+		return false, "schedule_db_error"
+	}
+	if len(list) == 0 {
+		return false, "no_access_level_for_credential"
+	}
+
+	seen := make(map[string]struct{})
+	for _, pt := range list {
+		if _, ok := seen[pt.key]; ok {
+			continue
+		}
+		seen[pt.key] = struct{}{}
+
+		loc := accessScheduleTimeLocation(pt.tz)
+		tLocal := atTime.In(loc)
+		minuteOfDay := tLocal.Hour()*60 + tLocal.Minute()
+		wd := tLocal.Weekday()
+
+		wrows, err := ctx.DB.Query(`
+			SELECT weekday, start_minute, end_minute
+			FROM access_time_windows
+			WHERE time_profile_id = ?
+			ORDER BY id`, pt.id)
+		if err != nil {
+			log.Printf("WARNING: access schedule elevator windows: %v", err)
+			return false, "schedule_db_error"
+		}
+		var wins []struct {
+			weekday      int
+			start, end int
+		}
+		for wrows.Next() {
+			var wk, sm, em int
+			if err := wrows.Scan(&wk, &sm, &em); err != nil {
+				_ = wrows.Close()
+				return false, "schedule_db_error"
+			}
+			wins = append(wins, struct {
+				weekday      int
+				start, end int
+			}{wk, sm, em})
+		}
+		if err := wrows.Close(); err != nil {
+			return false, "schedule_db_error"
+		}
+
+		if len(wins) == 0 {
+			continue
+		}
+		if timeMatchesProfileWindows(wd, minuteOfDay, wins) {
+			return true, ""
+		}
+	}
+
+	return false, "outside_scheduled_hours"
+}
+
 func (ctx *AppContext) effectiveAccessDoorID() string {
 	ctx.configMu.RLock()
 	defer ctx.configMu.RUnlock()
 	return strings.TrimSpace(ctx.Config.AccessControlDoorID)
+}
+
+func (ctx *AppContext) effectiveAccessElevatorID() string {
+	ctx.configMu.RLock()
+	defer ctx.configMu.RUnlock()
+	return strings.TrimSpace(ctx.Config.AccessControlElevatorID)
+}
+
+// loadElevatorPinFloorAllowSet reads access_elevator_pin_floors for this PIN and elevator.
+// When hasRows is false, the caller should treat the credential as unrestricted for floors.
+func loadElevatorPinFloorAllowSet(db *sql.DB, pin, elevatorID string) (map[int]bool, bool, error) {
+	pin = strings.TrimSpace(pin)
+	elevatorID = strings.TrimSpace(elevatorID)
+	if db == nil || pin == "" || elevatorID == "" {
+		return nil, false, nil
+	}
+	rows, err := db.Query(`
+		SELECT floor_index FROM access_elevator_pin_floors
+		WHERE pin = ? AND elevator_id = ?
+		ORDER BY floor_index`, pin, elevatorID)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	m := make(map[int]bool)
+	for rows.Next() {
+		var fi int
+		if err := rows.Scan(&fi); err != nil {
+			return nil, false, err
+		}
+		if fi >= 0 {
+			m[fi] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return m, len(m) > 0, nil
+}
+
+// elevatorPinMayUseFloor enforces access_elevator_pin_floors when device.access_control_elevator_id is set
+// and there is at least one row for this PIN+elevator. Fallback PIN behavior matches access_schedule_apply_to_fallback_pin.
+func (ctx *AppContext) elevatorPinMayUseFloor(pin, elevatorID string, floorIndex int, viaFallback bool) bool {
+	pin = strings.TrimSpace(pin)
+	elevatorID = strings.TrimSpace(elevatorID)
+	if ctx.DB == nil || elevatorID == "" || floorIndex < 0 {
+		return true
+	}
+	ctx.configMu.RLock()
+	applyFallback := ctx.Config.AccessScheduleApplyToFallbackPin
+	ctx.configMu.RUnlock()
+	if viaFallback && !applyFallback {
+		return true
+	}
+	m, hasRows, err := loadElevatorPinFloorAllowSet(ctx.DB, pin, elevatorID)
+	if err != nil || !hasRows {
+		return true
+	}
+	return m[floorIndex]
+}
+
+// elevatorPredefinedDispatchIndexForACL returns the 0-based floor index used for access_elevator_pin_floors and dispatch wiring.
+func (ctx *AppContext) elevatorPredefinedDispatchIndexForACL(cfg DeviceConfig) int {
+	nf := len(cfg.ElevatorPredefinedFloors)
+	nDisp := len(ctx.elevatorFloorDispatchPins)
+	idx := cfg.ElevatorPredefinedFloor
+	if nf == 0 {
+		if nDisp > 0 {
+			if idx < 0 {
+				idx = 0
+			}
+			if idx >= nDisp {
+				idx = nDisp - 1
+			}
+		}
+		return idx
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= nf {
+		idx = nf - 1
+	}
+	return idx
 }
 
 func initDatabase() *sql.DB {
@@ -3674,6 +4122,18 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			ctx.pinRejectWithStreak(cfg, keypadRole, buzzerBCM, feedbackDelay, "access_schedule", ex)
 			return
 		}
+		if isElevatorKeypadMode(modePre) {
+			elevID := ctx.effectiveAccessElevatorID()
+			if ok, schedReason := ctx.accessScheduleAllowsElevator(pin, elevID, time.Now(), cred.ViaFallback); !ok {
+				log.Printf("INFO: PIN rejected (access schedule: %s; elevator=%q).", schedReason, elevID)
+				ex := map[string]any{"schedule_reason": schedReason, "access_control_elevator_id": elevID}
+				if credLabel != "" {
+					ex["credential_label"] = credLabel
+				}
+				ctx.pinRejectWithStreak(cfg, keypadRole, buzzerBCM, feedbackDelay, "access_schedule", ex)
+				return
+			}
+		}
 
 		ctx.pinFailMu.Lock()
 		ctx.pinFailSeq = 0
@@ -3690,6 +4150,10 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		switch mode {
 		case ModeElevatorWaitFloorButtons:
 			cabSense := normalizeElevatorWaitFloorCabSense(cfg.ElevatorWaitFloorCabSense)
+			ctx.elevatorMu.Lock()
+			ctx.elevatorGrantPIN = pin
+			ctx.elevatorGrantViaFallback = cred.ViaFallback
+			ctx.elevatorMu.Unlock()
 			log.Printf("INFO: PIN accepted (elevator wait-floor; %s keypad; credential=%s); enable window started (cab_sense=%s).", kTag, credTag, cabSense)
 			playSoundSync(cfg, cfg.SoundPinOK)
 			startElevatorFloorWaitGrant(ctx, cfg)
@@ -3706,8 +4170,23 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			return
 
 		case ModeElevatorPredefinedFloor:
+			ex, okElev := activateElevatorPredefinedFloor(ctx, cfg, kTag, credTag, pin, cred.ViaFallback)
+			if !okElev {
+				aclIdx := ctx.elevatorPredefinedDispatchIndexForACL(cfg)
+				denyEx := map[string]any{
+					"keypad_role":                keypadRole,
+					"elevator_floor_index":       aclIdx,
+					"access_control_elevator_id": strings.TrimSpace(ctx.effectiveAccessElevatorID()),
+				}
+				if credLabel != "" {
+					denyEx["credential_label"] = credLabel
+				}
+				playSoundSync(cfg, cfg.SoundPinReject)
+				fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
+				time.Sleep(feedbackDelay)
+				return
+			}
 			playSoundSync(cfg, cfg.SoundPinOK)
-			ex := activateElevatorPredefinedFloor(ctx, cfg, kTag, credTag)
 			wh := map[string]any{
 				"operation_mode":   mode,
 				"keypad_role":      keypadRole,
@@ -3909,6 +4388,240 @@ func (ctx *AppContext) techHistoryClear() {
 	ctx.techHistMu.Unlock()
 }
 
+// techMenuCfgKeysForCompletion must match keys accepted by techMenuCfgSetValue (cfg set <key>).
+// Keep sorted for predictable Tab order.
+var techMenuCfgKeysForCompletion = []string{
+	"access_control_door_id",
+	"access_control_elevator_id",
+	"access_schedule_apply_to_fallback_pin",
+	"access_schedule_enforce",
+	"buzzer_relay_active_low",
+	"buzzer_relay_pin",
+	"door_open_warning_after",
+	"door_relay_active_low",
+	"door_relay_pin",
+	"door_sensor_closed_is_low",
+	"door_sensor_pin",
+	"dual_keypad_reject_exit_without_entry",
+	"elevator_dispatch_active_low",
+	"elevator_dispatch_pulse_duration",
+	"elevator_dispatch_relay_pin",
+	"elevator_enable_active_low",
+	"elevator_enable_pulse_duration",
+	"elevator_floor_dispatch_pins",
+	"elevator_floor_dispatch_pulse_durations",
+	"elevator_floor_input_pins",
+	"elevator_floor_wait_timeout",
+	"elevator_predefined_enable_pins",
+	"elevator_predefined_floor",
+	"elevator_predefined_floors",
+	"elevator_wait_floor_cab_sense",
+	"elevator_wait_floor_enable_pins",
+	"entry_button_active_low",
+	"entry_button_pin",
+	"exit_button_active_low",
+	"exit_button_pin",
+	"fallback_access_pin",
+	"heartbeat_interval",
+	"heartbeat_led_pin",
+	"keypad_evdev_path",
+	"keypad_exit_evdev_path",
+	"keypad_inter_digit_timeout",
+	"keypad_operation_mode",
+	"keypad_session_timeout",
+	"log_level",
+	"mcp23017_i2c_addr",
+	"mcp23017_i2c_bus",
+	"mqtt_broker",
+	"mqtt_client_id",
+	"mqtt_command_token",
+	"mqtt_command_topic",
+	"mqtt_enabled",
+	"mqtt_pair_peer_topic",
+	"mqtt_password",
+	"mqtt_status_topic",
+	"mqtt_username",
+	"pair_peer_role",
+	"pair_peer_token",
+	"pin_entry_feedback_delay",
+	"pin_length",
+	"pin_lockout_after_attempts",
+	"pin_lockout_duration",
+	"pin_lockout_enabled",
+	"pin_lockout_override_pin",
+	"pin_reject_buzzer_after_attempts",
+	"relay_output_mode",
+	"relay_pulse_duration",
+	"sound_card_name",
+	"sound_keypress",
+	"sound_pin_ok",
+	"sound_pin_reject",
+	"sound_shutdown",
+	"sound_startup",
+	"tech_menu_history_max",
+	"tech_menu_prompt",
+	"webhook_event_enabled",
+	"webhook_event_token",
+	"webhook_event_token_enabled",
+	"webhook_event_url",
+	"webhook_heartbeat_enabled",
+	"webhook_heartbeat_token",
+	"webhook_heartbeat_token_enabled",
+	"webhook_heartbeat_url",
+	"xl9535_i2c_addr",
+	"xl9535_i2c_bus",
+}
+
+func techMenuRootCommands() []string {
+	return []string{
+		"...", "…",
+		"1", "2", "3", "4", "5", "6", "7", "8", "9",
+		"c", "cfg", "ch", "clear", "cls",
+		"exit",
+		"h", "help", "i", "kb", "kbd", "keypads",
+		"m", "menu", "occ", "p", "q", "quit",
+		"v", "z",
+	}
+}
+
+// techMenuCfgSubcommands lists cfg second tokens for Tab completion (no single-letter aliases — they share prefixes and block LCP).
+func techMenuCfgSubcommands() []string {
+	return []string{
+		"apply", "help", "history", "keys", "list", "live",
+		"reread", "reload", "save", "set", "show", "write",
+	}
+}
+
+func techMenuSplitForComplete(line string) (prefix []string, partial string, trailingSpace bool) {
+	if len(line) == 0 {
+		return nil, "", false
+	}
+	trailingSpace = line[len(line)-1] == ' ' || line[len(line)-1] == '\t'
+	trimmed := strings.TrimRight(line, " \t")
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return nil, "", trailingSpace
+	}
+	if trailingSpace {
+		return fields, "", true
+	}
+	if len(fields) == 1 {
+		return nil, fields[0], false
+	}
+	return fields[:len(fields)-1], fields[len(fields)-1], false
+}
+
+func techMenuLowerPrefixSlice(s []string) []string {
+	out := make([]string, len(s))
+	for i, w := range s {
+		out[i] = strings.ToLower(w)
+	}
+	return out
+}
+
+func techMenuFilterPrefixLower(cands []string, lowPrefix string) []string {
+	var out []string
+	for _, c := range cands {
+		if strings.HasPrefix(strings.ToLower(c), lowPrefix) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func techMenuLongestCommonPrefix(strs []string) string {
+	if len(strs) == 0 {
+		return ""
+	}
+	ref := strs[0]
+	for i := range ref {
+		rc := ref[i]
+		for _, s := range strs[1:] {
+			if i >= len(s) || s[i] != rc {
+				return ref[:i]
+			}
+		}
+	}
+	return ref
+}
+
+func techMenuCompleteAddTrailingSpace(prefixLower []string, completed string) bool {
+	c := strings.ToLower(completed)
+	if c == "..." || c == "…" {
+		return false
+	}
+	if len(prefixLower) == 0 {
+		return true
+	}
+	if len(prefixLower) == 1 && prefixLower[0] == "cfg" {
+		return true
+	}
+	if len(prefixLower) == 2 && prefixLower[0] == "cfg" && prefixLower[1] == "set" {
+		return true
+	}
+	if len(prefixLower) == 1 && prefixLower[0] == "kb" {
+		return true
+	}
+	return false
+}
+
+// techMenuTabCompleteLine returns an updated input line and whether to ring the terminal bell (no extension).
+func techMenuTabCompleteLine(line string) (newLine string, bell bool) {
+	prefix, partial, trail := techMenuSplitForComplete(line)
+	pl := techMenuLowerPrefixSlice(prefix)
+
+	var matches []string
+	switch {
+	case len(pl) == 0 && !trail:
+		matches = techMenuFilterPrefixLower(techMenuRootCommands(), strings.ToLower(partial))
+	case len(pl) == 1 && pl[0] == "cfg" && trail:
+		matches = append([]string(nil), techMenuCfgSubcommands()...)
+	case len(pl) == 1 && pl[0] == "cfg" && !trail:
+		matches = techMenuFilterPrefixLower(techMenuCfgSubcommands(), strings.ToLower(partial))
+	case len(pl) == 2 && pl[0] == "cfg" && pl[1] == "set" && trail:
+		matches = append([]string(nil), techMenuCfgKeysForCompletion...)
+	case len(pl) == 2 && pl[0] == "cfg" && pl[1] == "set" && !trail:
+		matches = techMenuFilterPrefixLower(techMenuCfgKeysForCompletion, strings.ToLower(partial))
+	case len(pl) == 1 && pl[0] == "kb" && trail:
+		matches = []string{"all"}
+	case len(pl) == 1 && pl[0] == "kb" && !trail:
+		matches = techMenuFilterPrefixLower([]string{"all"}, strings.ToLower(partial))
+	default:
+		return line, true
+	}
+
+	if len(matches) == 0 {
+		return line, true
+	}
+
+	lowPart := strings.ToLower(partial)
+	if trail {
+		lowPart = ""
+	}
+
+	var pick string
+	addSpace := false
+
+	if len(matches) == 1 {
+		pick = matches[0]
+		addSpace = techMenuCompleteAddTrailingSpace(pl, pick)
+	} else {
+		lcp := techMenuLongestCommonPrefix(matches)
+		if !strings.HasPrefix(lcp, lowPart) || len(lcp) == len(lowPart) {
+			return line, true
+		}
+		pick = lcp
+		addSpace = false
+	}
+
+	newWords := append(append([]string{}, prefix...), pick)
+	out := strings.Join(newWords, " ")
+	if addSpace {
+		out += " "
+	}
+	return out, false
+}
+
 func techMenuReadCSI(tty *os.File) ([]byte, error) {
 	b := make([]byte, 1)
 	if _, err := tty.Read(b); err != nil {
@@ -3933,6 +4646,7 @@ func techMenuReadCSI(tty *os.File) ([]byte, error) {
 func techMenuRedrawInputLine(line []byte) {
 	techUILock.Lock()
 	defer techUILock.Unlock()
+	techMenuInputDraft = append([]byte(nil), line...)
 	paintTechPromptRowUnlocked(os.Stdout)
 	if len(line) > 0 {
 		_, _ = os.Stdout.Write(line)
@@ -3946,7 +4660,12 @@ func readTechMenuLine(ctx *AppContext, tty *os.File) (string, error) {
 	if err != nil {
 		return readTechMenuLineFallback(tty)
 	}
-	defer func() { _ = term.Restore(fd, old) }()
+	defer func() {
+		_ = term.Restore(fd, old)
+		techUILock.Lock()
+		techMenuInputDraft = nil
+		techUILock.Unlock()
+	}()
 
 	var line []byte
 	histIdx := -1
@@ -3980,6 +4699,14 @@ func readTechMenuLine(ctx *AppContext, tty *os.File) (string, error) {
 				histIdx = -1
 				redraw()
 			}
+		case b == '\t':
+			histIdx = -1
+			nl, bell := techMenuTabCompleteLine(string(line))
+			line = []byte(nl)
+			if bell {
+				_, _ = tty.Write([]byte{'\a'})
+			}
+			redraw()
 		case b == 27:
 			csi, err := techMenuReadCSI(tty)
 			if err != nil {
@@ -3993,6 +4720,7 @@ func readTechMenuLine(ctx *AppContext, tty *os.File) (string, error) {
 			switch {
 			case bytes.Equal(seq, upSeq) || bytes.Equal(seq, upSS3):
 				if nh == 0 {
+					redraw()
 					continue
 				}
 				if histIdx < 0 {
@@ -4062,6 +4790,7 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
   VirtualKeyz Version 2.0.0 by Suvir Kumar <suvir@dits.co.th>
 --------------------------------------------------------------------------------
   Up/Down       Recall previous commands (see tech_menu_history_max in config)
+  Tab           Complete commands (cfg, cfg subcommands, cfg set keys, kb all)
   h   Redraw Main Menu
   c   Clear Screen 
   z Clear command history 
@@ -4098,7 +4827,7 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
 
 	for {
 		techUILock.Lock()
-		paintTechPromptRowUnlocked(os.Stdout)
+		paintTechPromptAndInputDraftUnlocked(os.Stdout)
 		techUILock.Unlock()
 
 		line, err := readTechMenuLine(ctx, tty)
@@ -4402,6 +5131,7 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  dual_keypad_reject_exit_without_entry: %v\n", c.DualKeypadRejectExitWithoutEntry)
 	fmt.Fprintf(w, "\n--- Access schedule (SQLite) ---\n")
 	fmt.Fprintf(w, "  access_control_door_id: %q\n", c.AccessControlDoorID)
+	fmt.Fprintf(w, "  access_control_elevator_id: %q\n", c.AccessControlElevatorID)
 	fmt.Fprintf(w, "  access_schedule_enforce: %v\n", c.AccessScheduleEnforce)
 	fmt.Fprintf(w, "  access_schedule_apply_to_fallback_pin: %v\n", c.AccessScheduleApplyToFallbackPin)
 	fmt.Fprintf(w, "  pin_lockout_enabled: %v\n", c.PinLockoutEnabled)
@@ -4459,6 +5189,8 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  relay_output_mode: %s\n", normalizeRelayOutputMode(g.RelayOutputMode))
 	fmt.Fprintf(w, "  mcp23017_i2c_bus: %d\n", g.MCP23017I2CBus)
 	fmt.Fprintf(w, "  mcp23017_i2c_addr: %d\n", int(g.MCP23017I2CAddr))
+	fmt.Fprintf(w, "  xl9535_i2c_bus: %d\n", g.XL9535I2CBus)
+	fmt.Fprintf(w, "  xl9535_i2c_addr: %d\n", int(g.XL9535I2CAddr))
 	fmt.Fprintf(w, "  door_relay_pin: %d\n", g.DoorRelayPin)
 	fmt.Fprintf(w, "  door_relay_active_low: %v\n", g.DoorRelayActiveLow)
 	fmt.Fprintf(w, "  buzzer_relay_pin: %d\n", g.BuzzerRelayPin)
@@ -4963,13 +5695,18 @@ func techMenuWriteProcListenPorts(w io.Writer) {
 
 // --- Structures ---
 
+// i2cRelayExpander drives relay outputs 0–15 on an MCP23017 or XL9535 (see gpio.relay_output_mode).
+type i2cRelayExpander interface {
+	SetPin(pin uint8, high bool) error
+}
+
 // OutputConfig defines an output pin, like a door relay or buzzer
 type OutputConfig struct {
 	PinNumber uint8
 	ActiveLow bool // True if the relay triggers on ground/0V (common for opto-relays)
 	Pin       rpio.Pin
-	// UseMCP23017: when true, PinNumber is MCP23017 port index 0-15 (GPIOManager.mcp drives the line).
-	UseMCP23017 bool
+	// UseI2CRelay: when true, PinNumber is expander index 0-15 (MCP23017 or XL9535 per relay_output_mode).
+	UseI2CRelay bool
 	mu          sync.Mutex // Prevents overlapping pulse routines
 }
 
@@ -4994,7 +5731,7 @@ type GPIOManager struct {
 	Outputs map[string]*OutputConfig
 	Inputs  map[string]*InputConfig
 
-	mcp *mcp23017.Dev
+	i2cRelay i2cRelayExpander
 
 	doorSensorPin   rpio.Pin
 	doorSensorReady bool
@@ -5011,9 +5748,9 @@ func NewGPIOManager() *GPIOManager {
 	}
 }
 
-// SetMCP23017 attaches an MCP23017 expander for outputs registered with useMCP23017 true.
-func (m *GPIOManager) SetMCP23017(d *mcp23017.Dev) {
-	m.mcp = d
+// SetI2CRelayExpander attaches an MCP23017 or XL9535 for outputs registered with UseI2CRelay true.
+func (m *GPIOManager) SetI2CRelayExpander(d i2cRelayExpander) {
+	m.i2cRelay = d
 }
 
 // ConfigureDoorSensor sets up a BCM GPIO as digital input with pull-up for a door contact (call once after rpio.Open).
@@ -5087,14 +5824,14 @@ func (m *GPIOManager) HasOutput(name string) bool {
 	return ok
 }
 
-// AddOutput registers a new output pin. useMCP23017 selects MCP23017 port pin PinNumber (0-15); otherwise BCM GPIO.
-func (m *GPIOManager) AddOutput(name string, pin uint8, activeLow bool, useMCP23017 bool) {
+// AddOutput registers a new output pin. useI2CRelay selects expander pin PinNumber (0-15); otherwise BCM GPIO.
+func (m *GPIOManager) AddOutput(name string, pin uint8, activeLow bool, useI2CRelay bool) {
 	cfg := &OutputConfig{
 		PinNumber:   pin,
 		ActiveLow:   activeLow,
-		UseMCP23017: useMCP23017,
+		UseI2CRelay: useI2CRelay,
 	}
-	if !useMCP23017 {
+	if !useI2CRelay {
 		p := rpio.Pin(pin)
 		p.Output()
 		cfg.Pin = p
@@ -5137,15 +5874,15 @@ func (m *GPIOManager) ActionOn(name string) {
 		log.Printf("ERROR: Output '%s' not found", name)
 		return
 	}
-	if out.UseMCP23017 {
-		if m.mcp == nil {
-			log.Printf("ERROR: Output '%s' uses MCP23017 but device is not initialized", name)
+	if out.UseI2CRelay {
+		if m.i2cRelay == nil {
+			log.Printf("ERROR: Output '%s' uses I2C relay expander but device is not initialized", name)
 			return
 		}
 		// Energized: active-low => drive low; active-high => drive high.
 		logicHigh := !out.ActiveLow
-		if err := m.mcp.SetPin(out.PinNumber, logicHigh); err != nil {
-			log.Printf("ERROR: MCP23017 output %q pin %d: %v", name, out.PinNumber, err)
+		if err := m.i2cRelay.SetPin(out.PinNumber, logicHigh); err != nil {
+			log.Printf("ERROR: I2C relay output %q pin %d: %v", name, out.PinNumber, err)
 		}
 		return
 	}
@@ -5162,12 +5899,12 @@ func (m *GPIOManager) ActionOff(name string) {
 	if !exists {
 		return
 	}
-	if out.UseMCP23017 {
-		if m.mcp == nil {
+	if out.UseI2CRelay {
+		if m.i2cRelay == nil {
 			return
 		}
 		logicHigh := out.ActiveLow
-		_ = m.mcp.SetPin(out.PinNumber, logicHigh)
+		_ = m.i2cRelay.SetPin(out.PinNumber, logicHigh)
 		return
 	}
 	if out.ActiveLow {
@@ -5318,6 +6055,10 @@ func clearElevatorGrantState(ctx *AppContext) {
 	ctx.elevatorGrantStartedAt = time.Time{}
 	ctx.elevatorCabFloorDebounceHeld = nil
 	ctx.elevatorCabFloorDebounceTick = 0
+	ctx.elevatorGrantPIN = ""
+	ctx.elevatorGrantViaFallback = false
+	ctx.elevatorGrantFloorsRestricted = false
+	ctx.elevatorGrantAllowedFloors = nil
 	ctx.elevatorMu.Unlock()
 	if ctx.GPIO == nil {
 		return
@@ -5335,10 +6076,35 @@ func clearElevatorGrantState(ctx *AppContext) {
 
 func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
 	ctx.elevatorMu.Lock()
+	pin := ctx.elevatorGrantPIN
+	via := ctx.elevatorGrantViaFallback
+	ctx.elevatorMu.Unlock()
+
+	elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
+	ctx.configMu.RLock()
+	applyFallback := ctx.Config.AccessScheduleApplyToFallbackPin
+	ctx.configMu.RUnlock()
+
+	restricted := false
+	var allow map[int]bool
+	if ctx.DB != nil && elevID != "" && !(via && !applyFallback) {
+		var hasRows bool
+		var err error
+		allow, hasRows, err = loadElevatorPinFloorAllowSet(ctx.DB, pin, elevID)
+		if err != nil {
+			log.Printf("WARNING: access_elevator_pin_floors: %v", err)
+		} else if hasRows {
+			restricted = true
+		}
+	}
+
+	ctx.elevatorMu.Lock()
 	ctx.elevatorGrantUntil = time.Now().Add(cfg.ElevatorFloorWaitTimeout)
 	ctx.elevatorGrantStartedAt = time.Now()
 	ctx.elevatorCabFloorDebounceHeld = nil
 	ctx.elevatorCabFloorDebounceTick = 0
+	ctx.elevatorGrantFloorsRestricted = restricted
+	ctx.elevatorGrantAllowedFloors = allow
 	ctx.elevatorMu.Unlock()
 	if ctx.GPIO == nil {
 		return
@@ -5347,6 +6113,9 @@ func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
 	// floor press or timeout). elevator_enable_pulse_duration does not apply here—only elevator_predefined_floor uses it.
 	if len(ctx.elevatorWaitFloorEnablePins) > 0 {
 		for i := range ctx.elevatorWaitFloorEnablePins {
+			if restricted && !allow[i] {
+				continue
+			}
 			name := elevatorWaitFloorEnableOutputName(i)
 			if ctx.GPIO.HasOutput(name) {
 				ctx.GPIO.ActionOn(name)
@@ -5427,12 +6196,18 @@ func pulseElevatorPredefinedDispatchAtIndex(ctx *AppContext, cfg DeviceConfig, i
 }
 
 // activateElevatorPredefinedFloor pulses the enable relay (if configured) and dispatch for the selected predefined floor; returns webhook detail fields.
-func activateElevatorPredefinedFloor(ctx *AppContext, cfg DeviceConfig, kTag, credTag string) map[string]any {
+// The second return is false when access_elevator_pin_floors denies this credential for the configured floor index (caller plays reject sound).
+func activateElevatorPredefinedFloor(ctx *AppContext, cfg DeviceConfig, kTag, credTag, pin string, viaFallback bool) (map[string]any, bool) {
 	extra := map[string]any{}
+	aclIdx := ctx.elevatorPredefinedDispatchIndexForACL(cfg)
+	if !ctx.elevatorPinMayUseFloor(pin, strings.TrimSpace(ctx.effectiveAccessElevatorID()), aclIdx, viaFallback) {
+		log.Printf("INFO: Elevator predefined floor denied (floor_index=%d not permitted for credential; %s keypad; credential=%s).", aclIdx, kTag, credTag)
+		return nil, false
+	}
 	if ctx.GPIO == nil {
 		extra["gpio"] = "unavailable"
 		log.Printf("INFO: PIN accepted (elevator predefined; %s keypad; credential=%s); GPIO unavailable.", kTag, credTag)
-		return extra
+		return extra, true
 	}
 	nf := len(cfg.ElevatorPredefinedFloors)
 	if nf == 0 {
@@ -5453,7 +6228,7 @@ func activateElevatorPredefinedFloor(ctx *AppContext, cfg DeviceConfig, kTag, cr
 		extra["dispatch_output"] = dOut
 		extra["dispatch_relay_pin"] = dPin
 		extra["dispatch_pulsed"] = dOK
-		return extra
+		return extra, true
 	}
 	idx := cfg.ElevatorPredefinedFloor
 	if idx < 0 {
@@ -5493,7 +6268,7 @@ func activateElevatorPredefinedFloor(ctx *AppContext, cfg DeviceConfig, kTag, cr
 	extra["dispatch_output"] = dOut
 	extra["dispatch_relay_pin"] = dPin
 	extra["dispatch_pulsed"] = dOK
-	return extra
+	return extra, true
 }
 
 func monitorElevatorFloorSelection(ctx *AppContext) {
@@ -5562,10 +6337,38 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 			ctx.elevatorCabFloorDebounceHeld = slices.Clone(pressed)
 			ctx.elevatorCabFloorDebounceTick = 1
 		}
+		floorDenied := false
+		var deniedIndices []int
 		if ctx.elevatorCabFloorDebounceTick >= elevatorCabSenseStableTicks {
-			toDispatch = slices.Clone(ctx.elevatorCabFloorDebounceHeld)
+			held := slices.Clone(ctx.elevatorCabFloorDebounceHeld)
+			if ctx.elevatorGrantFloorsRestricted {
+				for _, fi := range held {
+					if !ctx.elevatorGrantAllowedFloors[fi] {
+						floorDenied = true
+						deniedIndices = held
+						break
+					}
+				}
+			}
+			if !floorDenied {
+				toDispatch = held
+			}
 		}
 		ctx.elevatorMu.Unlock()
+		if floorDenied {
+			clearElevatorGrantState(ctx)
+			ctx.configMu.RLock()
+			cfg := ctx.Config
+			ctx.configMu.RUnlock()
+			log.Printf("INFO: Elevator cab floor input(s) rejected (not permitted for credential): %v", deniedIndices)
+			playSoundSync(cfg, cfg.SoundPinReject)
+			fireEventWebhook(ctx, "elevator_floor_denied", map[string]any{
+				"operation_mode":           mode,
+				"elevator_floor_indices":   deniedIndices,
+				"access_control_elevator_id": strings.TrimSpace(ctx.effectiveAccessElevatorID()),
+			})
+			continue
+		}
 		if len(toDispatch) == 0 {
 			continue
 		}
