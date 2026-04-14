@@ -254,8 +254,6 @@ type AppContext struct {
 	elevatorCabFloorDebounceTick int       // consecutive 50ms polls with same held snapshot
 	elevatorGrantPIN             string    // credential used for current wait-floor grant (for DB floor ACL)
 	elevatorGrantViaFallback     bool
-	elevatorGrantFloorsRestricted bool // true when access_elevator_pin_floors has rows for this PIN+elevator
-	elevatorGrantAllowedFloors   map[int]bool
 
 	// Dual USB keypad: in-memory occupancy per PIN (entry adds, exit subtracts). Reset on process restart.
 	occupancyMu    sync.Mutex
@@ -2602,8 +2600,20 @@ func (c *colorLogWriter) writeColoredLine(line []byte) {
 // Per-PIN allowed floors (optional): access_elevator_pin_floors — only when device.access_control_elevator_id matches elevator_id.
 // floor_index is 0-based in the same order as device.elevator_floor_input_pins / gpio.elevator_wait_floor_enable_pins / gpio.elevator_floor_dispatch_pins.
 // If there are no rows for a PIN+elevator pair, all floors are allowed (backward compatible). If one or more rows exist, only listed indices are allowed.
+// Bulk assignment: access_elevator_floor_groups + access_elevator_floor_group_members + access_elevator_pin_floor_groups (PIN may belong to groups; union of member floor_index values applies).
 //
 //	INSERT INTO access_elevator_pin_floors (pin,elevator_id,floor_index) VALUES ('123456','cab_a',0),('123456','cab_a',2);
+//
+// Logical labels / relay documentation: access_elevator_floor_labels — optional floor_name and relay_pin per elevator_id + floor_index (for logs and operator reference; relay_pin matches gpio expander/BCM index for that channel when set).
+//
+// Timed floor policy: access_elevator_floor_time_rules — per floor_index, reuse access_time_profiles + access_time_windows.
+// action 'lock' denies that floor during matching windows (overrides PIN lists). action 'open' allows that floor during matching windows even when PIN would not list it (still subject to elevator access_schedule and valid credential).
+//
+//	INSERT INTO access_elevator_floor_labels (elevator_id,floor_index,floor_name,relay_pin) VALUES ('cab_a',0,'Lobby',5);
+//	INSERT INTO access_elevator_floor_groups (id,elevator_id,display_name) VALUES ('grp_public','cab_a','Public');
+//	INSERT INTO access_elevator_floor_group_members (group_id,floor_index) VALUES ('grp_public',0),('grp_public',1);
+//	INSERT INTO access_elevator_pin_floor_groups (pin,group_id) VALUES ('123456','grp_public');
+//	INSERT INTO access_elevator_floor_time_rules (elevator_id,floor_index,time_profile_id,action) VALUES ('cab_a',3,'nights','lock');
 
 func accessLevelTargetsTableHasElevatorColumns(db *sql.DB) (bool, error) {
 	rows, err := db.Query(`PRAGMA table_info(access_level_targets)`)
@@ -2717,6 +2727,40 @@ func initAccessScheduleSchema(db *sql.DB) error {
 			FOREIGN KEY (pin) REFERENCES access_pins(pin) ON DELETE CASCADE,
 			CHECK (floor_index >= 0)
 		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevator_floor_labels (
+			elevator_id TEXT NOT NULL REFERENCES access_elevators(id) ON DELETE CASCADE,
+			floor_index INTEGER NOT NULL,
+			floor_name TEXT NOT NULL,
+			relay_pin INTEGER,
+			PRIMARY KEY (elevator_id, floor_index),
+			CHECK (floor_index >= 0)
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevator_floor_groups (
+			id TEXT PRIMARY KEY NOT NULL,
+			elevator_id TEXT NOT NULL REFERENCES access_elevators(id) ON DELETE CASCADE,
+			display_name TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevator_floor_group_members (
+			group_id TEXT NOT NULL REFERENCES access_elevator_floor_groups(id) ON DELETE CASCADE,
+			floor_index INTEGER NOT NULL,
+			PRIMARY KEY (group_id, floor_index),
+			CHECK (floor_index >= 0)
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevator_pin_floor_groups (
+			pin TEXT NOT NULL,
+			group_id TEXT NOT NULL REFERENCES access_elevator_floor_groups(id) ON DELETE CASCADE,
+			PRIMARY KEY (pin, group_id),
+			FOREIGN KEY (pin) REFERENCES access_pins(pin) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_elevator_floor_time_rules (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			elevator_id TEXT NOT NULL REFERENCES access_elevators(id) ON DELETE CASCADE,
+			floor_index INTEGER NOT NULL,
+			time_profile_id TEXT NOT NULL REFERENCES access_time_profiles(id) ON DELETE CASCADE,
+			action TEXT NOT NULL CHECK (action IN ('open','lock')),
+			enabled INTEGER NOT NULL DEFAULT 1,
+			CHECK (floor_index >= 0)
+		)`,
 		`CREATE TABLE IF NOT EXISTS access_user_groups (
 			id TEXT PRIMARY KEY NOT NULL,
 			display_name TEXT
@@ -2778,6 +2822,9 @@ func initAccessScheduleSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_door ON access_level_targets(door_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_access_level_targets_elevator ON access_level_targets(elevator_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_access_elevator_pin_floors_lookup ON access_elevator_pin_floors(elevator_id, pin)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_elevator_floor_groups_elevator ON access_elevator_floor_groups(elevator_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_elevator_pin_floor_groups_pin ON access_elevator_pin_floor_groups(pin)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_elevator_floor_time_rules_lookup ON access_elevator_floor_time_rules(elevator_id, floor_index, enabled)`,
 		`CREATE INDEX IF NOT EXISTS idx_access_time_windows_profile ON access_time_windows(time_profile_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_access_user_group_members_pin ON access_user_group_members(pin)`,
 	}
@@ -3125,8 +3172,9 @@ func (ctx *AppContext) effectiveAccessElevatorID() string {
 	return strings.TrimSpace(ctx.Config.AccessControlElevatorID)
 }
 
-// loadElevatorPinFloorAllowSet reads access_elevator_pin_floors for this PIN and elevator.
-// When hasRows is false, the caller should treat the credential as unrestricted for floors.
+// loadElevatorPinFloorAllowSet reads per-floor allow list for this PIN and elevator from
+// access_elevator_pin_floors and from access_elevator_pin_floor_groups (union of group members).
+// When hasRows is false, the caller should treat the credential as unrestricted for floors (PIN-only rules).
 func loadElevatorPinFloorAllowSet(db *sql.DB, pin, elevatorID string) (map[int]bool, bool, error) {
 	pin = strings.TrimSpace(pin)
 	elevatorID = strings.TrimSpace(elevatorID)
@@ -3136,7 +3184,12 @@ func loadElevatorPinFloorAllowSet(db *sql.DB, pin, elevatorID string) (map[int]b
 	rows, err := db.Query(`
 		SELECT floor_index FROM access_elevator_pin_floors
 		WHERE pin = ? AND elevator_id = ?
-		ORDER BY floor_index`, pin, elevatorID)
+		UNION
+		SELECT m.floor_index FROM access_elevator_pin_floor_groups pfg
+		INNER JOIN access_elevator_floor_groups g ON g.id = pfg.group_id AND g.elevator_id = ?
+		INNER JOIN access_elevator_floor_group_members m ON m.group_id = g.id
+		WHERE pfg.pin = ?
+		ORDER BY floor_index`, pin, elevatorID, elevatorID, pin)
 	if err != nil {
 		return nil, false, err
 	}
@@ -3176,6 +3229,101 @@ func (ctx *AppContext) elevatorPinMayUseFloor(pin, elevatorID string, floorIndex
 		return true
 	}
 	return m[floorIndex]
+}
+
+// elevatorFloorTimedPolicy reports whether active time windows mark the floor locked and/or open.
+// lock takes precedence in elevatorFloorChannelAllowed. open allows bypass of PIN floor lists only.
+func (ctx *AppContext) elevatorFloorTimedPolicy(elevatorID string, floorIndex int, at time.Time) (locked, openActive bool) {
+	elevatorID = strings.TrimSpace(elevatorID)
+	if ctx.DB == nil || elevatorID == "" || floorIndex < 0 {
+		return false, false
+	}
+	rows, err := ctx.DB.Query(`
+		SELECT r.action, tp.iana_timezone, tw.weekday, tw.start_minute, tw.end_minute
+		FROM access_elevator_floor_time_rules r
+		INNER JOIN access_time_profiles tp ON tp.id = r.time_profile_id
+		INNER JOIN access_time_windows tw ON tw.time_profile_id = tp.id
+		WHERE r.enabled = 1 AND r.elevator_id = ? AND r.floor_index = ?
+		ORDER BY r.id, tw.id`, elevatorID, floorIndex)
+	if err != nil {
+		log.Printf("WARNING: access_elevator_floor_time_rules: %v", err)
+		return false, false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var action, iana string
+		var wk, sm, em int
+		if err := rows.Scan(&action, &iana, &wk, &sm, &em); err != nil {
+			log.Printf("WARNING: access_elevator_floor_time_rules scan: %v", err)
+			continue
+		}
+		loc := accessScheduleTimeLocation(iana)
+		tLocal := at.In(loc)
+		minuteOfDay := tLocal.Hour()*60 + tLocal.Minute()
+		wd := tLocal.Weekday()
+		wins := []struct {
+			weekday      int
+			start, end int
+		}{{wk, sm, em}}
+		if !timeMatchesProfileWindows(wd, minuteOfDay, wins) {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "lock":
+			locked = true
+		case "open":
+			openActive = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("WARNING: access_elevator_floor_time_rules: %v", err)
+	}
+	return locked, openActive
+}
+
+// elevatorFloorChannelAllowed is the full per-floor check: timed lock/open rules, then PIN floor list (and groups).
+func (ctx *AppContext) elevatorFloorChannelAllowed(pin, elevatorID string, floorIndex int, viaFallback bool, at time.Time) bool {
+	pin = strings.TrimSpace(pin)
+	elevatorID = strings.TrimSpace(elevatorID)
+	if ctx.DB == nil || elevatorID == "" || floorIndex < 0 {
+		return true
+	}
+	locked, openWin := ctx.elevatorFloorTimedPolicy(elevatorID, floorIndex, at)
+	if locked {
+		return false
+	}
+	if openWin {
+		return true
+	}
+	return ctx.elevatorPinMayUseFloor(pin, elevatorID, floorIndex, viaFallback)
+}
+
+// elevatorFloorLogLabel returns a short label for logs/webhooks: "name [index N]" or "index N".
+func elevatorFloorLogLabel(db *sql.DB, elevatorID string, floorIndex int) string {
+	elevatorID = strings.TrimSpace(elevatorID)
+	if db == nil || elevatorID == "" || floorIndex < 0 {
+		return fmt.Sprintf("index %d", floorIndex)
+	}
+	var name sql.NullString
+	err := db.QueryRow(`
+		SELECT floor_name FROM access_elevator_floor_labels
+		WHERE elevator_id = ? AND floor_index = ?`, elevatorID, floorIndex).Scan(&name)
+	if err != nil || !name.Valid {
+		return fmt.Sprintf("index %d", floorIndex)
+	}
+	n := strings.TrimSpace(name.String)
+	if n == "" {
+		return fmt.Sprintf("index %d", floorIndex)
+	}
+	return fmt.Sprintf("%q [index %d]", n, floorIndex)
+}
+
+func elevatorFloorLogLabels(db *sql.DB, elevatorID string, indices []int) []string {
+	out := make([]string, 0, len(indices))
+	for _, fi := range indices {
+		out = append(out, elevatorFloorLogLabel(db, elevatorID, fi))
+	}
+	return out
 }
 
 // elevatorPredefinedDispatchIndexForACL returns the 0-based floor index used for access_elevator_pin_floors and dispatch wiring.
@@ -4173,13 +4321,17 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			ex, okElev := activateElevatorPredefinedFloor(ctx, cfg, kTag, credTag, pin, cred.ViaFallback)
 			if !okElev {
 				aclIdx := ctx.elevatorPredefinedDispatchIndexForACL(cfg)
+				elevDenyID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
 				denyEx := map[string]any{
 					"keypad_role":                keypadRole,
 					"elevator_floor_index":       aclIdx,
-					"access_control_elevator_id": strings.TrimSpace(ctx.effectiveAccessElevatorID()),
+					"access_control_elevator_id": elevDenyID,
 				}
 				if credLabel != "" {
 					denyEx["credential_label"] = credLabel
+				}
+				if ctx.DB != nil && elevDenyID != "" {
+					denyEx["elevator_floor_label"] = elevatorFloorLogLabel(ctx.DB, elevDenyID, aclIdx)
 				}
 				playSoundSync(cfg, cfg.SoundPinReject)
 				fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
@@ -6057,8 +6209,6 @@ func clearElevatorGrantState(ctx *AppContext) {
 	ctx.elevatorCabFloorDebounceTick = 0
 	ctx.elevatorGrantPIN = ""
 	ctx.elevatorGrantViaFallback = false
-	ctx.elevatorGrantFloorsRestricted = false
-	ctx.elevatorGrantAllowedFloors = nil
 	ctx.elevatorMu.Unlock()
 	if ctx.GPIO == nil {
 		return
@@ -6081,30 +6231,13 @@ func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
 	ctx.elevatorMu.Unlock()
 
 	elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
-	ctx.configMu.RLock()
-	applyFallback := ctx.Config.AccessScheduleApplyToFallbackPin
-	ctx.configMu.RUnlock()
-
-	restricted := false
-	var allow map[int]bool
-	if ctx.DB != nil && elevID != "" && !(via && !applyFallback) {
-		var hasRows bool
-		var err error
-		allow, hasRows, err = loadElevatorPinFloorAllowSet(ctx.DB, pin, elevID)
-		if err != nil {
-			log.Printf("WARNING: access_elevator_pin_floors: %v", err)
-		} else if hasRows {
-			restricted = true
-		}
-	}
+	now := time.Now()
 
 	ctx.elevatorMu.Lock()
-	ctx.elevatorGrantUntil = time.Now().Add(cfg.ElevatorFloorWaitTimeout)
-	ctx.elevatorGrantStartedAt = time.Now()
+	ctx.elevatorGrantUntil = now.Add(cfg.ElevatorFloorWaitTimeout)
+	ctx.elevatorGrantStartedAt = now
 	ctx.elevatorCabFloorDebounceHeld = nil
 	ctx.elevatorCabFloorDebounceTick = 0
-	ctx.elevatorGrantFloorsRestricted = restricted
-	ctx.elevatorGrantAllowedFloors = allow
 	ctx.elevatorMu.Unlock()
 	if ctx.GPIO == nil {
 		return
@@ -6113,7 +6246,7 @@ func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
 	// floor press or timeout). elevator_enable_pulse_duration does not apply here—only elevator_predefined_floor uses it.
 	if len(ctx.elevatorWaitFloorEnablePins) > 0 {
 		for i := range ctx.elevatorWaitFloorEnablePins {
-			if restricted && !allow[i] {
+			if !ctx.elevatorFloorChannelAllowed(pin, elevID, i, via, now) {
 				continue
 			}
 			name := elevatorWaitFloorEnableOutputName(i)
@@ -6123,6 +6256,7 @@ func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
 		}
 		return
 	}
+	// Legacy single shared enable relay: hardware cannot isolate per floor; PIN/time rules are enforced when a floor is selected.
 	if ctx.GPIO.HasOutput("elevator_enable") {
 		ctx.GPIO.ActionOn("elevator_enable")
 	}
@@ -6196,12 +6330,13 @@ func pulseElevatorPredefinedDispatchAtIndex(ctx *AppContext, cfg DeviceConfig, i
 }
 
 // activateElevatorPredefinedFloor pulses the enable relay (if configured) and dispatch for the selected predefined floor; returns webhook detail fields.
-// The second return is false when access_elevator_pin_floors denies this credential for the configured floor index (caller plays reject sound).
+// The second return is false when elevatorFloorChannelAllowed denies (PIN floor list / floor groups, or timed lock).
 func activateElevatorPredefinedFloor(ctx *AppContext, cfg DeviceConfig, kTag, credTag, pin string, viaFallback bool) (map[string]any, bool) {
 	extra := map[string]any{}
 	aclIdx := ctx.elevatorPredefinedDispatchIndexForACL(cfg)
-	if !ctx.elevatorPinMayUseFloor(pin, strings.TrimSpace(ctx.effectiveAccessElevatorID()), aclIdx, viaFallback) {
-		log.Printf("INFO: Elevator predefined floor denied (floor_index=%d not permitted for credential; %s keypad; credential=%s).", aclIdx, kTag, credTag)
+	elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
+	if !ctx.elevatorFloorChannelAllowed(pin, elevID, aclIdx, viaFallback, time.Now()) {
+		log.Printf("INFO: Elevator predefined floor denied (%s not permitted for credential or schedule; %s keypad; credential=%s).", elevatorFloorLogLabel(ctx.DB, elevID, aclIdx), kTag, credTag)
 		return nil, false
 	}
 	if ctx.GPIO == nil {
@@ -6341,13 +6476,14 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 		var deniedIndices []int
 		if ctx.elevatorCabFloorDebounceTick >= elevatorCabSenseStableTicks {
 			held := slices.Clone(ctx.elevatorCabFloorDebounceHeld)
-			if ctx.elevatorGrantFloorsRestricted {
-				for _, fi := range held {
-					if !ctx.elevatorGrantAllowedFloors[fi] {
-						floorDenied = true
-						deniedIndices = held
-						break
-					}
+			pin := ctx.elevatorGrantPIN
+			via := ctx.elevatorGrantViaFallback
+			elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
+			for _, fi := range held {
+				if !ctx.elevatorFloorChannelAllowed(pin, elevID, fi, via, time.Now()) {
+					floorDenied = true
+					deniedIndices = held
+					break
 				}
 			}
 			if !floorDenied {
@@ -6360,13 +6496,18 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 			ctx.configMu.RLock()
 			cfg := ctx.Config
 			ctx.configMu.RUnlock()
-			log.Printf("INFO: Elevator cab floor input(s) rejected (not permitted for credential): %v", deniedIndices)
+			log.Printf("INFO: Elevator cab floor input(s) rejected (not permitted for credential or schedule): %v", deniedIndices)
 			playSoundSync(cfg, cfg.SoundPinReject)
-			fireEventWebhook(ctx, "elevator_floor_denied", map[string]any{
-				"operation_mode":           mode,
-				"elevator_floor_indices":   deniedIndices,
-				"access_control_elevator_id": strings.TrimSpace(ctx.effectiveAccessElevatorID()),
-			})
+			elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
+			denyEx := map[string]any{
+				"operation_mode":             mode,
+				"elevator_floor_indices":     deniedIndices,
+				"access_control_elevator_id": elevID,
+			}
+			if ctx.DB != nil && elevID != "" && len(deniedIndices) > 0 {
+				denyEx["elevator_floor_labels"] = elevatorFloorLogLabels(ctx.DB, elevID, deniedIndices)
+			}
+			fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
 			continue
 		}
 		if len(toDispatch) == 0 {
