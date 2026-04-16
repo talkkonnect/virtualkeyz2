@@ -2,7 +2,7 @@
 
 Virtualkeyz2 is an opensource door and elevator PIN based access control using USB keypads and I2C expander boards for the hardware layer. Built for Fun Over the Songrkran Holidays!
 
-This document is for installers and operators who configure and run the service on a Raspberry Pi (or similar Linux host). It describes behaviour, configuration keys, SQLite access control, the **`acl` technician commands**, event **audit logging**, and practical wiring notes. Authoritative JSON field names match `virtualkeyz2.json`.
+This document is for installers and operators who configure and run the service on a Raspberry Pi (or similar Linux host). It describes behaviour, **`device`** / **`gpio`** JSON keys, SQLite access control, **`acl`** technician commands, **exception calendars** (holidays), **door-open alarms** and **webhooks**, **audit logging**, and wiring notes. Authoritative field names match `virtualkeyz2.json`.
 
 ---
 
@@ -14,13 +14,13 @@ This document is for installers and operators who configure and run the service 
 | `-daemon` | Declares daemon-style startup (logging only; no extra integration in-tree). |
 | `-notechmenu` | Disable the interactive technician menu on `/dev/tty` when a TTY is present. |
 
-**Applying changes:** edit JSON, then either **restart the process** or use the technician menu: `cfg reload` loads from disk; `cfg apply` / `cfg live` refreshes in-memory settings (MQTT, log level, durations, paths, and other keys handled by `cfg set`).
+**Applying changes:** edit JSON, then either **restart the process** or use the technician menu: **`cfg reload`** loads from disk; **`cfg apply`** / **`cfg live`** refreshes in-memory settings (MQTT, log level, durations, paths, and keys handled by **`cfg set`**).
 
-**GPIO / relay mapping:** changing `gpio` pin numbers, `relay_output_mode`, or I2C settings **requires a process restart**; `cfg apply` does not re-initialise hardware.
+**GPIO / relay mapping:** changing **`gpio`** pin numbers, **`relay_output_mode`**, or I2C settings **requires a process restart**; **`cfg apply`** does not re-initialise hardware.
 
-**Database:** the service opens SQLite **`access_control.db`** in the **current working directory** (PINs, access schedules, and the **`logs`** audit table). Ensure the service user can read/write this file.
+**Database:** the service opens SQLite **`access_control.db`** in the **current working directory** (PINs, schedules, exception calendars, elevator floor rules, and the **`logs`** audit table). Ensure the service user can read/write this file.
 
-**Building:** build the **package directory**, not a single source file, for example:
+**Building:** build the **package directory**, not a single source file:
 
 ```bash
 cd /path/to/virtualkeyz2
@@ -47,69 +47,63 @@ When the process has a TTY and `-notechmenu` is not used, a bottom-line prompt a
 |-------|--------|
 | `h` | Main menu help |
 | `1` / `cfg list` | Full configuration (sensitive tokens shown as `(set)`) |
-| `acl` / `acl help` | **Access-control help** (SQLite doors, PINs, schedules, levels); same detail as §3.3 |
+| `acl` / `acl help` | **Access-control help** (SQLite doors, PINs, schedules, exception calendars); Tab completes subcommands |
 | `v` | Software build version and release |
 | `ch` | Changelog text |
 | `i` | Network snapshot (Ethernet / Wi‑Fi, DNS, gateways) |
 | `p` | System-wide listening TCP/UDP ports |
 | `occ` | Dual USB mode: in-memory area occupancy (masked PIN tails + `access_pins` labels) |
 | `kb` / `kb all` | List **by-id/by-path** USE_PATH values (`kb` = USB only; `kb all` = include non-USB) |
-| `cfg set <key> <value>` | Change one setting in memory |
+| `cfg set <key> <value>` | Change one setting in memory (see §5 and **`cfg keys`**) |
 | `cfg save` | Write current config to the `-config` JSON path |
 | `cfg reload` | Load JSON from disk and apply |
 | `cfg apply` / `cfg live` | Apply in-memory config (e.g. after `cfg set`) |
-| `cfg keys` | All settable keys (same names as JSON); includes a pointer to **`acl help`** |
+| `cfg keys` | All **`cfg set`** keys (snake_case, same as JSON `device` / `gpio` flat keys) |
 | `cfg history clear` | Clear command history |
 | `...` | Shutdown request (same path as SIGTERM) |
 
 ### 3.1 Tab completion
 
-Press **Tab** to complete:
-
-- Top-level commands, including **`acl`**
-- After **`cfg `** — subcommands (`set`, `save`, `reload`, …)
-- After **`cfg set `** — configuration keys (snake_case)
-- After **`acl `** — `acl` subcommands (`bind`, `door`, `pin`, `profile`, …)
-- After **`acl door `** (and similar) — verbs such as **`add`** and **`list`**
-
-If several names share a prefix (for example **`door`** and **`door_group`**), Tab may extend only to the common prefix; type another character and press Tab again to disambiguate.
+Press **Tab** to complete top-level commands, **`cfg`** subcommands, **`cfg set`** keys, **`acl`** categories and verbs (e.g. **`acl pin hold_extra`**). If several names share a prefix, Tab may extend only to the common prefix; type another character and press Tab again.
 
 ### 3.2 `cfg` versus `acl` versus JSON
 
 | Mechanism | What it changes |
 |-----------|-----------------|
-| **`cfg set` / `cfg save`** | **`virtualkeyz2.json`** fields only (device binding ids, `access_schedule_enforce`, MQTT, GPIO *numbers* in JSON — hardware still needs restart for pin/mode changes). |
-| **`acl …` commands** | Rows in **`access_control.db`** (doors, elevators, PINs, groups, time profiles, windows, levels, targets). |
-| **`acl bind door|elevator`** | Convenience: updates **`access_control_door_id`** / **`access_control_elevator_id`** in memory like **`cfg set`**; you still run **`cfg save`** if you want those ids persisted in JSON. |
+| **`cfg set` / `cfg save`** | **`virtualkeyz2.json`** — scalar **`device`** and **`gpio`** fields. Nested webhook maps / endpoint lists (**`webhook_event_types`**, **`webhook_event_endpoints`**) are edited in JSON (or merge partial JSON on reload), not via **`cfg set`**. |
+| **`acl …` commands** | Rows in **`access_control.db`** (doors, elevators, PINs, groups, profiles, windows, levels, targets, exception calendars). |
+| **`acl bind door|elevator`** | Convenience: sets **`access_control_door_id`** / **`access_control_elevator_id`** in memory like **`cfg set`**; run **`cfg save`** to persist in JSON. |
 
-### 3.3 Access control commands (`acl`) — reference and examples
+---
 
-All **`acl`** commands run from the technician menu. They require a working SQLite handle (normal startup). Errors often include a **hint** (for example: create a door with **`acl door add`** before **`acl target door`**).
+## 4. Access control commands (`acl`) — reference
+
+All **`acl`** commands run from the technician menu. Full inline help: **`acl help`**. Errors often include a **hint** (for example: create a door with **`acl door add`** before **`acl target door`**).
 
 **Conventions**
 
 - **Display names** in the CLI should be a **single token**; use underscores instead of spaces (e.g. `Main_Entrance`).
 - **Time windows:** `weekday` is **0 = Sunday … 6 = Saturday**, or **7 = any day**. **`start_minute`** and **`end_minute`** are **0–1439** (minutes from midnight). If start > end, the window crosses midnight.
-- **PINs** are stored in **`access_pins`**. List commands show what you query; design assumes operators already know their PIN policy.
+- **PINs** live in **`access_pins`**. List commands show what you query; PIN policy is your organisation’s responsibility.
 
-#### 3.3.1 Discover and summary
+### 4.1 Discover and summary
 
 | Command | Purpose |
 |---------|---------|
-| `acl summary` | Prints **`access_control_door_id`**, **`access_control_elevator_id`**, **`access_schedule_enforce`**, and **row counts** for main ACL tables plus **`logs`**. |
-| `acl door list` | Rows in **`access_doors`**. |
-| `acl door_group list` | Rows in **`access_door_groups`**. |
-| `acl elevator list` | Rows in **`access_elevators`**. |
-| `acl elevator_group list` | Rows in **`access_elevator_groups`**. |
-| `acl pin list` | **`access_pins`** (`pin`, `label`, `enabled`). |
-| `acl group list` | User groups and **member PIN counts**. |
-| `acl profile list` | **`access_time_profiles`** (id, display name, IANA timezone). |
-| `acl level list` | **`access_levels`** (enabled flag, linked profile and user group). |
-| `acl target list` | **`access_level_targets`** (which level grants which door/elevator/group). |
+| `acl summary` | **`access_control_door_id`**, **`access_control_elevator_id`**, **`access_schedule_enforce`**, and row counts for main ACL tables plus **`logs`**. |
+| `acl door list` | **`access_doors`**. |
+| `acl door_group list` | **`access_door_groups`**. |
+| `acl elevator list` | **`access_elevators`**. |
+| `acl elevator_group list` | **`access_elevator_groups`**. |
+| `acl pin list` | **`access_pins`** columns including **`door_hold_extra_seconds`** (§4.5). |
+| `acl group list` | User groups and member PIN counts. |
+| `acl profile list` | **`access_time_profiles`** (id, display name, IANA timezone, **`respects_exception_calendar`**). |
+| `acl level list` | **`access_levels`**. |
+| `acl target list` | **`access_level_targets`**. |
+| `acl exception calendar list` | Exception calendars (§4.8). |
+| `acl exception date list [calendar_id]` | Exception dates. |
 
-#### 3.3.2 Bind this controller to a logical door or elevator
-
-These set the same JSON fields as **`cfg set`** (in memory only until **`cfg save`**):
+### 4.2 Bind this controller to a logical door or elevator
 
 ```text
 acl bind door east
@@ -117,9 +111,9 @@ acl bind elevator cab_a
 cfg save
 ```
 
-The id must match a row you created (**`acl door add`** / **`acl elevator add`**) and usually a **`acl target …`** row for schedule enforcement (see §8.2).
+The id must match a row you created and, for schedule enforcement, a **`acl target …`** row (§4.7).
 
-#### 3.3.3 Doors, elevators, and groups
+### 4.3 Doors, elevators, and groups
 
 ```text
 acl door add east Main_Entrance
@@ -128,12 +122,14 @@ acl door_group add all_exits North_exits
 acl elevator_group add bank1 Bank_1_cars
 ```
 
-**Note:** **`acl`** does not yet manage **`access_door_group_members`** or **`access_elevator_group_members`** (which physical doors/cars belong to a group). Use **`sqlite3`** for those joins, or add rows manually. You can still create the **group id** and use **`acl target door_group`** / **`acl target elevator_group`** once members exist.
+**Note:** **`acl`** does not manage **`access_door_group_members`** or **`access_elevator_group_members`** (which physical doors/cars belong to a group). Use **`sqlite3`** or your provisioning tool for those joins.
 
-#### 3.3.4 PINs and user groups
+### 4.4 PINs and user groups
 
 ```text
 acl pin add 123456 Alice
+acl pin add temporary 999999 2026-12-31T23:59:59Z Visitor1 --max-uses 10
+acl pin hold_extra 123456 120
 acl pin disable 123456
 acl pin enable 123456
 
@@ -142,30 +138,35 @@ acl group join staff 123456
 acl group leave staff 123456
 ```
 
-#### 3.3.5 Time profiles and windows
+- **`acl pin hold_extra <pin> <extra_seconds>`** — sets **`access_pins.door_hold_extra_seconds`**. **0** clears. Extends the **first** door-open alarm threshold for the **next** time this credential unlocks the door (accessibility / slower entry); see §10. Maximum **24h** worth of seconds is enforced in software.
+
+### 4.5 `access_pins` columns (operator-relevant)
+
+| Column | Meaning |
+|--------|---------|
+| `pin`, `label`, `enabled` | Credential identity and on/off. |
+| `temporary`, `expires_at`, `max_uses`, `use_count` | Visitor/contractor lifecycle: temporary PINs need **`expires_at`** (RFC3339); optional **`max_uses`** caps successful grants. |
+| **`door_hold_extra_seconds`** | Optional extra time (seconds) added to **`device.door_open_warning_after`** for the open period following an unlock by this PIN (§10). |
+
+### 4.6 Time profiles and windows
 
 ```text
 acl profile add biz Business_Hours
 acl profile add nights After_hours Asia/Bangkok
+acl profile respects_exceptions biz on
 
 acl window add biz 1 525 1020
 ```
 
-The last line is **Monday**, **08:45**–**17:00** (minutes 525 and 1020). Add more **`acl window add`** lines for other weekdays or **`weekday 7`** for every day.
+**`acl profile respects_exceptions <profile_id> on|off`** — when **on** (default), profiles that represent “standard business” hours follow **exception calendars** (holidays / early close). When **off**, that profile ignores exception dates (e.g. 24/7-style profiles).
 
-#### 3.3.6 Access levels and targets
-
-An **access level** ties a **time profile** and a **user group** (who may enter when the profile matches “now”):
+### 4.7 Access levels and targets
 
 ```text
 acl level add L1 biz staff Staff_weekdays
 acl level disable L1
 acl level enable L1
-```
 
-Then **grant** that level on a specific door, elevator, or group:
-
-```text
 acl target door L1 east
 acl target elevator L1 cab_a
 acl target door_group L1 all_exits
@@ -173,7 +174,25 @@ acl target elevator_group L1 bank1
 acl target list
 ```
 
-#### 3.3.7 End-to-end example (door + schedule + PIN)
+### 4.8 Exception calendars (holidays / early closure)
+
+Civil dates are interpreted in **`device.access_exception_site_timezone`** (IANA, e.g. `America/New_York`); **empty** uses the system local timezone.
+
+```text
+cfg set access_exception_site_timezone America/New_York
+cfg save
+
+acl exception calendar add national National 100
+acl exception date add national 2026-12-25 full Christmas
+acl exception date add national 2026-12-24 early 780 Christmas_Eve_1pm_close
+acl exception import national /path/to/holidays.csv
+```
+
+- **`acl exception calendar add <id> [display_name [priority [source_note]]]`** — priority resolves overlapping calendars (higher wins).
+- **`acl exception date add`** — **`full`** = holiday (access windows that respect exceptions are treated as closed that day); **`early <minute>`** = early closure that day (minute 0–1439 from midnight in the profile’s timezone evaluation path).
+- **`acl exception import <calendar_id> <csv_path>`** — CSV: `YYYY-MM-DD,full|early[,minute][,label]`.
+
+### 4.9 End-to-end example (door + schedule + PIN)
 
 ```text
 acl door add east Main_Entrance
@@ -182,10 +201,6 @@ acl group add staff Staff
 acl group join staff 123456
 acl profile add biz Business_Hours
 acl window add biz 1 525 1020
-acl window add biz 2 525 1020
-acl window add biz 3 525 1020
-acl window add biz 4 525 1020
-acl window add biz 5 525 1020
 acl level add L1 biz staff Staff_on_schedule
 acl target door L1 east
 acl bind door east
@@ -193,279 +208,223 @@ cfg set access_schedule_enforce true
 cfg save
 ```
 
-After this, with **`access_schedule_enforce`** true and **`access_control_door_id`** set to **`east`**, a valid PIN must be in **`staff`**, during **`biz`** windows, for level **`L1`** that targets door **`east`**. If **no** enabled level targets that door, schedule enforcement is **not** applied for that door (backward compatible).
+### 4.10 What stays in SQL / outside `acl`
 
-#### 3.3.8 What stays in SQL / outside `acl`
-
-The **`acl`** menu covers the **core** schedule model (§8.2). It does **not** replace every table:
-
-- **`access_door_group_members`**, **`access_elevator_group_members`** — group membership for doors/cars.
-- **`access_elevator_pin_floors`**, **`access_elevator_floor_groups`**, **`access_elevator_pin_floor_groups`**, **`access_elevator_floor_labels`**, **`access_elevator_floor_time_rules`** — per-floor elevator rules (§8.3–§8.5). Continue to use **`sqlite3`** or your provisioning tool for those.
-
-See §8.6 for example SQL for elevator floors and time rules.
+The **`acl`** menu covers the core schedule and exception model. Advanced elevator floor tables (**`access_elevator_pin_floors`**, floor groups, **`access_elevator_floor_time_rules`**, labels) may still be maintained with **`sqlite3`** or your provisioning tool — see §8.2.
 
 ---
 
-## 4. Operation modes (`device.keypad_operation_mode`)
+## 5. Device and GPIO settings (`cfg set` / JSON)
+
+All keys below are settable with **`cfg set <key> <value>`** (same names as JSON). Durations use Go syntax (e.g. `10s`, `400ms`, `1m0s`). Booleans: `true` / `false`. **`cfg keys`** prints a compact list with short descriptions.
+
+### 5.1 Logging, heartbeat, sounds
+
+| Key | Purpose |
+|-----|---------|
+| `log_level` | `debug`, `info`, `warning`, `error`, `critical`, `all` (empty = all). |
+| `heartbeat_interval` | Heartbeat webhook tick interval and internal debug cadence. |
+| `sound_card_name` | ALSA device for WAV playback (e.g. `plughw:0,0`). |
+| `sound_startup` / `sound_shutdown` / `sound_pin_ok` / `sound_pin_reject` / `sound_keypress` | WAV paths (empty skips). |
+
+### 5.2 Door sensor, door-open alarms, and accessibility
+
+Requires **`gpio.door_sensor_pin`** non-zero and a configured polarity.
+
+| Key | Purpose |
+|-----|---------|
+| `door_sensor_closed_is_low` | **true** = closed when GPIO reads low (typical pull-up to 3.3 V, contact to GND when closed). |
+| `door_open_warning_after` | **Base** duration the door may stay open before the **first** **`door_open_timeout`** webhook. |
+| `door_open_alarm_interval` | Interval between **repeat** **`door_open_timeout`** webhooks after the first (default **30s** if unset/zero after normalisation). |
+| `door_open_alarm_max_count` | Maximum **`door_open_timeout`** events per **continuous** open period; **0 = unlimited**. |
+| `door_forced_after_warnings` | After this many **`door_open_timeout`** events in **one** open period, emit **`door_forced`** once and **stop further door alarm webhooks** until the door has **closed and opened again**; **0 = never**. |
+
+Per-PIN extra time before the first alarm: **`access_pins.door_hold_extra_seconds`** via **`acl pin hold_extra`** (§4.4–4.5). The effective first threshold is **`door_open_warning_after` + extra** for the open period following that PIN’s unlock.
+
+### 5.3 PIN entry, lockout, fallback
+
+| Key | Purpose |
+|-----|---------|
+| `pin_length` | Digits before auto-submit; **0** = require **Enter** / KP Enter to submit. |
+| `keypad_inter_digit_timeout` | Max gap between digits (clamped in software). |
+| `keypad_session_timeout` | Max time from first digit to submit/clear. |
+| `pin_entry_feedback_delay` | Pause after PIN OK/reject before accepting new keys. |
+| `pin_lockout_enabled` | Master switch for wrong-PIN lockout. |
+| `pin_lockout_after_attempts` | Consecutive wrong PINs before lockout (0 = off; else clamped 3–5). |
+| `pin_lockout_duration` | Keypad ignore duration after lockout. |
+| `pin_lockout_override_pin` | Submitted PIN clears lockout **without** opening the door. |
+| `pin_reject_buzzer_after_attempts` | Wrong-PIN streak threshold for buzzer pulse (**0** = off). |
+| `buzzer_relay_pulse_duration` | Buzzer relay pulse length. |
+| `fallback_access_pin` | Accepted when no **`access_pins`** row matches (empty disables). |
+| `access_schedule_apply_to_fallback_pin` | When **true**, fallback PIN is subject to schedules too. |
+
+### 5.4 MQTT
+
+| Key | Purpose |
+|-----|---------|
+| `mqtt_enabled` | Client on/off. |
+| `mqtt_broker` | e.g. `tcp://host:1883`. |
+| `mqtt_client_id` | Client id; copied to webhooks and **`logs.device_client_id`**. |
+| `mqtt_username` / `mqtt_password` | Optional broker credentials. |
+| `mqtt_command_topic` | Subscribe topic for remote commands (§9). |
+| `mqtt_status_topic` | JSON command acknowledgements. |
+| `mqtt_command_token` | If set, command payload must be JSON with matching **`token`**. |
+| `mqtt_pair_peer_topic` | Pair-peer topic (§6.6). |
+| `pair_peer_role` | `none` \| `entry` \| `exit`. |
+| `pair_peer_token` | Optional secret in pair-peer JSON. |
+
+### 5.5 Webhooks (scalars via `cfg set`; lists/maps in JSON)
+
+| Key | Purpose |
+|-----|---------|
+| `webhook_event_enabled` | POST discrete events when **true** and URL(s) configured. |
+| `webhook_event_url` | Legacy single event URL (used only if **`webhook_event_endpoints`** is empty). |
+| `webhook_event_token_enabled` / `webhook_event_token` | Optional **Authorization: Bearer** for legacy URL. |
+| `webhook_heartbeat_enabled` | POST heartbeats when **true** and URL set. |
+| `webhook_heartbeat_url` | Heartbeat URL. |
+| `webhook_heartbeat_token_enabled` / `webhook_heartbeat_token` | Bearer for heartbeat. |
+
+**In JSON only (not individual `cfg set` keys):**
+
+- **`webhook_event_types`** — Global allowlist: if non-empty, only event names with value **true** are sent.
+- **`webhook_event_endpoints`** — Array of `{ enabled, url, token_enabled, token, event_types? }`. If **non-empty**, it **replaces** **`webhook_event_url`** for event delivery until the list is cleared. Each endpoint may have its own **`event_types`** allowlist.
+
+### 5.6 Operation mode and access binding
+
+| Key | Purpose |
+|-----|---------|
+| `keypad_operation_mode` | §6. |
+| `keypad_evdev_path` / `keypad_exit_evdev_path` | evdev devices (dual mode: must differ). |
+| `access_control_door_id` | SQLite **`access_doors.id`** for this device. |
+| `access_control_elevator_id` | SQLite **`access_elevators.id`** for elevator modes. |
+| `access_schedule_enforce` | When **true** and id set, enforce levels + windows for that target. |
+| `access_exception_site_timezone` | IANA zone for exception-calendar **civil** dates (§4.8). |
+| `tech_menu_history_max` | Technician command history cap. |
+| `tech_menu_prompt` | Top-level JSON: prompt label (not under **`device`**). |
+
+### 5.7 Elevator-specific `device` keys
+
+| Key | Purpose |
+|-----|---------|
+| `elevator_floor_wait_timeout` | Wait-floor grant window. |
+| `elevator_wait_floor_cab_sense` | `sense` (default) or `ignore`. |
+| `elevator_floor_input_pins` | Comma BCM list (sense mode). |
+| `elevator_predefined_floor` / `elevator_predefined_floors` | Predefined-floor mode indices / labels. |
+| `elevator_dispatch_pulse_duration` | Default dispatch pulse. |
+| `elevator_floor_dispatch_pulse_durations` | Comma-separated durations per dispatch index. |
+| `elevator_enable_pulse_duration` | Predefined-floor enable pulse (wait-floor uses full timeout for enables). |
+| `dual_keypad_reject_exit_without_entry` | Dual USB: reject exit without entry when **true**. |
+
+### 5.8 GPIO (`gpio` section)
+
+| Key | Purpose |
+|-----|---------|
+| `relay_output_mode` | `gpio` \| `mcp23017` \| `xl9535`. |
+| `mcp23017_i2c_bus` / `mcp23017_i2c_addr` | MCP23017 I2C bus and 7-bit address. |
+| `xl9535_i2c_bus` / `xl9535_i2c_addr` | XL9535 bus and address. |
+| `door_relay_pin` / `door_relay_active_low` | Strike / door relay (BCM or expander index per mode). |
+| `buzzer_relay_pin` / `buzzer_relay_active_low` | Wrong-PIN buzzer. |
+| `door_sensor_pin` | Door position input (**BCM**; not on expander). |
+| `heartbeat_led_pin` | Activity LED (**BCM**). |
+| `exit_button_pin` / `exit_button_active_low` | REX (**BCM**). |
+| `entry_button_pin` / `entry_button_active_low` | Entry request (**BCM**). |
+| `elevator_dispatch_relay_pin` / `elevator_dispatch_active_low` | Shared dispatch when no per-floor list. |
+| `elevator_enable_relay_pin` / `elevator_enable_active_low` | Legacy single wait-floor enable. |
+| `elevator_floor_dispatch_pins` | Comma BCM or expander indices for per-floor dispatch. |
+| `elevator_wait_floor_enable_pins` | Wait-floor “return ground” enables. |
+| `elevator_predefined_enable_pins` | Predefined-floor call simulation. |
+
+**Note:** Door sensor, heartbeat LED, exit/entry buttons, and **cab floor sense** inputs remain **SoC BCM GPIO**, not on the I2C expander.
+
+### 5.9 Top-level JSON (besides `device` / `gpio`)
+
+| Key | Purpose |
+|-----|---------|
+| `tech_menu_prompt` | Short label on the technician prompt line. |
+| `elevator_parameter_modes` | **Documentation only** — not read by control logic; preserved on **`cfg save`**. |
+
+---
+
+## 6. Operation modes (`device.keypad_operation_mode`)
 
 Set **exactly one** of the following string values.
 
-### 4.1 `access_entry` (default)
+### 6.1 `access_entry` (default)
 
-- Single USB keypad on `device.keypad_evdev_path`.
-- Valid PIN → pulse **door** relay (`gpio.door_relay_*`, duration `device.relay_pulse_duration`).
+Single USB keypad on **`keypad_evdev_path`**. Valid PIN → pulse **door** relay.
 
-### 4.2 `access_exit`
+### 6.2 `access_exit`
 
-- Same logic as **entry**; use when the keypad and relay are wired for an **exit** door or strike. Software behaviour matches `access_entry`; logs and webhooks record the mode.
+Same behaviour as entry; logs/webhooks record the mode for wiring clarity.
 
-### 4.3 `access_entry_with_exit_button`
+### 6.3 `access_entry_with_exit_button`
 
-- Valid PIN → door pulse.
-- **Free egress:** `gpio.exit_button_pin` (non-zero) pulses the door; `gpio.exit_button_active_low` = contact pulls to ground when pressed.
+Valid PIN → door pulse. **`exit_button_pin`**: free egress.
 
-### 4.4 `access_exit_with_entry_button`
+### 6.4 `access_exit_with_entry_button`
 
-- Keypad at **exit** side (valid PIN → door pulse).
-- **`gpio.entry_button_pin`:** “request entry” input; **`gpio.entry_button_active_low`** same convention as exit.
+Keypad at exit; **`entry_button_pin`**: request entry from inside.
 
-### 4.5 `access_dual_usb_keypad`
+### 6.5 `access_dual_usb_keypad`
 
-- **`device.keypad_evdev_path`** — **entry** keypad; **`device.keypad_exit_evdev_path`** — **exit** keypad (must differ).
-- **Credentials:** SQLite **`access_pins`** (`pin`, optional `label`, `enabled`). If no row matches, **`device.fallback_access_pin`** is accepted when non-empty.
-- **Occupancy (RAM, until restart):** entry PIN increments that credential’s “inside” count; exit PIN decrements. Mismatch handling: **`device.dual_keypad_reject_exit_without_entry`** (`false` = warn, still open, webhook may include `occupancy_mismatch`; `true` = reject exit, no pulse).
-- **Technician `occ`:** occupancy snapshot with masked PINs and labels.
+**`keypad_evdev_path`** = entry; **`keypad_exit_evdev_path`** = exit (must differ). Occupancy and **`occ`** command; **`dual_keypad_reject_exit_without_entry`**.
 
-### 4.6 `access_paired_remote_exit`
+### 6.6 `access_paired_remote_exit`
 
-| Unit | `device.pair_peer_role` | Behaviour |
-|------|-------------------------|-----------|
-| **Entry** | `entry` | Valid PIN → pulse **local** door + publish JSON to **`device.mqtt_pair_peer_topic`**. |
-| **Exit** | `exit` | Subscribes to **`device.mqtt_pair_peer_topic`**; on valid message, pulses **local** door. |
+| Unit | `pair_peer_role` | Behaviour |
+|------|------------------|-----------|
+| **Entry** | `entry` | Valid PIN → local door + publish JSON to **`mqtt_pair_peer_topic`**. |
+| **Exit** | `exit` | Subscribes; on valid message, pulses local door. |
 
-Requires **`device.mqtt_enabled`**, broker, topic, and optional **`device.pair_peer_token`** in JSON payloads. Local PIN on the exit unit still opens that unit’s door.
+### 6.7 `elevator_wait_floor_buttons`
 
-### 4.7 `elevator_wait_floor_buttons`
+After valid PIN (and schedule checks if configured): per-floor or legacy enable relays, **`elevator_floor_wait_timeout`**, cab sense **`elevator_wait_floor_cab_sense`**, floor inputs and dispatch as in the previous OPERATOR sections (see `elevator_parameter_modes` in JSON for a field legend).
 
-After a **valid PIN** (and optional access-schedule checks for the configured elevator):
+### 6.8 `elevator_predefined_floor`
 
-1. **Per-floor wait enables:** if **`gpio.elevator_wait_floor_enable_pins`** is non-empty, each listed relay can be turned **ON** for the wait window (only for floors allowed by PIN/floor groups and **floor time rules** — see §8.3–§8.5).
-2. **Legacy single enable:** if **`gpio.elevator_wait_floor_enable_pins`** is empty and **`gpio.elevator_enable_relay_pin`** is non-zero, one **elevator_enable** output holds **ON** for all cab buttons (hardware cannot split per floor; PIN/floor/time rules still apply when a floor is selected).
-3. **`device.elevator_floor_wait_timeout`:** length of the grant window.
-4. **`device.elevator_wait_floor_cab_sense`:**
-   - **`sense` (default):** read **`device.elevator_floor_input_pins`** (comma BCM, active low). On stable press, pulse matching **`gpio.elevator_floor_dispatch_pins`** entry (or shared dispatch / door relay if unset).
-   - **`ignore`:** leave **`elevator_floor_input_pins`** empty; no cab GPIO; timeout only clears enables (no floor selection from software).
-5. Dispatch pulse length: **`device.elevator_dispatch_pulse_duration`**, with optional per-index **`device.elevator_floor_dispatch_pulse_durations`** aligned to dispatch pin list order.
-
-Validation rules tie together counts of cab inputs, wait-enable pins, and dispatch pins; see sample `elevator_parameter_modes` in `virtualkeyz2.json` for a field legend.
-
-### 4.8 `elevator_predefined_floor`
-
-- Valid PIN → **dispatch** (and optional **predefined enable**) pulse; no in-cab floor GPIO.
-- **`device.elevator_predefined_floors`:** comma-separated **logical floor labels** (at most one entry in typical single-floor setups); index **`device.elevator_predefined_floor`** selects the entry.
-- **`gpio.elevator_predefined_enable_pins`:** optional relay(s) pulsed with **`device.elevator_enable_pulse_duration`** (or derived from dispatch durations).
-- **`gpio.elevator_floor_dispatch_pins`:** per-floor dispatch when multiple predefined floors exist; otherwise **`gpio.elevator_dispatch_relay_pin`** or door relay.
-- Per-floor access uses the same **floor_index** order as wait-floor mode for **`access_elevator_pin_floors`** and related tables when **`device.access_control_elevator_id`** is set.
+Valid PIN → dispatch / predefined enable pulses; no in-cab GPIO. Floor ACL uses **`access_control_elevator_id`** and SQLite floor tables (§8.2).
 
 ---
 
-## 5. Device settings reference (`device` section)
+## 7. Exception calendars vs time windows
 
-| Key | Purpose |
-|-----|---------|
-| `heartbeat_interval` | Interval for heartbeat webhook and debug tick (default on the order of 1 minute). |
-| `door_open_warning_after` | After door sensor reports open this long, log WARNING and fire `door_open_timeout` webhook. |
-| `door_sensor_closed_is_low` | Polarity for door contact vs `gpio.door_sensor_pin`. |
-| `sound_card_name` | ALSA device for WAV playback (e.g. `plughw:0,0`). |
-| `sound_startup` / `sound_shutdown` / `sound_pin_ok` / `sound_pin_reject` / `sound_keypress` | WAV paths (empty skips that sound). |
-| `log_level` | e.g. `debug`, `info`, `warning`, `error`, `critical`, `all`. |
-| `pin_length` | Required digit count for PIN entry. |
-| `relay_pulse_duration` | Default door relay pulse. |
-| `pin_reject_buzzer_after_attempts` | Every Nth wrong PIN can trigger buzzer (0 disables pattern). |
-| `buzzer_relay_pulse_duration` | Buzzer relay pulse length. |
-| `mqtt_enabled` | Master switch for MQTT client. |
-| `mqtt_broker` | URL e.g. `tcp://host:1883`. |
-| `mqtt_client_id` | Client identifier; included in webhook payloads and audit **`logs.device_client_id`**. |
-| `mqtt_username` / `mqtt_password` | Optional broker credentials. |
-| `mqtt_command_topic` | Subscribe topic for remote commands (§9). |
-| `mqtt_status_topic` | Publish topic for command acknowledgements (JSON). |
-| `mqtt_command_token` | If set, commands must be JSON with matching `"token"`. |
-| `mqtt_pair_peer_topic` | Pair-peer publish/subscribe topic (§4.6). |
-| `pair_peer_role` | `none` \| `entry` \| `exit` for paired remote exit. |
-| `pair_peer_token` | Optional secret in pair-peer JSON. |
-| `tech_menu_history_max` | Technician command history size (bounded). |
-| `keypad_inter_digit_timeout` | Max gap between digits while composing a PIN. |
-| `keypad_session_timeout` | Max time from first digit to submit. |
-| `pin_entry_feedback_delay` | Pause after PIN OK/reject sounds before listening again. |
-| `pin_lockout_enabled` | Enable wrong-PIN lockout. |
-| `pin_lockout_after_attempts` / `pin_lockout_duration` | Threshold and lockout duration. |
-| `pin_lockout_override_pin` | If set, submitting this PIN clears lockout without opening. |
-| `fallback_access_pin` | PIN accepted when no `access_pins` row matches (empty disables). |
-| `webhook_event_*` / `webhook_heartbeat_*` | Event and heartbeat POST URLs and optional Bearer tokens (§11). |
-| `keypad_operation_mode` | §4. |
-| `keypad_evdev_path` / `keypad_exit_evdev_path` | §7 (keypad paths). |
-| `elevator_floor_wait_timeout` | Wait-floor grant window. |
-| `elevator_wait_floor_cab_sense` | `sense` or `ignore`. |
-| `elevator_floor_input_pins` | BCM list (sense mode only). |
-| `elevator_predefined_floor` / `elevator_predefined_floors` | §4.8. |
-| `elevator_dispatch_pulse_duration` | Default elevator dispatch pulse. |
-| `elevator_floor_dispatch_pulse_durations` | Comma durations, one per dispatch index (pads with dispatch duration). |
-| `elevator_enable_pulse_duration` | Predefined-floor enable pulse (wait-floor ignores). |
-| `dual_keypad_reject_exit_without_entry` | §4.5. |
-| `access_control_door_id` | SQLite `access_doors.id` for this device’s door strike (empty = no door schedule binding). Set via JSON, **`cfg set`**, or **`acl bind door`**. |
-| `access_control_elevator_id` | SQLite `access_elevators.id` for elevator modes (empty = no elevator schedule binding). Set via JSON, **`cfg set`**, or **`acl bind elevator`**. |
-| `access_schedule_enforce` | When `true` and door/elevator id set, enforce `access_levels` + time windows for that target (default `true` in sample config). |
-| `access_schedule_apply_to_fallback_pin` | When `true`, **`fallback_access_pin`** is also subject to schedules. |
+**`access_time_windows`** define recurring weekly hours. **`access_exception_dates`** (via **`acl exception …`**) define **specific civil dates** where:
 
-Top-level JSON keys outside `device` / `gpio`:
+- **`full`** — holiday: profiles with **`respects_exception_calendar`** treat the day as closed.
+- **`early`** — early closure: schedules end at the given minute that day.
 
-| Key | Purpose |
-|-----|---------|
-| `tech_menu_prompt` | Short label shown on the technician prompt line. |
-| `elevator_parameter_modes` | **Documentation only** — not read by control logic; preserved on `cfg save` to annotate which fields apply to which elevator sub-mode. |
-
----
-
-## 6. Keypad device paths
-
-Prefer stable symlinks under **`/dev/input/by-id/`** or **`/dev/input/by-path/`** (see §6.1). Bare **`/dev/input/eventN`** can change after reboot.
-
-### 6.1 Installer tool: `listkeypads`
-
-```bash
-go run ./tools/listkeypads
-go run ./tools/listkeypads -usb
-go build -o listkeypads ./tools/listkeypads && sudo install -m755 listkeypads /usr/local/bin/
-```
-
-Use **`sudo evtest <USE_PATH>`** to confirm physical mapping. The running service exposes the same table via technician **`kb`** / **`kb all`**.
-
----
-
-## 7. GPIO reference (`gpio` section)
-
-### 7.1 Relay output backend
-
-| Key | Values |
-|-----|--------|
-| `relay_output_mode` | `gpio` — relays on SoC BCM numbers. `mcp23017` / `xl9535` — relay outputs on I2C expander pins **0–15** (door, buzzer, elevator outputs as configured). |
-| `mcp23017_i2c_bus` / `mcp23017_i2c_addr` | Linux I2C bus index (often `1`) and 7-bit address (often `32` = 0x20). |
-| `xl9535_i2c_bus` / `xl9535_i2c_addr` | Same for XL9535 when `relay_output_mode` is `xl9535`. |
-
-**Note:** Door sensor, heartbeat LED, exit/entry buttons, and **elevator cab floor sense inputs** (`elevator_floor_input_pins`) remain **BCM GPIO** on the SoC, not on the expander.
-
-### 7.2 Pin map (typical roles)
-
-| Field | Role |
-|-------|------|
-| `door_relay_pin` / `door_relay_active_low` | Main strike or door relay. |
-| `buzzer_relay_pin` / `buzzer_relay_active_low` | Wrong-PIN buzzer. |
-| `door_sensor_pin` | Door position (with `device.door_sensor_closed_is_low`). |
-| `heartbeat_led_pin` | Activity LED (toggled by software). |
-| `exit_button_pin` / `exit_button_active_low` | REX (`access_entry_with_exit_button`). |
-| `entry_button_pin` / `entry_button_active_low` | Entry request (`access_exit_with_entry_button`). |
-| `elevator_dispatch_relay_pin` / `elevator_dispatch_active_low` | Shared dispatch when `elevator_floor_dispatch_pins` empty. |
-| `elevator_enable_relay_pin` / `elevator_enable_active_low` | Legacy single wait-floor enable (§4.7). |
-| `elevator_floor_dispatch_pins` | Comma list: per-floor dispatch outputs (order matches mode rules in §4.7–4.8). |
-| `elevator_wait_floor_enable_pins` | Comma list: per-floor “return ground” enables for wait-floor mode. |
-| `elevator_predefined_enable_pins` | Predefined-floor call simulation relay(s). |
+Evaluation uses **`access_exception_site_timezone`** for date boundaries when set. **`acl profile respects_exceptions`** controls whether a given profile reacts to those dates.
 
 ---
 
 ## 8. SQLite (`access_control.db`)
 
-Created automatically on startup in the process **working directory**. The DSN enables foreign keys and a busy timeout for safer concurrent access.
+Created on startup in the process **working directory**. DSN uses **`_fk=1`** and a busy timeout.
 
-### 8.1 PINs
+### 8.1 Schedule model (summary)
 
-- **`access_pins`:** `pin` (primary key), optional `label`, `enabled` (1/0). Maintain with **`acl pin …`** or SQL.
+**`access_doors`**, **`access_elevators`**, groups, **`access_user_groups`**, **`access_time_profiles`**, **`access_time_windows`**, **`access_levels`**, **`access_level_targets`**. Bind the device with **`access_control_door_id`** / **`access_control_elevator_id`**. If **no** enabled level targets that door/elevator, schedule enforcement is **not** applied for that target (backward compatible).
 
-### 8.2 Time-based access (doors and elevators)
+### 8.2 Elevator per-floor permissions and time rules
 
-- **`access_doors`**, **`access_door_groups`**, **`access_door_group_members`** — logical doors and grouping.
-- **`access_elevators`**, **`access_elevator_groups`**, **`access_elevator_group_members`** — logical elevators and grouping.
-- **`access_user_groups`**, **`access_user_group_members`** — user groups (members are PINs).
-- **`access_time_profiles`** — named schedule; optional **`iana_timezone`** (empty = host local time).
-- **`access_time_windows`** — `weekday` 0–6 (Sun–Sat) or **7** = any day; `start_minute` / `end_minute` 0–1439; if start > end, window crosses midnight.
-- **`access_levels`** — links `time_profile_id`, `user_group_id`, `enabled`.
-- **`access_level_targets`** — each row grants **exactly one** of: door, door group, elevator, or elevator group.
-
-Bind the device with **`device.access_control_door_id`** and/or **`device.access_control_elevator_id`** (JSON, **`cfg set`**, or **`acl bind`**). When **`device.access_schedule_enforce`** is true and the id is set, a valid PIN must belong to an **enabled** level whose **time profile** matches **now**, and whose target includes that door/elevator (directly or via a group). If **no** enabled level targets that door/elevator, scheduling is not applied for that target (backward compatible).
-
-**Operator workflow:** use **`acl`** commands in §3.3 for the common path; use **`sqlite3 access_control.db`** for advanced tables in §8.3–§8.5.
-
-### 8.3 Elevator per-floor permissions (floor index)
-
-**`floor_index`** is 0-based in the same order as **`device.elevator_floor_input_pins`**, **`gpio.elevator_wait_floor_enable_pins`**, and **`gpio.elevator_floor_dispatch_pins`** (for the configured mode).
+**`floor_index`** order matches **`elevator_floor_input_pins`**, **`elevator_wait_floor_enable_pins`**, and **`elevator_floor_dispatch_pins`** for the configured mode.
 
 | Table | Role |
 |-------|------|
-| **`access_elevator_pin_floors`** | `(pin, elevator_id, floor_index)` — optional explicit allowed floors. **No rows** for a PIN+elevator ⇒ all floors allowed (PIN-only). **One or more rows** ⇒ only listed indices. |
-| **`access_elevator_floor_groups`** | `(id, elevator_id, display_name)` — e.g. “Public”, “Executive”. |
-| **`access_elevator_floor_group_members`** | `(group_id, floor_index)` — floors in a group. |
-| **`access_elevator_pin_floor_groups`** | `(pin, group_id)` — PIN inherits the **union** of all member floors of its groups (for that elevator). |
+| **`access_elevator_pin_floors`** | Explicit allowed floors; no rows ⇒ all floors (PIN-only). |
+| **`access_elevator_floor_groups`** / **`access_elevator_floor_group_members`** / **`access_elevator_pin_floor_groups`** | Floor group inheritance. |
+| **`access_elevator_floor_labels`** | Human-readable labels for logs/webhooks. |
+| **`access_elevator_floor_time_rules`** | Per-floor **`open`** / **`lock`** windows using time profiles. |
 
-### 8.4 Logical floor labels and relay documentation
+### 8.3 Event audit log (`logs`)
 
-- **`access_elevator_floor_labels`:** `(elevator_id, floor_index, floor_name, relay_pin optional)`. Used for clearer **logs**, **webhooks**, and audit **`detail_json`** (`elevator_floor_label` / `elevator_floor_labels` on some elevator deny events). **`relay_pin`** is optional metadata you set to match wiring (expander index or BCM); it is **not** synced from JSON.
-
-### 8.5 Timed floor open / lock (per floor, reuse time profiles)
-
-- **`access_elevator_floor_time_rules`:** `elevator_id`, `floor_index`, `time_profile_id`, **`action`** `'open'` or `'lock'`, `enabled`.
-
-Semantics (after a valid credential and elevator schedule, if any):
-
-- **`lock`** during an active window → that floor is **denied** (overrides PIN lists and open rules).
-- **`open`** during an active window → that floor is **allowed** even if not listed for the PIN (still requires valid PIN / fallback and elevator-level schedule when enforced).
-
-These rules are **independent** of **`access_schedule_enforce`**; they apply whenever matching enabled rows exist.
-
-### 8.6 Example SQL (illustrative)
-
-Use this when **`acl`** does not cover the table (elevator floors, floor groups, time rules). Prefer **`acl`** for §8.2 entities where possible.
-
-```sql
--- Elevator + labels
-INSERT INTO access_elevators (id, display_name) VALUES ('cab_a','Lobby car A');
-INSERT INTO access_elevator_floor_labels (elevator_id,floor_index,floor_name,relay_pin)
-  VALUES ('cab_a',0,'Lobby',5);
-
--- PIN + floor group
-INSERT INTO access_elevator_floor_groups (id,elevator_id,display_name) VALUES ('grp_public','cab_a','Public');
-INSERT INTO access_elevator_floor_group_members (group_id,floor_index) VALUES ('grp_public',0),('grp_public',1);
-INSERT INTO access_pins (pin,label,enabled) VALUES ('123456','Alice',1);
-INSERT INTO access_elevator_pin_floor_groups (pin,group_id) VALUES ('123456','grp_public');
-
--- Night lock on floor 3 (reuse profile + windows)
-INSERT INTO access_time_profiles (id,display_name,description,iana_timezone) VALUES ('nights','Nights','','');
-INSERT INTO access_time_windows (time_profile_id,weekday,start_minute,end_minute) VALUES ('nights',0,0,1439);
-INSERT INTO access_elevator_floor_time_rules (elevator_id,floor_index,time_profile_id,action,enabled)
-  VALUES ('cab_a',3,'nights','lock',1);
-```
-
-Use `sqlite3 access_control.db` or your own tool to maintain data. Foreign keys are enabled (`_fk=1`).
-
-### 8.7 Event audit log (`logs` table)
-
-Every **event** that would drive an **event webhook** (same `event` names and detail maps; **no PIN digits**) is also appended to **`logs`**, **even when** `webhook_event_enabled` is false or the webhook URL is empty. This supports local audit without outbound HTTP.
+Every **event** that would drive an **event webhook** is appended to **`logs`** with the same **`event_name`** and **`detail_json`** (no PIN digits), **even if** **`webhook_event_enabled`** is false. **Heartbeats** are **not** stored in **`logs`**.
 
 | Column | Meaning |
 |--------|---------|
-| `id` | Autoincrement primary key. |
-| `created_at` | UTC timestamp (RFC3339 nanoseconds). |
-| `event_type` | Currently **`event`** for these rows. |
-| `event_name` | e.g. `pin_accepted`, `door_opened`, `mqtt_remote_door_open`. |
-| `device_client_id` | Copy of **`mqtt_client_id`** at insert time. |
-| `detail_json` | JSON object of the same detail fields as webhooks (no PINs). |
-
-**Heartbeat** POSTs are **not** duplicated into **`logs`** (only discrete **event** activities).
-
-Example queries:
-
-```sql
-SELECT id, created_at, event_name, detail_json FROM logs ORDER BY id DESC LIMIT 50;
-SELECT event_name, COUNT(*) FROM logs GROUP BY event_name ORDER BY COUNT(*) DESC;
-```
+| `event_name` | e.g. `pin_accepted`, `door_open_timeout`, `door_forced`. |
+| `device_client_id` | **`mqtt_client_id`** at insert time. |
+| `detail_json` | JSON detail map (matches webhooks). |
 
 ---
 
@@ -473,82 +432,88 @@ SELECT event_name, COUNT(*) FROM logs GROUP BY event_name ORDER BY COUNT(*) DESC
 
 ### 9.1 Remote commands (`mqtt_command_topic`)
 
-Payload may be **plain text** command or **JSON** `{"cmd":"..."}`. If **`mqtt_command_token`** is set, payload **must** be JSON and include `"token"` matching the configured token.
+Payload: plain text command or JSON **`{"cmd":"..."}`**. If **`mqtt_command_token`** is set, use JSON with **`"token"`**.
 
 | Command aliases | Action |
 |-----------------|--------|
-| `open_door`, `door_open`, `unlock` | Pulse door relay; webhook `mqtt_remote_door_open` if configured. |
-| `buzzer`, `buzz`, `alarm` | Pulse buzzer relay; webhook `mqtt_remote_buzzer`. |
-| `door_status`, `status_door` | ACK includes `door_open` bool if door sensor configured. |
-| `ping`, `hello` | ACK `detail`: `pong`. |
+| `open_door`, `door_open`, `unlock` | Pulse door relay; **`mqtt_remote_door_open`**. |
+| `buzzer`, `buzz`, `alarm` | Buzzer relay; **`mqtt_remote_buzzer`**. |
+| `door_status`, `status_door` | ACK includes **`door_open`** if sensor configured. |
+| `ping`, `hello` | ACK **`detail`**: `pong`. |
 
-Acknowledgements are published to **`mqtt_status_topic`** as JSON: `ok`, `cmd`, optional `error`, `detail`, optional `door_open`.
+Acknowledgements on **`mqtt_status_topic`**: **`ok`**, **`cmd`**, optional **`error`**, **`detail`**, optional **`door_open`**.
 
-### 9.2 Pair-peer topic (`mqtt_pair_peer_topic`)
+### 9.2 Pair-peer (`mqtt_pair_peer_topic`)
 
-JSON `{"cmd":"pulse_paired_exit"}` or `{"cmd":"unlock_peer_exit"}`; optional `"token"` when **`pair_peer_token`** is set. Exit unit pulses local door (§4.6).
-
----
-
-## 10. HTTP listener
-
-The process starts an HTTP server on **`:8080`** (Gin):
-
-- **`GET /admin`** — placeholder text (“Local Configuration Interface”).
-- **`POST /api/remote-control`** — currently returns JSON `{"status":"door_opened"}`; middleware is a stub (no token enforcement in-tree).
-
-Treat port 8080 as **local/debug** unless you firewall or proxy it explicitly.
+JSON **`{"cmd":"pulse_paired_exit"}`** or **`unlock_peer_exit`**; optional **`token`**. Fires **`mqtt_pair_peer_exit_pulse`**.
 
 ---
 
-## 11. HTTP webhooks
+## 10. Door sensor behaviour (summary)
 
-When enabled, the service POSTs JSON:
-
-- **Events** (`webhook_event_*`): PIN accept/reject, door sensor, MQTT remote, elevator phases, wrong-PIN buzzer, lockout, pair-peer, etc. Payloads **never** include PIN digits. Type field: `"type":"event"`, `"event":"<name>"`, `timestamp`, `device_client_id`, plus mode-specific keys (e.g. `keypad_role`, `credential_label`, `elevator_floor_indices`, **`elevator_floor_label`** / **`elevator_floor_labels`** on some elevator deny events).
-- **Heartbeat** (`webhook_heartbeat_*`): once per `heartbeat_interval`; `"type":"heartbeat"`.
-
-The same **event** stream is also written to SQLite **`logs`** (§8.7), independent of webhook configuration.
-
-Optional **Authorization: Bearer** when `*_token_enabled` and token string are set.
+1. **Transitions:** **`door_opened`** / **`door_closed`** webhooks (and audit) on edge; closing clears per-PIN **`door_hold_extra`** grace for the next cycle.
+2. **First alarm:** when open duration exceeds **`door_open_warning_after` +** current **`door_hold_extra`** (from last credential grant that set it).
+3. **Repeats:** **`door_open_timeout`** every **`door_open_alarm_interval`**, up to **`door_open_alarm_max_count`** (if non-zero).
+4. **Forced:** at **`door_forced_after_warnings`** timeout count, **`door_forced`** fires; then **no** further **`door_open_timeout`** / **`door_forced`** until **close** then **open** again.
+5. Payloads include fields such as **`warning_sequence`**, **`threshold_effective`**, **`door_hold_extra`**, **`forced_after_warnings`** where applicable.
 
 ---
 
-## 12. Keypad lockout and override
+## 11. HTTP listener
 
-- **`pin_lockout_enabled`**, **`pin_lockout_after_attempts`**, **`pin_lockout_duration`** — consecutive wrong PIN threshold and keypad ignore period.
-- **`pin_lockout_override_pin`** — clears lockout and wrong-PIN streak **without** opening the door.
+Server on **`:8080`** (Gin): **`GET /admin`** placeholder; **`POST /api/remote-control`** stub response. Treat as **local/debug** unless firewalled.
 
 ---
 
-## 13. Troubleshooting
+## 12. HTTP webhooks and event names
+
+- **Events:** **`type`**: **`event`**, **`event`**: `<name>`, **`timestamp`**, **`device_client_id`**, plus detail keys. No PIN digits.
+- **Heartbeat:** **`type`**: **`heartbeat`**, **`heartbeat_interval`**, etc.
+
+**Common event names** (for **`webhook_event_types`** / endpoint allowlists):
+
+`pin_accepted`, `pin_rejected`, `wrong_pin_buzzer`, `keypad_lockout_activated`, `keypad_lockout_override`, `door_opened`, `door_closed`, `door_open_timeout`, `door_forced`, `mqtt_remote_door_open`, `mqtt_remote_buzzer`, `mqtt_pair_peer_exit_pulse`, `elevator_floor_denied`, `elevator_floor_selected`, `elevator_floor_timeout`, and credential lifecycle / schedule reasons embedded in **`pin_rejected`** details.
+
+---
+
+## 13. Keypad device paths
+
+Prefer **`/dev/input/by-id/`** or **`/dev/input/by-path/`**. Tool: **`go run ./tools/listkeypads`** (or **`kb`** in the technician menu).
+
+---
+
+## 14. Troubleshooting
 
 | Symptom | Checks |
 |---------|--------|
-| No keypad response | Wrong `keypad_evdev_path`; use `listkeypads` / `kb`, then `evtest`. Dual mode: two distinct paths. |
-| Door never pulses | GPIO unavailable; relay pin and `active_low`; `relay_output_mode` and I2C wiring for expander relays. |
-| Pair exit never opens | MQTT connected; exit `pair_peer_role` = `exit`; same topic and token; broker ACLs. |
-| Elevator wait never dispatches | Sense mode: `elevator_floor_input_pins` and active-low wiring; timeout; dispatch pin list lengths vs inputs/enables. |
-| PIN OK but elevator rejects floor | SQLite: `access_elevator_pin_floors`, floor groups, **`access_elevator_floor_time_rules`** (`lock`/`open`); `access_control_elevator_id` must match `elevator_id` in rows. |
-| Schedule seems ignored | `access_schedule_enforce`; door/elevator id set; enabled `access_levels` targeting that id; time profile timezone; windows weekday/minutes. Use **`acl summary`** and **`acl target list`**. |
-| `acl` command fails (“unknown door …”) | Create entities in order (§3.3); follow the hint text; **`acl door list`** / **`acl level list`**. |
-| Config “stuck” after edit | `cfg reload` or restart; GPIO / I2C changes need **restart**. |
-| MQTT command ignored | Topic spelling; if token set, JSON + correct `token`. |
-| Build errors / missing symbols | Build with **`go build -o virtualkeyz2 .`** from the project directory, not a single `.go` file. |
+| No keypad | **`keypad_evdev_path`**; **`listkeypads`** / **`kb`**; **`evtest`**. |
+| Door never pulses | GPIO / expander mapping; **`relay_output_mode`**. |
+| Door alarms wrong | **`door_sensor_closed_is_low`**; **`door_open_*`** timings; **`acl pin hold_extra`**. |
+| No repeat webhooks | **`door_open_alarm_interval`**; **`door_open_alarm_max_count`** not already reached. |
+| **`door_forced` never fires** | **`door_forced_after_warnings`** > 0; allowlist includes **`door_forced`**. |
+| Webhook missing | **`webhook_event_enabled`**; URL or **`webhook_event_endpoints`**; **`webhook_event_types`** not blocking the event name. |
+| Pair exit dead | MQTT, **`pair_peer_role`**, topic, token, broker ACLs. |
+| Elevator floor denied | SQLite floor ACL + **`access_elevator_floor_time_rules`**; **`access_control_elevator_id`**. |
+| Schedule ignored | **`access_schedule_enforce`**; bind ids; **`acl target list`**; timezones. |
+| Holiday wrong | **`access_exception_site_timezone`**; **`acl exception date list`**; **`respects_exceptions`** on profile. |
+| **`acl` fails** | **`acl help`**; create entities in dependency order. |
+| GPIO “stuck” | **Restart** after **`gpio`** / I2C changes. |
+| Build errors | **`go build -o virtualkeyz2 .`** from package directory. |
 
 ---
 
-## 14. Related files
+## 15. Related files
 
 | File | Purpose |
 |------|---------|
 | `virtualkeyz2.json` | Main configuration |
-| `virtualkeyz2.go` | Main application (includes technician menu, **`acl`** handlers, MQTT, GPIO) |
-| `access_control.db` | SQLite: PINs, access schedules, **`logs`** audit (working directory) |
-| `changelog.txt` | Human-readable change history |
-| `tools/bump-version.sh` | Version + changelog bump |
-| `tools/listkeypads` | Stable evdev paths for keypad JSON |
+| `virtualkeyz2.go` | Main application (menu, **`acl`**, MQTT, GPIO, door monitor) |
+| `exception_calendar.go` | Exception calendar resolution |
+| `access_control.db` | SQLite (PINs, ACL, exceptions, **`logs`**) |
+| `changelog.txt` | Release history |
+| `tools/bump-version.sh` | Version bump |
+| `tools/listkeypads` | evdev discovery |
 
 ---
 
-*Product line: VirtualKeyz 2.x. For technical support, refer to your integrator or project maintainer.*
+*VirtualKeyz 2.x. For support, contact your integrator or project maintainer.*

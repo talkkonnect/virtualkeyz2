@@ -54,3 +54,43 @@ func TestTimeMatchesProfileWindows(t *testing.T) {
 		t.Fatal("wildcard day")
 	}
 }
+
+func TestTimeMatchesProfileWindowsWithExceptionsEarlyClose(t *testing.T) {
+	// Mon 8:45–17:00
+	wins := []struct {
+		weekday      int
+		start, end int
+	}{{1, 525, 1020}}
+	// 12:30 still inside nominal window and inside 1pm early close (clip ends 780)
+	if !timeMatchesProfileWindowsWithExceptions(time.Monday, 12*60+30, wins, true, false, true, 13*60) {
+		t.Fatal("expected inside clipped window before 1pm close")
+	}
+	// 2 PM after 1pm early close
+	if timeMatchesProfileWindowsWithExceptions(time.Monday, 14*60, wins, true, false, true, 13*60) {
+		t.Fatal("expected outside after early close")
+	}
+	// respects_exceptions off → ignore early close
+	if !timeMatchesProfileWindowsWithExceptions(time.Monday, 14*60, wins, false, false, true, 13*60) {
+		t.Fatal("non-respecting profile should ignore early close")
+	}
+}
+
+func TestResolveAccessExceptionCalendarPriority(t *testing.T) {
+	db := testAccessDB(t)
+	defer db.Close()
+	must := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(`INSERT INTO access_exception_calendars (id, display_name, priority, enabled, source_note) VALUES ('low','',10,1,'')`)
+	must(`INSERT INTO access_exception_calendars (id, display_name, priority, enabled, source_note) VALUES ('high','',100,1,'')`)
+	must(`INSERT INTO access_exception_dates (calendar_id, y, m, d, kind, early_close_minute, label) VALUES ('low',2026,7,3,'early_closure',660,'')`)
+	must(`INSERT INTO access_exception_dates (calendar_id, y, m, d, kind, early_close_minute, label) VALUES ('high',2026,7,3,'full_closure',NULL,'')`)
+
+	full, _, active := resolveAccessExceptionCalendarState(db, 2026, 7, 3)
+	if !full || active {
+		t.Fatalf("expected full_closure from higher priority tier, got full=%v active=%v", full, active)
+	}
+}

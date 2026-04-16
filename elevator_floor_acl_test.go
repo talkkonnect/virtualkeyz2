@@ -21,6 +21,9 @@ func testAccessDB(t *testing.T) *sql.DB {
 	)`); err != nil {
 		t.Fatal(err)
 	}
+	if err := migrateAccessPinsLifecycle(db); err != nil {
+		t.Fatal(err)
+	}
 	if err := initAccessScheduleSchema(db); err != nil {
 		t.Fatal(err)
 	}

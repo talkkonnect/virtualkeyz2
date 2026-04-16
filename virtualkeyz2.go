@@ -255,7 +255,7 @@ type AppContext struct {
 	elevatorGrantPIN             string    // credential used for current wait-floor grant (for DB floor ACL)
 	elevatorGrantViaFallback     bool
 
-	// Dual USB keypad: in-memory occupancy per PIN (entry adds, exit subtracts). Reset on process restart.
+	// Dual USB keypad: per-PIN "inside" counts (entry +1, exit −1). Persisted in SQLite dual_keypad_zone_occupancy when DB is open; in-memory map only if DB is nil.
 	occupancyMu    sync.Mutex
 	occupancyByPIN map[string]int
 
@@ -267,16 +267,68 @@ type AppContext struct {
 	elevatorWaitFloorEnablePins []uint8
 	// elevatorParameterModesDoc: optional JSON subtree from elevator_parameter_modes; documentation only, preserved on cfg save.
 	elevatorParameterModesDoc json.RawMessage
+
+	// doorAlarmMu protects doorHoldExtraGrace (per-credential extra time before first door-open alarm).
+	doorAlarmMu       sync.Mutex
+	doorHoldExtraGrace time.Duration
 }
 
 // logEmitMinSeverity: emit log lines whose severity is >= this (0=DEBUG all, 1=INFO+, 2=WARNING+, 3=ERROR+, 4=CRITICAL only).
 var logEmitMinSeverity atomic.Int32
 
+// WebhookEventEndpoint is one HTTP destination for JSON event webhooks. Use webhook_event_endpoints in JSON; when the
+// slice is non-empty it replaces the legacy single webhook_event_url for event delivery (legacy URL is ignored until the list is cleared).
+// Each endpoint can be turned off with enabled:false. EventTypes is an optional allowlist: nil or empty = all events;
+// if non-empty, only event names with value true are POSTed to this endpoint.
+type WebhookEventEndpoint struct {
+	Enabled      bool            `json:"enabled"`
+	URL          string          `json:"url"`
+	TokenEnabled bool            `json:"token_enabled"`
+	Token        string          `json:"token"`
+	EventTypes   map[string]bool `json:"event_types,omitempty"`
+}
+
+func cloneStringBoolMap(m map[string]bool) map[string]bool {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneWebhookEventEndpoints(src []WebhookEventEndpoint) []WebhookEventEndpoint {
+	if src == nil {
+		return nil
+	}
+	out := make([]WebhookEventEndpoint, len(src))
+	for i := range src {
+		out[i] = src[i]
+		out[i].EventTypes = cloneStringBoolMap(src[i].EventTypes)
+	}
+	return out
+}
+
+func webhookEventTypesAllowlistPass(m map[string]bool, event string) bool {
+	if len(m) == 0 {
+		return true
+	}
+	return m[event]
+}
+
 // DeviceConfig represents configurable parameters (loaded from SQLite/Central Server)
 type DeviceConfig struct {
 	HeartbeatInterval time.Duration
-	// DoorOpenWarningAfter: if the door stays open longer than this, a warning is logged once until it closes again.
+	// DoorOpenWarningAfter: base time the door may stay open before the first door_open_timeout webhook; access_pins.door_hold_extra_seconds adds to this for the last successful unlock.
 	DoorOpenWarningAfter time.Duration
+	// DoorOpenAlarmInterval: spacing between repeat door_open_timeout webhooks after the first (default 30s when unset/zero).
+	DoorOpenAlarmInterval time.Duration
+	// DoorOpenAlarmMaxCount: max door_open_timeout webhooks per continuous open period; 0 = unlimited.
+	DoorOpenAlarmMaxCount int
+	// DoorForcedAfterWarnings: after this many door_open_timeout events in one open period, emit door_forced once and stop further door alarms until the door has closed and opened again; 0 = never.
+	DoorForcedAfterWarnings int
 	// DoorSensorClosedIsLow: when true, a low GPIO level means the door is closed (e.g. switch to GND when closed, often with pull-up).
 	// When false, a high level means closed (open when the pin reads low).
 	DoorSensorClosedIsLow bool
@@ -327,12 +379,16 @@ type DeviceConfig struct {
 	// FallbackAccessPin: if non-empty, accepted when no matching enabled row exists in access_pins (legacy fallback).
 	FallbackAccessPin string
 
-	// WebhookEvent*: POST JSON to WebhookEventURL on door/PIN/MQTT events when WebhookEventEnabled and URL is set.
-	// When WebhookEventTokenEnabled, sends Authorization: Bearer <WebhookEventToken>.
+	// WebhookEvent*: POST JSON on door/PIN/MQTT events when WebhookEventEnabled.
+	// WebhookEventTypes: optional global allowlist — nil or empty = all event names; if non-empty, event E is sent only when WebhookEventTypes[E] is true.
+	// WebhookEventEndpoints: optional list; when non-empty, each enabled entry receives POSTs (replacing WebhookEventURL for events). Each entry has its own URL, token, enabled flag, and optional EventTypes allowlist.
+	// Legacy: when WebhookEventEndpoints is empty, WebhookEventURL + WebhookEventToken* are used.
 	WebhookEventEnabled      bool
 	WebhookEventURL          string
 	WebhookEventTokenEnabled bool
 	WebhookEventToken        string
+	WebhookEventTypes        map[string]bool
+	WebhookEventEndpoints    []WebhookEventEndpoint
 	// WebhookHeartbeat*: POST JSON on each heartbeat tick (same interval as heartbeat_interval) when enabled and URL set.
 	WebhookHeartbeatEnabled      bool
 	WebhookHeartbeatURL          string
@@ -377,6 +433,8 @@ type DeviceConfig struct {
 	AccessScheduleEnforce bool
 	// AccessScheduleApplyToFallbackPin: when true, device.fallback_access_pin is subject to schedules; default false (emergency bypass).
 	AccessScheduleApplyToFallbackPin bool
+	// AccessExceptionSiteTimezone: IANA timezone for interpreting exception-calendar civil dates (holidays / early closures). Empty uses the system local timezone.
+	AccessExceptionSiteTimezone string
 }
 
 // virtualkeyz2JSON is the on-disk shape of virtualkeyz2.json (see default file in repo).
@@ -390,6 +448,9 @@ type virtualkeyz2JSON struct {
 type virtualkeyz2DeviceJSON struct {
 	HeartbeatInterval                   *string `json:"heartbeat_interval"`
 	DoorOpenWarningAfter                *string `json:"door_open_warning_after"`
+	DoorOpenAlarmInterval               *string `json:"door_open_alarm_interval"`
+	DoorOpenAlarmMaxCount               *int    `json:"door_open_alarm_max_count"`
+	DoorForcedAfterWarnings             *int    `json:"door_forced_after_warnings"`
 	DoorSensorClosedIsLow               *bool   `json:"door_sensor_closed_is_low"`
 	SoundCardName                       *string `json:"sound_card_name"`
 	SoundStartup                        *string `json:"sound_startup"`
@@ -423,6 +484,8 @@ type virtualkeyz2DeviceJSON struct {
 	WebhookEventURL                     *string `json:"webhook_event_url"`
 	WebhookEventTokenEnabled            *bool   `json:"webhook_event_token_enabled"`
 	WebhookEventToken                   *string `json:"webhook_event_token"`
+	WebhookEventTypes                   *map[string]bool          `json:"webhook_event_types,omitempty"`
+	WebhookEventEndpoints               *[]WebhookEventEndpoint   `json:"webhook_event_endpoints,omitempty"`
 	WebhookHeartbeatEnabled             *bool   `json:"webhook_heartbeat_enabled"`
 	WebhookHeartbeatURL                 *string `json:"webhook_heartbeat_url"`
 	WebhookHeartbeatTokenEnabled        *bool   `json:"webhook_heartbeat_token_enabled"`
@@ -446,6 +509,7 @@ type virtualkeyz2DeviceJSON struct {
 	AccessControlElevatorID             *string `json:"access_control_elevator_id,omitempty"`
 	AccessScheduleEnforce               *bool   `json:"access_schedule_enforce,omitempty"`
 	AccessScheduleApplyToFallbackPin      *bool   `json:"access_schedule_apply_to_fallback_pin,omitempty"`
+	AccessExceptionSiteTimezone         *string `json:"access_exception_site_timezone,omitempty"`
 }
 
 type virtualkeyz2GPIOJSON struct {
@@ -815,8 +879,28 @@ func normalizeKeypadAndPinUX(c *DeviceConfig) {
 		c.PinLockoutAfterAttempts = 0
 	} else if c.PinLockoutAfterAttempts > 0 && c.PinLockoutAfterAttempts < 3 {
 		c.PinLockoutAfterAttempts = 3
-	} else if c.PinLockoutAfterAttempts > 5 {
+	} else 	if c.PinLockoutAfterAttempts > 5 {
 		c.PinLockoutAfterAttempts = 5
+	}
+	if c.DoorOpenWarningAfter <= 0 {
+		c.DoorOpenWarningAfter = 10 * time.Second
+	} else {
+		c.DoorOpenWarningAfter = clampDuration(c.DoorOpenWarningAfter, 1*time.Second, 24*time.Hour)
+	}
+	if c.DoorOpenAlarmInterval <= 0 {
+		c.DoorOpenAlarmInterval = 30 * time.Second
+	} else {
+		c.DoorOpenAlarmInterval = clampDuration(c.DoorOpenAlarmInterval, 1*time.Second, 24*time.Hour)
+	}
+	if c.DoorOpenAlarmMaxCount < 0 {
+		c.DoorOpenAlarmMaxCount = 0
+	} else if c.DoorOpenAlarmMaxCount > 10000 {
+		c.DoorOpenAlarmMaxCount = 10000
+	}
+	if c.DoorForcedAfterWarnings < 0 {
+		c.DoorForcedAfterWarnings = 0
+	} else if c.DoorForcedAfterWarnings > 10000 {
+		c.DoorForcedAfterWarnings = 10000
 	}
 	normalizeOperationModeConfig(c)
 }
@@ -874,6 +958,15 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if err := applyJSONDuration(&app.Config.DoorOpenWarningAfter, "device", "door_open_warning_after", d.DoorOpenWarningAfter); err != nil {
 		return err
+	}
+	if err := applyJSONDuration(&app.Config.DoorOpenAlarmInterval, "device", "door_open_alarm_interval", d.DoorOpenAlarmInterval); err != nil {
+		return err
+	}
+	if d.DoorOpenAlarmMaxCount != nil {
+		app.Config.DoorOpenAlarmMaxCount = *d.DoorOpenAlarmMaxCount
+	}
+	if d.DoorForcedAfterWarnings != nil {
+		app.Config.DoorForcedAfterWarnings = *d.DoorForcedAfterWarnings
 	}
 	if err := applyJSONDuration(&app.Config.RelayPulseDuration, "device", "relay_pulse_duration", d.RelayPulseDuration); err != nil {
 		return err
@@ -974,6 +1067,12 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.WebhookEventToken != nil {
 		app.Config.WebhookEventToken = *d.WebhookEventToken
 	}
+	if d.WebhookEventTypes != nil {
+		app.Config.WebhookEventTypes = cloneStringBoolMap(*d.WebhookEventTypes)
+	}
+	if d.WebhookEventEndpoints != nil {
+		app.Config.WebhookEventEndpoints = cloneWebhookEventEndpoints(*d.WebhookEventEndpoints)
+	}
 	if d.WebhookHeartbeatEnabled != nil {
 		app.Config.WebhookHeartbeatEnabled = *d.WebhookHeartbeatEnabled
 	}
@@ -1055,6 +1154,9 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if d.AccessScheduleApplyToFallbackPin != nil {
 		app.Config.AccessScheduleApplyToFallbackPin = *d.AccessScheduleApplyToFallbackPin
+	}
+	if d.AccessExceptionSiteTimezone != nil {
+		app.Config.AccessExceptionSiteTimezone = strings.TrimSpace(*d.AccessExceptionSiteTimezone)
 	}
 	g := &raw.GPIO
 	if g.RelayOutputMode != nil {
@@ -1250,6 +1352,9 @@ type virtualkeyz2PersistFile struct {
 type virtualkeyz2PersistDevice struct {
 	HeartbeatInterval                   string `json:"heartbeat_interval"`
 	DoorOpenWarningAfter                string `json:"door_open_warning_after"`
+	DoorOpenAlarmInterval               string `json:"door_open_alarm_interval"`
+	DoorOpenAlarmMaxCount               int    `json:"door_open_alarm_max_count"`
+	DoorForcedAfterWarnings             int    `json:"door_forced_after_warnings"`
 	DoorSensorClosedIsLow               bool   `json:"door_sensor_closed_is_low"`
 	SoundCardName                       string `json:"sound_card_name"`
 	SoundStartup                        string `json:"sound_startup"`
@@ -1282,7 +1387,9 @@ type virtualkeyz2PersistDevice struct {
 	WebhookEventEnabled                 bool   `json:"webhook_event_enabled"`
 	WebhookEventURL                     string `json:"webhook_event_url"`
 	WebhookEventTokenEnabled            bool   `json:"webhook_event_token_enabled"`
-	WebhookEventToken                   string `json:"webhook_event_token"`
+	WebhookEventToken                   string                 `json:"webhook_event_token"`
+	WebhookEventTypes                   map[string]bool        `json:"webhook_event_types,omitempty"`
+	WebhookEventEndpoints               []WebhookEventEndpoint `json:"webhook_event_endpoints,omitempty"`
 	WebhookHeartbeatEnabled             bool   `json:"webhook_heartbeat_enabled"`
 	WebhookHeartbeatURL                 string `json:"webhook_heartbeat_url"`
 	WebhookHeartbeatTokenEnabled        bool   `json:"webhook_heartbeat_token_enabled"`
@@ -1306,6 +1413,7 @@ type virtualkeyz2PersistDevice struct {
 	AccessControlElevatorID          string `json:"access_control_elevator_id,omitempty"`
 	AccessScheduleEnforce            bool   `json:"access_schedule_enforce"`
 	AccessScheduleApplyToFallbackPin bool   `json:"access_schedule_apply_to_fallback_pin"`
+	AccessExceptionSiteTimezone      string `json:"access_exception_site_timezone,omitempty"`
 }
 
 type virtualkeyz2PersistGPIO struct {
@@ -1342,6 +1450,9 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.TechMenuPrompt = app.TechMenuPrompt
 	out.Device.HeartbeatInterval = c.HeartbeatInterval.String()
 	out.Device.DoorOpenWarningAfter = c.DoorOpenWarningAfter.String()
+	out.Device.DoorOpenAlarmInterval = c.DoorOpenAlarmInterval.String()
+	out.Device.DoorOpenAlarmMaxCount = c.DoorOpenAlarmMaxCount
+	out.Device.DoorForcedAfterWarnings = c.DoorForcedAfterWarnings
 	out.Device.DoorSensorClosedIsLow = c.DoorSensorClosedIsLow
 	out.Device.SoundCardName = c.SoundCardName
 	out.Device.SoundStartup = c.SoundStartup
@@ -1375,6 +1486,8 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.WebhookEventURL = c.WebhookEventURL
 	out.Device.WebhookEventTokenEnabled = c.WebhookEventTokenEnabled
 	out.Device.WebhookEventToken = c.WebhookEventToken
+	out.Device.WebhookEventTypes = cloneStringBoolMap(c.WebhookEventTypes)
+	out.Device.WebhookEventEndpoints = cloneWebhookEventEndpoints(c.WebhookEventEndpoints)
 	out.Device.WebhookHeartbeatEnabled = c.WebhookHeartbeatEnabled
 	out.Device.WebhookHeartbeatURL = c.WebhookHeartbeatURL
 	out.Device.WebhookHeartbeatTokenEnabled = c.WebhookHeartbeatTokenEnabled
@@ -1408,6 +1521,7 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.AccessControlElevatorID = c.AccessControlElevatorID
 	out.Device.AccessScheduleEnforce = c.AccessScheduleEnforce
 	out.Device.AccessScheduleApplyToFallbackPin = c.AccessScheduleApplyToFallbackPin
+	out.Device.AccessExceptionSiteTimezone = c.AccessExceptionSiteTimezone
 	out.GPIO.RelayOutputMode = normalizeRelayOutputMode(g.RelayOutputMode)
 	out.GPIO.MCP23017I2CBus = g.MCP23017I2CBus
 	out.GPIO.MCP23017I2CAddr = int(g.MCP23017I2CAddr)
@@ -1650,6 +1764,20 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		err = applyJSONDuration(&ctx.Config.HeartbeatInterval, "device", "heartbeat_interval", &value)
 	case "door_open_warning_after":
 		err = applyJSONDuration(&ctx.Config.DoorOpenWarningAfter, "device", "door_open_warning_after", &value)
+	case "door_open_alarm_interval":
+		err = applyJSONDuration(&ctx.Config.DoorOpenAlarmInterval, "device", "door_open_alarm_interval", &value)
+	case "door_open_alarm_max_count":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.Config.DoorOpenAlarmMaxCount = int(n)
+		}
+	case "door_forced_after_warnings":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.Config.DoorForcedAfterWarnings = int(n)
+		}
 	case "relay_pulse_duration":
 		err = applyJSONDuration(&ctx.Config.RelayPulseDuration, "device", "relay_pulse_duration", &value)
 	case "buzzer_relay_pulse_duration":
@@ -1927,6 +2055,8 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.AccessScheduleEnforce, err = strconv.ParseBool(value)
 	case "access_schedule_apply_to_fallback_pin":
 		ctx.Config.AccessScheduleApplyToFallbackPin, err = strconv.ParseBool(value)
+	case "access_exception_site_timezone":
+		ctx.Config.AccessExceptionSiteTimezone = value
 	default:
 		return fmt.Errorf("unknown key %q (try: cfg keys)", key)
 	}
@@ -1973,7 +2103,10 @@ func techMenuCfgKeysHelp(w io.Writer) {
 Settable keys (snake_case, same as virtualkeyz2.json):
   log_level                         debug | info | warning | error | critical | all (empty=all)
   heartbeat_interval                e.g. 60s
-  door_open_warning_after           duration string
+  door_open_warning_after           duration string (base before first door_open_timeout)
+  door_open_alarm_interval          repeat interval for door_open_timeout after the first (default 30s)
+  door_open_alarm_max_count         max door_open_timeout per open period (0=unlimited)
+  door_forced_after_warnings        emit door_forced after N timeouts in one open period (0=never)
   door_sensor_closed_is_low         true|false
   relay_pulse_duration              e.g. 400ms
   buzzer_relay_pulse_duration       e.g. 800ms
@@ -2029,6 +2162,7 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   access_control_elevator_id        logical elevator id (access_elevators.id); empty = no elevator schedule; used in elevator_* keypad modes when set
   access_schedule_enforce           true|false (default true): when door/elevator id set, enforce access_levels + time windows if DB maps that target
   access_schedule_apply_to_fallback_pin  true|false (default false): subject device.fallback_access_pin to schedules
+  access_exception_site_timezone    IANA zone for exception-calendar civil dates (holidays / early close); empty = system local
   relay_output_mode                 gpio|mcp23017|xl9535 (relays on BCM vs I2C expander; sensors/LED stay BCM)
   mcp23017_i2c_bus                  MCP23017: Linux I2C bus (default 1)
   mcp23017_i2c_addr                 MCP23017: 7-bit address, default 32 (0x20)
@@ -2103,6 +2237,9 @@ func main() {
 		Config: DeviceConfig{
 			HeartbeatInterval:            60 * time.Second,
 			DoorOpenWarningAfter:         10 * time.Second,
+			DoorOpenAlarmInterval:        30 * time.Second,
+			DoorOpenAlarmMaxCount:        0,
+			DoorForcedAfterWarnings:      0,
 			DoorSensorClosedIsLow:        true,
 			PinLength:                    6,
 			RelayPulseDuration:           400 * time.Millisecond,
@@ -2579,13 +2716,14 @@ func (c *colorLogWriter) writeColoredLine(line []byte) {
 // access_elevators / elevator_groups — elevator banks (device.access_control_elevator_id = access_elevators.id; used in elevator_* keypad modes).
 // access_user_groups + access_user_group_members — who (PIN in access_pins).
 // access_time_profiles + access_time_windows — named schedules; weekday 0–6 Sun–Sat or 7 = any day; minutes 0–1439; start>end crosses midnight.
+// access_exception_calendars + access_exception_dates — optional multi-tier holiday/exception calendars (priority, full day or early close). Dates use device access_exception_site_timezone. Profiles use respects_exception_calendar (default 1): when set, holidays override “standard business” windows; set 0 for 24/7-style profiles that ignore exception calendars.
 // access_levels + access_level_targets — time profile + user group + exactly one target: door, door_group, elevator, or elevator_group.
 //
 // Example Mon–Fri 8:45–17:00 for door "east", group "staff", PIN 123456:
 //
 //	INSERT INTO access_doors VALUES ('east','East entry');
 //	INSERT INTO access_user_groups VALUES ('staff','Staff');
-//	INSERT INTO access_pins VALUES ('123456','Alice',1);
+//	INSERT INTO access_pins (pin,label,enabled,temporary,expires_at,max_uses,use_count) VALUES ('123456','Alice',1,0,NULL,NULL,0);
 //	INSERT INTO access_user_group_members VALUES ('staff','123456');
 //	INSERT INTO access_time_profiles VALUES ('biz','Standard Business','','');
 //	INSERT INTO access_time_windows (time_profile_id,weekday,start_minute,end_minute) VALUES
@@ -2776,7 +2914,8 @@ func initAccessScheduleSchema(db *sql.DB) error {
 			id TEXT PRIMARY KEY NOT NULL,
 			display_name TEXT,
 			description TEXT,
-			iana_timezone TEXT NOT NULL DEFAULT ''
+			iana_timezone TEXT NOT NULL DEFAULT '',
+			respects_exception_calendar INTEGER NOT NULL DEFAULT 1
 		)`,
 		`CREATE TABLE IF NOT EXISTS access_time_windows (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2809,6 +2948,29 @@ func initAccessScheduleSchema(db *sql.DB) error {
 				OR (door_id IS NULL AND door_group_id IS NULL AND elevator_id IS NULL AND elevator_group_id IS NOT NULL)
 			)
 		)`,
+		`CREATE TABLE IF NOT EXISTS access_exception_calendars (
+			id TEXT PRIMARY KEY NOT NULL,
+			display_name TEXT,
+			priority INTEGER NOT NULL DEFAULT 0,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			source_note TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_exception_dates (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			calendar_id TEXT NOT NULL REFERENCES access_exception_calendars(id) ON DELETE CASCADE,
+			y INTEGER NOT NULL,
+			m INTEGER NOT NULL,
+			d INTEGER NOT NULL,
+			kind TEXT NOT NULL CHECK (kind IN ('full_closure','early_closure')),
+			early_close_minute INTEGER,
+			label TEXT,
+			UNIQUE (calendar_id, y, m, d),
+			CHECK (y >= 1 AND y <= 9999 AND m >= 1 AND m <= 12 AND d >= 1 AND d <= 31),
+			CHECK (
+				(kind = 'early_closure' AND early_close_minute IS NOT NULL AND early_close_minute >= 0 AND early_close_minute <= 1439)
+				OR (kind = 'full_closure' AND early_close_minute IS NULL)
+			)
+		)`,
 	}
 	for _, q := range tableStmts {
 		if _, err := db.Exec(q); err != nil {
@@ -2816,6 +2978,9 @@ func initAccessScheduleSchema(db *sql.DB) error {
 		}
 	}
 	if err := migrateAccessLevelTargetsElevatorSupport(db); err != nil {
+		return fmt.Errorf("access schedule schema: %w", err)
+	}
+	if err := migrateAccessTimeProfilesRespectsExceptionCalendar(db); err != nil {
 		return fmt.Errorf("access schedule schema: %w", err)
 	}
 	indexStmts := []string{
@@ -2828,6 +2993,8 @@ func initAccessScheduleSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_access_elevator_floor_time_rules_lookup ON access_elevator_floor_time_rules(elevator_id, floor_index, enabled)`,
 		`CREATE INDEX IF NOT EXISTS idx_access_time_windows_profile ON access_time_windows(time_profile_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_access_user_group_members_pin ON access_user_group_members(pin)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_exception_dates_ymd ON access_exception_dates(y, m, d)`,
+		`CREATE INDEX IF NOT EXISTS idx_access_exception_dates_cal ON access_exception_dates(calendar_id)`,
 	}
 	for _, q := range indexStmts {
 		if _, err := db.Exec(q); err != nil {
@@ -2929,8 +3096,12 @@ func (ctx *AppContext) accessScheduleAllows(pin, doorID string, atTime time.Time
 		return true, ""
 	}
 
+	siteLoc := ctx.accessExceptionSiteLocation()
+	cy, cm, cd := civilDateInLocation(atTime, siteLoc)
+	fullExc, earlyEnd, earlyActive := resolveAccessExceptionCalendarState(ctx.DB, cy, cm, cd)
+
 	rows, err := ctx.DB.Query(`
-		SELECT DISTINCT al.time_profile_id, tp.iana_timezone
+		SELECT DISTINCT al.time_profile_id, tp.iana_timezone, COALESCE(tp.respects_exception_calendar, 1)
 		FROM access_levels al
 		INNER JOIN access_time_profiles tp ON tp.id = al.time_profile_id
 		INNER JOIN access_level_targets t ON t.access_level_id = al.id
@@ -2949,18 +3120,26 @@ func (ctx *AppContext) accessScheduleAllows(pin, doorID string, atTime time.Time
 	defer rows.Close()
 
 	type profTZ struct {
-		id  string
-		tz  string
-		key string
+		id          string
+		tz          string
+		key         string
+		respectsExc bool
 	}
 	var list []profTZ
 	for rows.Next() {
 		var pid, iana string
-		if err := rows.Scan(&pid, &iana); err != nil {
+		var respects sql.NullInt64
+		if err := rows.Scan(&pid, &iana, &respects); err != nil {
 			log.Printf("WARNING: access schedule scan: %v", err)
 			continue
 		}
-		list = append(list, profTZ{id: strings.TrimSpace(pid), tz: strings.TrimSpace(iana), key: strings.TrimSpace(pid) + "\x00" + strings.TrimSpace(iana)})
+		rf := true
+		if respects.Valid {
+			rf = respects.Int64 != 0
+		}
+		pid = strings.TrimSpace(pid)
+		iana = strings.TrimSpace(iana)
+		list = append(list, profTZ{id: pid, tz: iana, key: pid + "\x00" + iana, respectsExc: rf})
 	}
 	if err := rows.Err(); err != nil {
 		return false, "schedule_db_error"
@@ -3012,8 +3191,13 @@ func (ctx *AppContext) accessScheduleAllows(pin, doorID string, atTime time.Time
 		if len(wins) == 0 {
 			continue
 		}
-		if timeMatchesProfileWindows(wd, minuteOfDay, wins) {
+		matchesBase := timeMatchesProfileWindows(wd, minuteOfDay, wins)
+		matchesExc := timeMatchesProfileWindowsWithExceptions(wd, minuteOfDay, wins, pt.respectsExc, fullExc, earlyActive, earlyEnd)
+		if matchesExc {
 			return true, ""
+		}
+		if fullExc && pt.respectsExc && matchesBase && !matchesExc {
+			return false, "holiday_closure"
 		}
 	}
 
@@ -3070,8 +3254,12 @@ func (ctx *AppContext) accessScheduleAllowsElevator(pin, elevatorID string, atTi
 		return true, ""
 	}
 
+	siteLoc := ctx.accessExceptionSiteLocation()
+	cy, cm, cd := civilDateInLocation(atTime, siteLoc)
+	fullExc, earlyEnd, earlyActive := resolveAccessExceptionCalendarState(ctx.DB, cy, cm, cd)
+
 	rows, err := ctx.DB.Query(`
-		SELECT DISTINCT al.time_profile_id, tp.iana_timezone
+		SELECT DISTINCT al.time_profile_id, tp.iana_timezone, COALESCE(tp.respects_exception_calendar, 1)
 		FROM access_levels al
 		INNER JOIN access_time_profiles tp ON tp.id = al.time_profile_id
 		INNER JOIN access_level_targets t ON t.access_level_id = al.id
@@ -3090,18 +3278,26 @@ func (ctx *AppContext) accessScheduleAllowsElevator(pin, elevatorID string, atTi
 	defer rows.Close()
 
 	type profTZ struct {
-		id  string
-		tz  string
-		key string
+		id          string
+		tz          string
+		key         string
+		respectsExc bool
 	}
 	var list []profTZ
 	for rows.Next() {
 		var pid, iana string
-		if err := rows.Scan(&pid, &iana); err != nil {
+		var respects sql.NullInt64
+		if err := rows.Scan(&pid, &iana, &respects); err != nil {
 			log.Printf("WARNING: access schedule elevator scan: %v", err)
 			continue
 		}
-		list = append(list, profTZ{id: strings.TrimSpace(pid), tz: strings.TrimSpace(iana), key: strings.TrimSpace(pid) + "\x00" + strings.TrimSpace(iana)})
+		rf := true
+		if respects.Valid {
+			rf = respects.Int64 != 0
+		}
+		pid = strings.TrimSpace(pid)
+		iana = strings.TrimSpace(iana)
+		list = append(list, profTZ{id: pid, tz: iana, key: pid + "\x00" + iana, respectsExc: rf})
 	}
 	if err := rows.Err(); err != nil {
 		return false, "schedule_db_error"
@@ -3153,8 +3349,13 @@ func (ctx *AppContext) accessScheduleAllowsElevator(pin, elevatorID string, atTi
 		if len(wins) == 0 {
 			continue
 		}
-		if timeMatchesProfileWindows(wd, minuteOfDay, wins) {
+		matchesBase := timeMatchesProfileWindows(wd, minuteOfDay, wins)
+		matchesExc := timeMatchesProfileWindowsWithExceptions(wd, minuteOfDay, wins, pt.respectsExc, fullExc, earlyActive, earlyEnd)
+		if matchesExc {
 			return true, ""
+		}
+		if fullExc && pt.respectsExc && matchesBase && !matchesExc {
+			return false, "holiday_closure"
 		}
 	}
 
@@ -3239,8 +3440,12 @@ func (ctx *AppContext) elevatorFloorTimedPolicy(elevatorID string, floorIndex in
 	if ctx.DB == nil || elevatorID == "" || floorIndex < 0 {
 		return false, false
 	}
+	siteLoc := ctx.accessExceptionSiteLocation()
+	cy, cm, cd := civilDateInLocation(at, siteLoc)
+	fullExc, earlyEnd, earlyActive := resolveAccessExceptionCalendarState(ctx.DB, cy, cm, cd)
+
 	rows, err := ctx.DB.Query(`
-		SELECT r.action, tp.iana_timezone, tw.weekday, tw.start_minute, tw.end_minute
+		SELECT r.action, tp.iana_timezone, tw.weekday, tw.start_minute, tw.end_minute, COALESCE(tp.respects_exception_calendar, 1)
 		FROM access_elevator_floor_time_rules r
 		INNER JOIN access_time_profiles tp ON tp.id = r.time_profile_id
 		INNER JOIN access_time_windows tw ON tw.time_profile_id = tp.id
@@ -3254,10 +3459,12 @@ func (ctx *AppContext) elevatorFloorTimedPolicy(elevatorID string, floorIndex in
 	for rows.Next() {
 		var action, iana string
 		var wk, sm, em int
-		if err := rows.Scan(&action, &iana, &wk, &sm, &em); err != nil {
+		var respects sql.NullInt64
+		if err := rows.Scan(&action, &iana, &wk, &sm, &em, &respects); err != nil {
 			log.Printf("WARNING: access_elevator_floor_time_rules scan: %v", err)
 			continue
 		}
+		respectsExc := !respects.Valid || respects.Int64 != 0
 		loc := accessScheduleTimeLocation(iana)
 		tLocal := at.In(loc)
 		minuteOfDay := tLocal.Hour()*60 + tLocal.Minute()
@@ -3266,7 +3473,7 @@ func (ctx *AppContext) elevatorFloorTimedPolicy(elevatorID string, floorIndex in
 			weekday      int
 			start, end int
 		}{{wk, sm, em}}
-		if !timeMatchesProfileWindows(wd, minuteOfDay, wins) {
+		if !timeMatchesProfileWindowsWithExceptions(wd, minuteOfDay, wins, respectsExc, fullExc, earlyActive, earlyEnd) {
 			continue
 		}
 		switch strings.ToLower(strings.TrimSpace(action)) {
@@ -3362,11 +3569,18 @@ func initDatabase() *sql.DB {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS access_pins (
 		pin TEXT PRIMARY KEY NOT NULL,
 		label TEXT,
-		enabled INTEGER NOT NULL DEFAULT 1
+		enabled INTEGER NOT NULL DEFAULT 1,
+		temporary INTEGER NOT NULL DEFAULT 0,
+		expires_at TEXT,
+		max_uses INTEGER,
+		use_count INTEGER NOT NULL DEFAULT 0
 	)`); err != nil {
 		log.Printf("WARNING: access_pins table: %v", err)
 	} else {
 		log.Println("INFO: SQLite access_pins table ready (PINs optional; device.fallback_access_pin used when set and no row matches).")
+	}
+	if err := migrateAccessPinsLifecycle(db); err != nil {
+		log.Printf("WARNING: access_pins lifecycle migration: %v", err)
 	}
 	if err := initAccessScheduleSchema(db); err != nil {
 		log.Printf("WARNING: access schedule schema: %v", err)
@@ -3389,27 +3603,114 @@ func initDatabase() *sql.DB {
 		}
 		log.Println("INFO: SQLite logs table ready (audit trail for event activities).")
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dual_keypad_zone_occupancy (
+		pin TEXT PRIMARY KEY NOT NULL,
+		inside_count INTEGER NOT NULL CHECK (inside_count > 0)
+	)`); err != nil {
+		log.Printf("WARNING: dual_keypad_zone_occupancy table: %v", err)
+	} else {
+		log.Println("INFO: SQLite dual_keypad_zone_occupancy ready (dual USB keypad zone counts; survives restart).")
+	}
 	return db
+}
+
+// migrateAccessPinsLifecycle adds visitor/contractor lifecycle columns to access_pins on older databases.
+func migrateAccessPinsLifecycle(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(access_pins)`)
+	if err != nil {
+		return err
+	}
+	have := make(map[string]struct{})
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = struct{}{}
+	}
+	rows.Close()
+	alters := []struct {
+		name string
+		ddl  string
+	}{
+		{"temporary", `ALTER TABLE access_pins ADD COLUMN temporary INTEGER NOT NULL DEFAULT 0`},
+		{"expires_at", `ALTER TABLE access_pins ADD COLUMN expires_at TEXT`},
+		{"max_uses", `ALTER TABLE access_pins ADD COLUMN max_uses INTEGER`},
+		{"use_count", `ALTER TABLE access_pins ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0`},
+		{"door_hold_extra_seconds", `ALTER TABLE access_pins ADD COLUMN door_hold_extra_seconds INTEGER`},
+	}
+	for _, a := range alters {
+		if _, ok := have[a.name]; ok {
+			continue
+		}
+		if _, err := db.Exec(a.ddl); err != nil {
+			return fmt.Errorf("%s: %w", a.name, err)
+		}
+		log.Printf("INFO: access_pins migrated: added column %s", a.name)
+	}
+	return nil
 }
 
 // accessPinLookupResult is the outcome of validating a PIN against access_pins and optional fallback.
 type accessPinLookupResult struct {
-	OK          bool
-	Label       string
-	ViaFallback bool
+	OK              bool
+	Label           string
+	ViaFallback     bool
+	LifecycleReason string // when OK is false because a DB row failed visitor/contractor lifecycle rules
+	// DoorHoldExtra extends door_open_warning_after for the next door-open period after this credential unlocks the door.
+	DoorHoldExtra time.Duration
 }
 
 // accessCredentialForPIN returns whether the PIN is allowed: row in access_pins with enabled=1, or FallbackAccessPin when set and no DB match.
+// Visitor/contractor rows (temporary=1) require expires_at (RFC3339) and are rejected after that time or after max_uses successful grants, whichever comes first.
 func (ctx *AppContext) accessCredentialForPIN(pin string) accessPinLookupResult {
 	pin = strings.TrimSpace(pin)
 	if pin == "" {
 		return accessPinLookupResult{}
 	}
 	if ctx.DB != nil {
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
 		var lbl sql.NullString
-		err := ctx.DB.QueryRow(`SELECT label FROM access_pins WHERE pin = ? AND enabled = 1`, pin).Scan(&lbl)
+		var temporary int
+		var expiresAt sql.NullString
+		var maxUses sql.NullInt64
+		var useCount int64
+		var holdExtraSec sql.NullInt64
+		err := ctx.DB.QueryRow(`
+			SELECT label, COALESCE(temporary, 0), expires_at, max_uses, COALESCE(use_count, 0), COALESCE(door_hold_extra_seconds, 0)
+			FROM access_pins WHERE pin = ? AND enabled = 1`, pin).Scan(&lbl, &temporary, &expiresAt, &maxUses, &useCount, &holdExtraSec)
 		if err == nil {
-			return accessPinLookupResult{OK: true, Label: strings.TrimSpace(lbl.String)}
+			lblStr := strings.TrimSpace(lbl.String)
+			if temporary != 0 {
+				if !expiresAt.Valid || strings.TrimSpace(expiresAt.String) == "" {
+					return accessPinLookupResult{Label: lblStr, LifecycleReason: "temporary_requires_expires_at"}
+				}
+				expT, perr := time.Parse(time.RFC3339, strings.TrimSpace(expiresAt.String))
+				if perr != nil {
+					return accessPinLookupResult{Label: lblStr, LifecycleReason: "invalid_expires_at"}
+				}
+				if !time.Now().Before(expT) {
+					_, _ = ctx.DB.Exec(`UPDATE access_pins SET enabled = 0 WHERE pin = ? AND COALESCE(temporary, 0) != 0`, pin)
+					return accessPinLookupResult{Label: lblStr, LifecycleReason: "credential_expired"}
+				}
+				if maxUses.Valid && maxUses.Int64 > 0 && useCount >= maxUses.Int64 {
+					_, _ = ctx.DB.Exec(`UPDATE access_pins SET enabled = 0 WHERE pin = ? AND COALESCE(temporary, 0) != 0`, pin)
+					return accessPinLookupResult{Label: lblStr, LifecycleReason: "use_limit_exhausted"}
+				}
+			}
+			extra := time.Duration(0)
+			if holdExtraSec.Valid && holdExtraSec.Int64 > 0 {
+				extra = time.Duration(holdExtraSec.Int64) * time.Second
+				if extra > 24*time.Hour {
+					extra = 24 * time.Hour
+				}
+			}
+			return accessPinLookupResult{OK: true, Label: lblStr, DoorHoldExtra: extra}
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			log.Printf("WARNING: access_pins lookup: %v", err)
@@ -3424,10 +3725,50 @@ func (ctx *AppContext) accessCredentialForPIN(pin string) accessPinLookupResult 
 	return accessPinLookupResult{}
 }
 
+// credentialRecordSuccessfulUse increments use_count for temporary credentials after a successful access grant.
+// Dual-USB exit unlocks do not consume a use (free egress). Empty pin is a no-op (e.g. physical exit button).
+func (ctx *AppContext) credentialRecordSuccessfulUse(pin, mode, keypadRole string) {
+	pin = strings.TrimSpace(pin)
+	if pin == "" || ctx.DB == nil {
+		return
+	}
+	if NormalizeKeypadOperationMode(mode) == ModeAccessDualUSBKeypad && strings.TrimSpace(keypadRole) == "exit" {
+		return
+	}
+	aclDBMu.Lock()
+	defer aclDBMu.Unlock()
+	_, err := ctx.DB.Exec(`
+		UPDATE access_pins SET
+			use_count = use_count + 1,
+			enabled = CASE
+				WHEN COALESCE(temporary, 0) != 0 AND max_uses IS NOT NULL AND max_uses > 0
+					AND (use_count + 1) >= max_uses THEN 0
+				ELSE enabled
+			END
+		WHERE pin = ? AND COALESCE(temporary, 0) != 0`, pin)
+	if err != nil {
+		log.Printf("WARNING: access_pins use_count update: %v", err)
+	}
+}
+
+// pinRejectCredentialLifecycle plays reject feedback for lifecycle denial without counting toward wrong-PIN lockout streak.
+func (ctx *AppContext) pinRejectCredentialLifecycle(cfg DeviceConfig, keypadRole string, buzzerBCM uint8, feedbackDelay time.Duration, reason string, extra map[string]any) {
+	playSoundSync(cfg, cfg.SoundPinReject)
+	wh := map[string]any{"reason": reason, "keypad_role": keypadRole}
+	for k, v := range extra {
+		wh[k] = v
+	}
+	fireEventWebhook(ctx, "pin_rejected", wh)
+	time.Sleep(feedbackDelay)
+}
+
 // adjustDualKeypadOccupancy updates per-PIN "inside" counts for access_dual_usb_keypad (entry +1, exit −1). Returns total people across all PINs and this PIN's inside count after the change.
 func (ctx *AppContext) adjustDualKeypadOccupancy(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string) {
 	ctx.occupancyMu.Lock()
 	defer ctx.occupancyMu.Unlock()
+	if ctx.DB != nil {
+		return ctx.adjustDualKeypadOccupancyDBLocked(pin, keypadRole)
+	}
 	if ctx.occupancyByPIN == nil {
 		ctx.occupancyByPIN = make(map[string]int)
 	}
@@ -3456,6 +3797,79 @@ func (ctx *AppContext) adjustDualKeypadOccupancy(pin, keypadRole string) (areaTo
 	return areaTotal, insideThisPIN, mismatch
 }
 
+// adjustDualKeypadOccupancyDBLocked updates dual_keypad_zone_occupancy in a single transaction. Caller must hold ctx.occupancyMu.
+func (ctx *AppContext) adjustDualKeypadOccupancyDBLocked(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string) {
+	pin = strings.TrimSpace(pin)
+	if pin == "" {
+		return 0, 0, ""
+	}
+	switch keypadRole {
+	case "entry", "exit":
+	default:
+		return 0, 0, ""
+	}
+
+	tx, err := ctx.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		log.Printf("WARNING: dual keypad occupancy tx begin: %v", err)
+		return 0, 0, ""
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	switch keypadRole {
+	case "entry":
+		_, err = tx.Exec(`
+			INSERT INTO dual_keypad_zone_occupancy (pin, inside_count) VALUES (?, 1)
+			ON CONFLICT(pin) DO UPDATE SET inside_count = dual_keypad_zone_occupancy.inside_count + 1
+		`, pin)
+		if err != nil {
+			log.Printf("WARNING: dual keypad occupancy entry: %v", err)
+			return 0, 0, ""
+		}
+		if err = tx.QueryRow(`SELECT inside_count FROM dual_keypad_zone_occupancy WHERE pin = ?`, pin).Scan(&insideThisPIN); err != nil {
+			log.Printf("WARNING: dual keypad occupancy entry read: %v", err)
+			return 0, 0, ""
+		}
+	case "exit":
+		var cur int
+		err = tx.QueryRow(`SELECT inside_count FROM dual_keypad_zone_occupancy WHERE pin = ?`, pin).Scan(&cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			mismatch = "exit_without_recorded_entry"
+			insideThisPIN = 0
+		} else if err != nil {
+			log.Printf("WARNING: dual keypad occupancy exit read: %v", err)
+			return 0, 0, ""
+		} else if cur <= 0 {
+			mismatch = "exit_without_recorded_entry"
+			insideThisPIN = 0
+		} else {
+			if _, err = tx.Exec(`UPDATE dual_keypad_zone_occupancy SET inside_count = inside_count - 1 WHERE pin = ? AND inside_count > 0`, pin); err != nil {
+				log.Printf("WARNING: dual keypad occupancy exit update: %v", err)
+				return 0, 0, ""
+			}
+			insideThisPIN = cur - 1
+			if insideThisPIN == 0 {
+				if _, err = tx.Exec(`DELETE FROM dual_keypad_zone_occupancy WHERE pin = ?`, pin); err != nil {
+					log.Printf("WARNING: dual keypad occupancy exit delete: %v", err)
+					return 0, 0, ""
+				}
+			}
+		}
+	}
+
+	var sum int64
+	if err = tx.QueryRow(`SELECT COALESCE(SUM(inside_count), 0) FROM dual_keypad_zone_occupancy`).Scan(&sum); err != nil {
+		log.Printf("WARNING: dual keypad occupancy sum: %v", err)
+		return 0, 0, ""
+	}
+	areaTotal = int(sum)
+	if err = tx.Commit(); err != nil {
+		log.Printf("WARNING: dual keypad occupancy commit: %v", err)
+		return 0, 0, ""
+	}
+	return areaTotal, insideThisPIN, mismatch
+}
+
 func keypadLogTag(keypadRole string) string {
 	if strings.TrimSpace(keypadRole) == "" {
 		return "single"
@@ -3465,8 +3879,21 @@ func keypadLogTag(keypadRole string) string {
 
 // dualKeypadExitWouldMismatch is true when exit would not decrement an existing inside count (no prior entry for this PIN).
 func (ctx *AppContext) dualKeypadExitWouldMismatch(pin string) bool {
+	pin = strings.TrimSpace(pin)
 	ctx.occupancyMu.Lock()
 	defer ctx.occupancyMu.Unlock()
+	if ctx.DB != nil {
+		var n int
+		err := ctx.DB.QueryRow(`SELECT inside_count FROM dual_keypad_zone_occupancy WHERE pin = ?`, pin).Scan(&n)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true
+		}
+		if err != nil {
+			log.Printf("WARNING: dual keypad occupancy exit check: %v", err)
+			return true
+		}
+		return n <= 0
+	}
 	if ctx.occupancyByPIN == nil {
 		return true
 	}
@@ -3746,8 +4173,10 @@ func webhookPostJSONAsync(url string, tokenEnabled bool, token string, payload m
 	}()
 }
 
-// fireEventWebhook POSTs JSON to webhook_event_url when webhook_event_enabled and URL are set.
-// Payload never includes PINs or tokens. Optional Bearer token when webhook_event_token_enabled and token non-empty.
+// fireEventWebhook POSTs JSON for door/PIN/MQTT events when webhook_event_enabled.
+// Uses webhook_event_endpoints when non-empty (each entry may set enabled and optional event_types allowlist);
+// otherwise uses legacy webhook_event_url. webhook_event_types is an optional global allowlist (same semantics as endpoint event_types).
+// Payload never includes PINs or tokens. Optional Bearer token when token_enabled and token non-empty.
 func fireEventWebhook(ctx *AppContext, event string, detail map[string]any) {
 	auditLogEvent(ctx, event, detail)
 	ctx.configMu.RLock()
@@ -3755,14 +4184,21 @@ func fireEventWebhook(ctx *AppContext, event string, detail map[string]any) {
 		ctx.configMu.RUnlock()
 		return
 	}
-	url := strings.TrimSpace(ctx.Config.WebhookEventURL)
+	if !webhookEventTypesAllowlistPass(ctx.Config.WebhookEventTypes, event) {
+		ctx.configMu.RUnlock()
+		return
+	}
+	eps := ctx.Config.WebhookEventEndpoints
+	legacyURL := strings.TrimSpace(ctx.Config.WebhookEventURL)
 	tokEn := ctx.Config.WebhookEventTokenEnabled
 	tok := ctx.Config.WebhookEventToken
 	cid := ctx.Config.MQTTClientID
-	ctx.configMu.RUnlock()
-	if url == "" {
-		return
+	var epsCopy []WebhookEventEndpoint
+	if len(eps) > 0 {
+		epsCopy = cloneWebhookEventEndpoints(eps)
 	}
+	ctx.configMu.RUnlock()
+
 	pay := map[string]any{
 		"type":             "event",
 		"event":            event,
@@ -3772,7 +4208,28 @@ func fireEventWebhook(ctx *AppContext, event string, detail map[string]any) {
 	for k, v := range detail {
 		pay[k] = v
 	}
-	webhookPostJSONAsync(url, tokEn, tok, pay)
+
+	if len(epsCopy) > 0 {
+		for i := range epsCopy {
+			ep := &epsCopy[i]
+			if !ep.Enabled {
+				continue
+			}
+			u := strings.TrimSpace(ep.URL)
+			if u == "" {
+				continue
+			}
+			if !webhookEventTypesAllowlistPass(ep.EventTypes, event) {
+				continue
+			}
+			webhookPostJSONAsync(u, ep.TokenEnabled, ep.Token, pay)
+		}
+		return
+	}
+	if legacyURL == "" {
+		return
+	}
+	webhookPostJSONAsync(legacyURL, tokEn, tok, pay)
 }
 
 // fireHeartbeatWebhook POSTs to webhook_heartbeat_url on each heartbeat tick when enabled.
@@ -3850,6 +4307,21 @@ func startWebServer(ctx *AppContext) *http.Server {
 	return srv
 }
 
+func (ctx *AppContext) noteDoorHoldExtraGrace(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	ctx.doorAlarmMu.Lock()
+	ctx.doorHoldExtraGrace = d
+	ctx.doorAlarmMu.Unlock()
+}
+
+func (ctx *AppContext) clearDoorHoldExtraGrace() {
+	ctx.doorAlarmMu.Lock()
+	ctx.doorHoldExtraGrace = 0
+	ctx.doorAlarmMu.Unlock()
+}
+
 func monitorDoorSensors(ctx *AppContext) {
 	if ctx.GPIO == nil {
 		log.Println("INFO: Door sensor monitor disabled (GPIO not available).")
@@ -3863,18 +4335,31 @@ func monitorDoorSensors(ctx *AppContext) {
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
 
+	sensorGPIO := int(ctx.GPIOSettings.DoorSensorPin)
+
 	var openSince time.Time
-	var warned bool
-	first := true
 	var wasOpen bool
+	first := true
+
+	var inAlarmPhase bool
+	var lastAlarmAt time.Time
+	var warningCount int
+	var doorForcedLatched bool
+	var doorSeenCloseAfterForced bool
 
 	for range tick.C {
 		ctx.configMu.RLock()
 		warnAfter := ctx.Config.DoorOpenWarningAfter
+		alarmInterval := ctx.Config.DoorOpenAlarmInterval
+		maxCount := ctx.Config.DoorOpenAlarmMaxCount
+		forcedAfter := ctx.Config.DoorForcedAfterWarnings
 		closedLow := ctx.Config.DoorSensorClosedIsLow
 		ctx.configMu.RUnlock()
 		if warnAfter <= 0 {
 			warnAfter = 10 * time.Second
+		}
+		if alarmInterval <= 0 {
+			alarmInterval = 30 * time.Second
 		}
 
 		open := ctx.GPIO.DoorIsOpen(closedLow)
@@ -3889,22 +4374,38 @@ func monitorDoorSensors(ctx *AppContext) {
 				log.Printf("INFO: Door status: CLOSED (sensor GPIO %d).", ctx.GPIOSettings.DoorSensorPin)
 				openSince = time.Time{}
 			}
-			warned = false
+			inAlarmPhase = false
+			lastAlarmAt = time.Time{}
+			warningCount = 0
+			doorForcedLatched = false
+			doorSeenCloseAfterForced = false
 			continue
 		} else if open != wasOpen {
 			wasOpen = open
-			pin := int(ctx.GPIOSettings.DoorSensorPin)
 			if open {
 				log.Printf("INFO: Door is now OPEN (sensor GPIO %d).", ctx.GPIOSettings.DoorSensorPin)
 				openSince = time.Now()
-				warned = false
-				fireEventWebhook(ctx, "door_opened", map[string]any{"door_sensor_gpio": pin})
+				inAlarmPhase = false
+				lastAlarmAt = time.Time{}
+				warningCount = 0
+				if doorSeenCloseAfterForced {
+					doorForcedLatched = false
+					doorSeenCloseAfterForced = false
+				}
+				fireEventWebhook(ctx, "door_opened", map[string]any{"door_sensor_gpio": sensorGPIO})
 			} else {
 				log.Printf("INFO: Door is now CLOSED (sensor GPIO %d).", ctx.GPIOSettings.DoorSensorPin)
 				openSince = time.Time{}
-				warned = false
-				fireEventWebhook(ctx, "door_closed", map[string]any{"door_sensor_gpio": pin})
+				inAlarmPhase = false
+				lastAlarmAt = time.Time{}
+				warningCount = 0
+				if doorForcedLatched {
+					doorSeenCloseAfterForced = true
+				}
+				ctx.clearDoorHoldExtraGrace()
+				fireEventWebhook(ctx, "door_closed", map[string]any{"door_sensor_gpio": sensorGPIO})
 			}
+			continue
 		}
 
 		if !open {
@@ -3913,16 +4414,77 @@ func monitorDoorSensors(ctx *AppContext) {
 		if openSince.IsZero() {
 			openSince = time.Now()
 		}
-		if warned {
+
+		ctx.doorAlarmMu.Lock()
+		holdExtra := ctx.doorHoldExtraGrace
+		ctx.doorAlarmMu.Unlock()
+		effectiveWarn := warnAfter + holdExtra
+
+		if doorForcedLatched && !doorSeenCloseAfterForced {
 			continue
 		}
-		if time.Since(openSince) >= warnAfter {
-			log.Printf("WARNING: Door open longer than %v (door sensor GPIO %d).", warnAfter, ctx.GPIOSettings.DoorSensorPin)
-			warned = true
-			fireEventWebhook(ctx, "door_open_timeout", map[string]any{
-				"door_sensor_gpio": int(ctx.GPIOSettings.DoorSensorPin),
-				"threshold":        warnAfter.String(),
+
+		now := time.Now()
+		elapsed := now.Sub(openSince)
+
+		if !inAlarmPhase {
+			if elapsed < effectiveWarn {
+				continue
+			}
+			inAlarmPhase = true
+			warningCount = 1
+			lastAlarmAt = now
+			log.Printf("WARNING: Door open longer than %v (effective threshold %v; door sensor GPIO %d).", warnAfter, effectiveWarn, ctx.GPIOSettings.DoorSensorPin)
+			detail := map[string]any{
+				"door_sensor_gpio":      sensorGPIO,
+				"threshold":           warnAfter.String(),
+				"threshold_effective":   effectiveWarn.String(),
+				"door_hold_extra":       holdExtra.String(),
+				"warning_sequence":      warningCount,
+				"door_open_alarm_interval": alarmInterval.String(),
+			}
+			fireEventWebhook(ctx, "door_open_timeout", detail)
+			if forcedAfter > 0 && warningCount >= forcedAfter {
+				fireEventWebhook(ctx, "door_forced", map[string]any{
+					"door_sensor_gpio":        sensorGPIO,
+					"warning_sequence":        warningCount,
+					"forced_after_warnings":   forcedAfter,
+				})
+				doorForcedLatched = true
+			}
+			continue
+		}
+
+		if maxCount > 0 && warningCount >= maxCount {
+			continue
+		}
+		if now.Sub(lastAlarmAt) < alarmInterval {
+			continue
+		}
+
+		warningCount++
+		lastAlarmAt = now
+		if maxCount > 0 && warningCount > maxCount {
+			continue
+		}
+
+		log.Printf("WARNING: Door still open (alarm repeat %d; door sensor GPIO %d).", warningCount, ctx.GPIOSettings.DoorSensorPin)
+		detail := map[string]any{
+			"door_sensor_gpio":         sensorGPIO,
+			"threshold":                warnAfter.String(),
+			"threshold_effective":      effectiveWarn.String(),
+			"door_hold_extra":          holdExtra.String(),
+			"warning_sequence":         warningCount,
+			"door_open_alarm_interval": alarmInterval.String(),
+		}
+		fireEventWebhook(ctx, "door_open_timeout", detail)
+		if forcedAfter > 0 && warningCount >= forcedAfter && !doorForcedLatched {
+			fireEventWebhook(ctx, "door_forced", map[string]any{
+				"door_sensor_gpio":      sensorGPIO,
+				"warning_sequence":      warningCount,
+				"forced_after_warnings": forcedAfter,
 			})
+			doorForcedLatched = true
 		}
 	}
 }
@@ -4259,6 +4821,39 @@ func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, 
 	time.Sleep(feedbackDelay)
 }
 
+// grantDefaultModeDoorUnlockLikePIN performs the same unlock side effects as processPIN's default branch
+// (non-elevator modes): welcome sound, door relay pulse, optional pair-peer MQTT, pin_accepted webhook,
+// then pin_entry_feedback_delay. whExtra is merged into the webhook payload (e.g. dual-keypad occupancy).
+// pin is the credential (empty for physical entry/exit buttons); temporary credentials consume a use_count here when applicable.
+// doorHoldExtra extends the configured door_open_warning_after for the next open period (accessibility); use 0 when not from access_pins.
+func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceConfig, mode, keypadRole, credLabel string, doorBCM uint8, feedbackDelay time.Duration, doorHoldExtra time.Duration, whExtra map[string]any) {
+	ctx.noteDoorHoldExtraGrace(doorHoldExtra)
+	playSoundSync(cfg, cfg.SoundPinOK)
+	relPulsed := false
+	if ctx.GPIO != nil {
+		ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
+		relPulsed = true
+	} else {
+		log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
+	}
+	if pairedEntryPublishesToPeer(mode, cfg.PairPeerRole) {
+		publishMQTTPairPeerPulse(ctx, cfg)
+	}
+	wh := map[string]any{
+		"operation_mode":   mode,
+		"keypad_role":      keypadRole,
+		"credential_label": credLabel,
+		"door_relay_gpio":  int(doorBCM),
+		"relay_pulsed":     relPulsed,
+	}
+	for k, v := range whExtra {
+		wh[k] = v
+	}
+	fireEventWebhook(ctx, "pin_accepted", wh)
+	ctx.credentialRecordSuccessfulUse(pin, mode, keypadRole)
+	time.Sleep(feedbackDelay)
+}
+
 func processPIN(ctx *AppContext, pin string, keypadRole string) {
 	// Query local SQLite for permissions
 	// Validate PIN against door constraints
@@ -4297,6 +4892,15 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 	}
 
 	cred := ctx.accessCredentialForPIN(pin)
+	if cred.LifecycleReason != "" {
+		log.Printf("INFO: PIN rejected (credential lifecycle: %s; %s keypad).", cred.LifecycleReason, keypadLogTag(keypadRole))
+		ex := map[string]any{"lifecycle_reason": cred.LifecycleReason}
+		if cred.Label != "" {
+			ex["credential_label"] = cred.Label
+		}
+		ctx.pinRejectCredentialLifecycle(cfg, keypadRole, buzzerBCM, feedbackDelay, "credential_lifecycle", ex)
+		return
+	}
 	pinOK := cred.OK
 	credLabel := cred.Label
 	modePre := NormalizeKeypadOperationMode(cfg.KeypadOperationMode)
@@ -4400,6 +5004,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 				wh[k] = v
 			}
 			fireEventWebhook(ctx, "pin_accepted", wh)
+			ctx.credentialRecordSuccessfulUse(pin, ModeElevatorPredefinedFloor, keypadRole)
 			time.Sleep(feedbackDelay)
 			return
 
@@ -4419,33 +5024,17 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 				}
 				log.Printf("INFO: PIN accepted (mode=%s %s keypad; credential=%s); door relay GPIO %d.", mode, kTag, credTag, doorBCM)
 			}
-			playSoundSync(cfg, cfg.SoundPinOK)
-			relPulsed := false
-			if ctx.GPIO != nil {
-				ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
-				relPulsed = true
-			} else {
-				log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
-			}
-			if pairedEntryPublishesToPeer(mode, cfg.PairPeerRole) {
-				publishMQTTPairPeerPulse(ctx, cfg)
-			}
-			wh := map[string]any{
-				"operation_mode":   mode,
-				"keypad_role":      keypadRole,
-				"credential_label": credLabel,
-				"door_relay_gpio":  int(doorBCM),
-				"relay_pulsed":     relPulsed,
-			}
+			var whExtra map[string]any
 			if mode == ModeAccessDualUSBKeypad && (keypadRole == "entry" || keypadRole == "exit") {
-				wh["access_area_occupancy_total"] = areaTotal
-				wh["credential_inside_count"] = insideThis
+				whExtra = map[string]any{
+					"access_area_occupancy_total": areaTotal,
+					"credential_inside_count":     insideThis,
+				}
 				if occMismatch != "" {
-					wh["occupancy_mismatch"] = occMismatch
+					whExtra["occupancy_mismatch"] = occMismatch
 				}
 			}
-			fireEventWebhook(ctx, "pin_accepted", wh)
-			time.Sleep(feedbackDelay)
+			ctx.grantDefaultModeDoorUnlockLikePIN(pin, cfg, mode, keypadRole, credLabel, doorBCM, feedbackDelay, cred.DoorHoldExtra, whExtra)
 			return
 		}
 	}
@@ -4596,10 +5185,14 @@ func (ctx *AppContext) techHistoryClear() {
 var techMenuCfgKeysForCompletion = []string{
 	"access_control_door_id",
 	"access_control_elevator_id",
+	"access_exception_site_timezone",
 	"access_schedule_apply_to_fallback_pin",
 	"access_schedule_enforce",
 	"buzzer_relay_active_low",
 	"buzzer_relay_pin",
+	"door_forced_after_warnings",
+	"door_open_alarm_interval",
+	"door_open_alarm_max_count",
 	"door_open_warning_after",
 	"door_relay_active_low",
 	"door_relay_pin",
@@ -5023,7 +5616,7 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
   9   Play PIN Correct sound
   i   Network: Ethernet & Wi-Fi (IPv4, mask, gateway, DNS)
   p   System listening ports (all TCP + UDP, all processes)
-  occ Dual USB keypad: show in-memory area occupancy (masked PINs + labels)
+  occ Dual USB keypad: show persisted area occupancy (masked PINs + labels)
   kb  List USB keypads → stable USE_PATH (by-id/by-path; same as: go run ./tools/listkeypads -usb)
   kb all   List all keypad-related nodes (includes non-USB by-path)
   v   Software build version & release date (UTC)
@@ -5227,7 +5820,7 @@ func techMenuShowSoftwareVersion(w io.Writer) {
 func techMenuShowChangelog(w io.Writer) {
 	p := techMenuChangelogPath()
 	if p == "" {
-		fmt.Fprintln(w, "\nchangelog.txt not found (place next to the binary, in cwd, or project root).\n")
+		fmt.Fprintln(w, "\nchangelog.txt not found (place next to the binary, in cwd, or project root).")
 		return
 	}
 	b, err := os.ReadFile(p)
@@ -5249,7 +5842,7 @@ func techMenuWriteOccupancy(w io.Writer, ctx *AppContext) {
 	rejectExit := ctx.Config.DualKeypadRejectExitWithoutEntry
 	ctx.configMu.RUnlock()
 
-	fmt.Fprintf(w, "\n--- Dual keypad occupancy (in-memory until restart) ---\n")
+	fmt.Fprintf(w, "\n--- Dual keypad occupancy (SQLite dual_keypad_zone_occupancy) ---\n")
 	fmt.Fprintf(w, "  keypad_operation_mode: %s\n", mode)
 	fmt.Fprintf(w, "  dual_keypad_reject_exit_without_entry: %v\n", rejectExit)
 	if mode != ModeAccessDualUSBKeypad {
@@ -5261,17 +5854,40 @@ func techMenuWriteOccupancy(w io.Writer, ctx *AppContext) {
 		pin string
 		n   int
 	}
-	ctx.occupancyMu.Lock()
 	var rows []occRow
 	total := 0
-	for p, n := range ctx.occupancyByPIN {
-		if n <= 0 {
-			continue
+	if ctx.DB != nil {
+		ctx.occupancyMu.Lock()
+		rq, err := ctx.DB.Query(`SELECT pin, inside_count FROM dual_keypad_zone_occupancy WHERE inside_count > 0 ORDER BY pin`)
+		if err != nil {
+			ctx.occupancyMu.Unlock()
+			fmt.Fprintf(w, "  (occupancy query failed: %v)\n\n", err)
+			return
 		}
-		rows = append(rows, occRow{p, n})
-		total += n
+		for rq.Next() {
+			var r occRow
+			if err := rq.Scan(&r.pin, &r.n); err != nil {
+				_ = rq.Close()
+				ctx.occupancyMu.Unlock()
+				fmt.Fprintf(w, "  (occupancy scan failed: %v)\n\n", err)
+				return
+			}
+			rows = append(rows, r)
+			total += r.n
+		}
+		_ = rq.Close()
+		ctx.occupancyMu.Unlock()
+	} else {
+		ctx.occupancyMu.Lock()
+		for p, n := range ctx.occupancyByPIN {
+			if n <= 0 {
+				continue
+			}
+			rows = append(rows, occRow{p, n})
+			total += n
+		}
+		ctx.occupancyMu.Unlock()
 	}
-	ctx.occupancyMu.Unlock()
 
 	sort.Slice(rows, func(i, j int) bool { return rows[i].pin < rows[j].pin })
 
@@ -5311,6 +5927,9 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  tech_menu_history_max: %d\n", c.TechMenuHistoryMax)
 	fmt.Fprintf(w, "  pin_length: %d\n", c.PinLength)
 	fmt.Fprintf(w, "  door_open_warning_after: %s\n", c.DoorOpenWarningAfter)
+	fmt.Fprintf(w, "  door_open_alarm_interval: %s\n", c.DoorOpenAlarmInterval)
+	fmt.Fprintf(w, "  door_open_alarm_max_count: %d (0=unlimited door_open_timeout per open period)\n", c.DoorOpenAlarmMaxCount)
+	fmt.Fprintf(w, "  door_forced_after_warnings: %d (0=never)\n", c.DoorForcedAfterWarnings)
 	fmt.Fprintf(w, "  door_sensor_closed_is_low: %v\n", c.DoorSensorClosedIsLow)
 	fmt.Fprintf(w, "  relay_pulse_duration: %s\n", c.RelayPulseDuration)
 	fmt.Fprintf(w, "  buzzer_relay_pulse_duration: %s\n", c.BuzzerRelayPulseDuration)
@@ -5357,6 +5976,7 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  access_control_elevator_id: %q\n", c.AccessControlElevatorID)
 	fmt.Fprintf(w, "  access_schedule_enforce: %v\n", c.AccessScheduleEnforce)
 	fmt.Fprintf(w, "  access_schedule_apply_to_fallback_pin: %v\n", c.AccessScheduleApplyToFallbackPin)
+	fmt.Fprintf(w, "  access_exception_site_timezone: %q\n", c.AccessExceptionSiteTimezone)
 	fmt.Fprintf(w, "  pin_lockout_enabled: %v\n", c.PinLockoutEnabled)
 	fmt.Fprintf(w, "  pin_lockout_after_attempts: %d\n", c.PinLockoutAfterAttempts)
 	fmt.Fprintf(w, "  pin_lockout_duration: %s\n", c.PinLockoutDuration)
@@ -5400,6 +6020,24 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 		evTok = "(set)"
 	}
 	fmt.Fprintf(w, "  webhook_event_token: %s\n", evTok)
+	if len(c.WebhookEventTypes) > 0 {
+		fmt.Fprintf(w, "  webhook_event_types: %v (non-empty = global allowlist; only true keys are sent)\n", c.WebhookEventTypes)
+	} else {
+		fmt.Fprintf(w, "  webhook_event_types: (unset = all event types)\n")
+	}
+	if n := len(c.WebhookEventEndpoints); n > 0 {
+		fmt.Fprintf(w, "  webhook_event_endpoints: %d (when non-empty, replaces webhook_event_url for events; each may set enabled + event_types)\n", n)
+		for i := range c.WebhookEventEndpoints {
+			ep := c.WebhookEventEndpoints[i]
+			u := strings.TrimSpace(ep.URL)
+			if u == "" {
+				u = "(no url)"
+			}
+			fmt.Fprintf(w, "    [%d] enabled=%v url=%q token_enabled=%v event_types=%v\n", i, ep.Enabled, u, ep.TokenEnabled, ep.EventTypes)
+		}
+	} else {
+		fmt.Fprintf(w, "  webhook_event_endpoints: (unset = use webhook_event_url)\n")
+	}
 	fmt.Fprintf(w, "  webhook_heartbeat_enabled: %v\n", c.WebhookHeartbeatEnabled)
 	fmt.Fprintf(w, "  webhook_heartbeat_url: %q\n", c.WebhookHeartbeatURL)
 	fmt.Fprintf(w, "  webhook_heartbeat_token_enabled: %v\n", c.WebhookHeartbeatTokenEnabled)
@@ -6220,29 +6858,33 @@ func setupOperationModeGPIOInputs(ctx *AppContext, gpio *GPIOManager) {
 	if ex != 0 {
 		gpio.AddInput("exit_button", ex, exLow, func() {
 			ctx.configMu.RLock()
-			m := NormalizeKeypadOperationMode(ctx.Config.KeypadOperationMode)
-			d := ctx.Config.RelayPulseDuration
+			cfg := ctx.Config
+			m := NormalizeKeypadOperationMode(cfg.KeypadOperationMode)
+			feedbackDelay := cfg.PinEntryFeedbackDelay
+			doorBCM := ctx.GPIOSettings.DoorRelayPin
 			ctx.configMu.RUnlock()
 			if !modeUsesExitGPIOButton(m) {
 				return
 			}
-			log.Println("INFO: Exit button (GPIO REX); pulsing door relay.")
-			fireEventWebhook(ctx, "exit_button_rex", map[string]any{"operation_mode": m})
-			gpio.ActionPulse("door", d)
+			kTag := keypadLogTag("")
+			log.Printf("INFO: PIN accepted (mode=%s %s keypad; credential=%s); door relay GPIO %d.", m, kTag, "exit_button", doorBCM)
+			ctx.grantDefaultModeDoorUnlockLikePIN("", cfg, m, "", "exit_button", doorBCM, feedbackDelay, 0, nil)
 		})
 	}
 	if en != 0 {
 		gpio.AddInput("entry_button", en, enLow, func() {
 			ctx.configMu.RLock()
-			m := NormalizeKeypadOperationMode(ctx.Config.KeypadOperationMode)
-			d := ctx.Config.RelayPulseDuration
+			cfg := ctx.Config
+			m := NormalizeKeypadOperationMode(cfg.KeypadOperationMode)
+			feedbackDelay := cfg.PinEntryFeedbackDelay
+			doorBCM := ctx.GPIOSettings.DoorRelayPin
 			ctx.configMu.RUnlock()
 			if !modeUsesEntryGPIOButton(m) {
 				return
 			}
-			log.Println("INFO: Entry request button (GPIO); pulsing door relay.")
-			fireEventWebhook(ctx, "entry_button_rex", map[string]any{"operation_mode": m})
-			gpio.ActionPulse("door", d)
+			kTag := keypadLogTag("")
+			log.Printf("INFO: PIN accepted (mode=%s %s keypad; credential=%s); door relay GPIO %d.", m, kTag, "entry_button", doorBCM)
+			ctx.grantDefaultModeDoorUnlockLikePIN("", cfg, m, "", "entry_button", doorBCM, feedbackDelay, 0, nil)
 		})
 	}
 }
@@ -6542,16 +7184,30 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 		}
 		floorDenied := false
 		var deniedIndices []int
+		var denyElevLifecycle string
 		if ctx.elevatorCabFloorDebounceTick >= elevatorCabSenseStableTicks {
 			held := slices.Clone(ctx.elevatorCabFloorDebounceHeld)
-			pin := ctx.elevatorGrantPIN
+			pin := strings.TrimSpace(ctx.elevatorGrantPIN)
 			via := ctx.elevatorGrantViaFallback
 			elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
-			for _, fi := range held {
-				if !ctx.elevatorFloorChannelAllowed(pin, elevID, fi, via, time.Now()) {
+			if pin != "" {
+				live := ctx.accessCredentialForPIN(pin)
+				if !live.OK {
 					floorDenied = true
 					deniedIndices = held
-					break
+					denyElevLifecycle = live.LifecycleReason
+					if denyElevLifecycle == "" {
+						denyElevLifecycle = "credential_invalid"
+					}
+				}
+			}
+			if !floorDenied {
+				for _, fi := range held {
+					if !ctx.elevatorFloorChannelAllowed(pin, elevID, fi, via, time.Now()) {
+						floorDenied = true
+						deniedIndices = held
+						break
+					}
 				}
 			}
 			if !floorDenied {
@@ -6564,13 +7220,20 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 			ctx.configMu.RLock()
 			cfg := ctx.Config
 			ctx.configMu.RUnlock()
-			log.Printf("INFO: Elevator cab floor input(s) rejected (not permitted for credential or schedule): %v", deniedIndices)
+			if denyElevLifecycle != "" {
+				log.Printf("INFO: Elevator cab floor rejected (%s; floors=%v).", denyElevLifecycle, deniedIndices)
+			} else {
+				log.Printf("INFO: Elevator cab floor input(s) rejected (not permitted for credential or schedule): %v", deniedIndices)
+			}
 			playSoundSync(cfg, cfg.SoundPinReject)
 			elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
 			denyEx := map[string]any{
 				"operation_mode":             mode,
 				"elevator_floor_indices":     deniedIndices,
 				"access_control_elevator_id": elevID,
+			}
+			if denyElevLifecycle != "" {
+				denyEx["lifecycle_reason"] = denyElevLifecycle
 			}
 			if ctx.DB != nil && elevID != "" && len(deniedIndices) > 0 {
 				denyEx["elevator_floor_labels"] = elevatorFloorLogLabels(ctx.DB, elevID, deniedIndices)
@@ -6581,11 +7244,13 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 		if len(toDispatch) == 0 {
 			continue
 		}
+		grantPin := strings.TrimSpace(ctx.elevatorGrantPIN)
 		clearElevatorGrantState(ctx)
 		ctx.configMu.RLock()
 		cfg := ctx.Config
 		ctx.configMu.RUnlock()
 		pulseElevatorFloorSelections(ctx, cfg, toDispatch)
+		ctx.credentialRecordSuccessfulUse(grantPin, ModeElevatorWaitFloorButtons, "elevator_cab_floor")
 		log.Printf("INFO: Elevator cab floor input(s) active %v; dispatch pulse sent.", toDispatch)
 		fireEventWebhook(ctx, "elevator_floor_selected", map[string]any{"operation_mode": mode, "elevator_floor_indices": toDispatch})
 	}
@@ -6664,7 +7329,7 @@ var aclDBMu sync.Mutex
 
 func techMenuACLTopLevel() []string {
 	return []string{
-		"bind", "door", "door_group", "elevator", "elevator_group", "group", "help", "level", "pin", "profile", "summary", "target", "window",
+		"bind", "door", "door_group", "elevator", "elevator_group", "exception", "group", "help", "level", "pin", "profile", "summary", "target", "window",
 	}
 }
 
@@ -6676,11 +7341,13 @@ func techMenuACLSecondLevel(category string) []string {
 	case "door", "elevator", "door_group", "elevator_group":
 		return []string{"add", "list"}
 	case "pin":
-		return []string{"add", "disable", "enable", "list"}
+		return []string{"add", "disable", "enable", "hold_extra", "list"}
 	case "group":
 		return []string{"add", "join", "leave", "list"}
 	case "profile":
-		return []string{"add", "list"}
+		return []string{"add", "list", "respects_exceptions"}
+	case "exception":
+		return []string{"calendar", "date", "import"}
 	case "window":
 		return []string{"add"}
 	case "level":
@@ -6713,7 +7380,8 @@ func techMenuACLCompleteAddSpace(prefixLower []string, completed string) bool {
 			}
 		case "pin":
 			if prefixLower[2] == "add" || prefixLower[2] == "list" ||
-				prefixLower[2] == "enable" || prefixLower[2] == "disable" {
+				prefixLower[2] == "enable" || prefixLower[2] == "disable" ||
+				prefixLower[2] == "hold_extra" {
 				return true
 			}
 		case "group":
@@ -6722,7 +7390,12 @@ func techMenuACLCompleteAddSpace(prefixLower []string, completed string) bool {
 				return true
 			}
 		case "profile":
-			if prefixLower[2] == "add" || prefixLower[2] == "list" {
+			if prefixLower[2] == "add" || prefixLower[2] == "list" || prefixLower[2] == "respects_exceptions" {
+				return true
+			}
+		case "exception":
+			switch prefixLower[2] {
+			case "calendar", "date", "import":
 				return true
 			}
 		case "window":
@@ -6814,8 +7487,15 @@ Typical setup (door + schedule + PIN + group + level + target):
 Notes:
   • Use underscores instead of spaces in display names (e.g. Main_Entrance).
   • Times are minutes from midnight (0–1439). Profile timezone: acl profile add id name Asia/Bangkok
+  • Exception calendars (holidays): cfg set access_exception_site_timezone America/New_York (IANA; civil dates for holidays)
+    acl exception calendar add national National 100
+    acl exception date add national 2026-12-25 full Christmas
+    acl exception date add national 2026-12-24 early 780 Christmas_Eve_1pm_close
+    acl exception import national /path/to/holidays.csv   (CSV: YYYY-MM-DD,full|early[,minute][,label])
+    acl profile respects_exceptions biz on   (default on: “standard business” profiles follow holidays; off = ignore exceptions)
   • Enforce schedules only when access_control_*_id matches a row and access_levels target that door/elevator.
   • PINs are stored in access_pins; they are never echoed by these list commands beyond what you typed.
+  • Visitor/contractor (temporary) PINs require expires_at (RFC3339) and are rejected after that time; optional max_uses limits successful grants.
 
 Commands (detail):
   acl help                        this text
@@ -6825,16 +7505,22 @@ Commands (detail):
   acl door_group add <id> [display_name]
   acl elevator add <id> [display_name]
   acl elevator_group add <id> [display_name]
-  acl pin add <pin> [label]       label optional; enabled by default
+  acl pin add <pin> [label]       employee PIN; label optional; enabled by default
+  acl pin add temporary <pin> <expires_rfc3339> [label...] [--max-uses N]
   acl pin enable|disable <pin>
   acl group add <id> [display_name]
   acl group join|leave <group_id> <pin>
   acl profile add <id> [display_name [iana_timezone]]
+  acl profile respects_exceptions <profile_id> on|off
   acl window add <profile_id> <weekday> <start_minute> <end_minute>
   acl level add <level_id> <time_profile_id> <user_group_id> [display_name]
   acl level enable|disable <level_id>
   acl target door|elevator|door_group|elevator_group <level_id> <target_id>
   acl target list
+  acl exception calendar add <id> [display_name [priority [source_note]]]  |  acl exception calendar list
+  acl exception date add <calendar_id> <YYYY-MM-DD> full [label]  |  … early <minute> [label]
+  acl exception date list [calendar_id]  |  acl exception date delete <row_id>
+  acl exception import <calendar_id> <csv_path>
 `)
 }
 
@@ -6892,6 +7578,8 @@ func techMenuACLSummary(ctx *AppContext) {
 			{"time_windows", "access_time_windows"},
 			{"access_levels", "access_levels"},
 			{"level_targets", "access_level_targets"},
+			{"exception_calendars", "access_exception_calendars"},
+			{"exception_dates", "access_exception_dates"},
 			{"audit_logs", "logs"},
 		}
 		for _, c := range counts {
@@ -6934,6 +7622,8 @@ func techMenuACLDispatch(ctx *AppContext, parts []string) error {
 		return techMenuACLCmdLevel(ctx, parts)
 	case "target":
 		return techMenuACLCmdTarget(ctx, parts)
+	case "exception":
+		return techMenuACLCmdException(ctx, parts)
 	default:
 		return fmt.Errorf("unknown acl %q — try: acl help (Tab completes subcommands)", parts[1])
 	}
@@ -7116,15 +7806,66 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
+func techMenuACLCmdPinAddTemporary(ctx *AppContext, parts []string) error {
+	if len(parts) < 6 {
+		return fmt.Errorf(`usage: acl pin add temporary <pin> <expires_rfc3339> [label...] [--max-uses N]`)
+	}
+	pin := strings.TrimSpace(parts[4])
+	expiresStr := strings.TrimSpace(parts[5])
+	if pin == "" || expiresStr == "" {
+		return fmt.Errorf("pin and expires must not be empty")
+	}
+	if _, err := time.Parse(time.RFC3339, expiresStr); err != nil {
+		return fmt.Errorf("expires must be RFC3339 (e.g. 2026-04-16T18:00:00Z): %w", err)
+	}
+	tail := parts[6:]
+	var maxUses sql.NullInt64
+	labelParts := make([]string, 0, len(tail))
+	for i := 0; i < len(tail); i++ {
+		if strings.EqualFold(strings.TrimSpace(tail[i]), "--max-uses") && i+1 < len(tail) {
+			n, err := strconv.ParseInt(strings.TrimSpace(tail[i+1]), 10, 64)
+			if err != nil || n <= 0 {
+				return fmt.Errorf("max-uses must be a positive integer")
+			}
+			maxUses = sql.NullInt64{Int64: n, Valid: true}
+			i++
+			continue
+		}
+		labelParts = append(labelParts, tail[i])
+	}
+	label := strings.TrimSpace(strings.Join(labelParts, " "))
+	aclDBMu.Lock()
+	defer aclDBMu.Unlock()
+	var err error
+	if maxUses.Valid {
+		_, err = ctx.DB.Exec(`INSERT OR REPLACE INTO access_pins (pin, label, enabled, temporary, expires_at, max_uses, use_count, door_hold_extra_seconds) VALUES (?, ?, 1, 1, ?, ?, 0, NULL)`,
+			pin, nullIfEmpty(label), expiresStr, maxUses.Int64)
+	} else {
+		_, err = ctx.DB.Exec(`INSERT OR REPLACE INTO access_pins (pin, label, enabled, temporary, expires_at, max_uses, use_count, door_hold_extra_seconds) VALUES (?, ?, 1, 1, ?, NULL, 0, NULL)`,
+			pin, nullIfEmpty(label), expiresStr)
+	}
+	if err != nil {
+		return err
+	}
+	log.Printf("INFO: Technician menu: acl pin add temporary (enabled)")
+	techMenuSyncPrint(func(w io.Writer) {
+		fmt.Fprintln(w, "Temporary PIN saved (enabled). Add to a user group: acl group join <group_id> <pin>")
+	})
+	return nil
+}
+
 func techMenuACLCmdPin(ctx *AppContext, parts []string) error {
 	if len(parts) < 3 {
-		return fmt.Errorf("usage: acl pin add|list|enable|disable …")
+		return fmt.Errorf("usage: acl pin add|list|hold_extra|enable|disable …")
 	}
 	verb := strings.ToLower(parts[2])
 	switch verb {
 	case "list":
-		return techMenuACLQueryStrings(ctx, "access_pins", "pin", "label", "enabled")
+		return techMenuACLQueryStrings(ctx, "access_pins", "pin", "label", "enabled", "temporary", "expires_at", "max_uses", "use_count", "door_hold_extra_seconds")
 	case "add":
+		if len(parts) >= 5 && strings.EqualFold(strings.TrimSpace(parts[3]), "temporary") {
+			return techMenuACLCmdPinAddTemporary(ctx, parts)
+		}
 		if len(parts) < 4 {
 			return fmt.Errorf("usage: acl pin add <pin> [label]")
 		}
@@ -7138,7 +7879,7 @@ func techMenuACLCmdPin(ctx *AppContext, parts []string) error {
 		}
 		aclDBMu.Lock()
 		defer aclDBMu.Unlock()
-		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_pins (pin, label, enabled) VALUES (?, ?, 1)`, pin, nullIfEmpty(label))
+		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_pins (pin, label, enabled, temporary, expires_at, max_uses, use_count, door_hold_extra_seconds) VALUES (?, ?, 1, 0, NULL, NULL, 0, NULL)`, pin, nullIfEmpty(label))
 		if err != nil {
 			return err
 		}
@@ -7146,6 +7887,37 @@ func techMenuACLCmdPin(ctx *AppContext, parts []string) error {
 		techMenuSyncPrint(func(w io.Writer) {
 			fmt.Fprintln(w, "PIN saved (enabled). Add to a user group: acl group join <group_id> <pin>")
 		})
+		return nil
+	case "hold_extra":
+		if len(parts) < 5 {
+			return fmt.Errorf("usage: acl pin hold_extra <pin> <extra_seconds> (0 clears; extends door_open_warning_after for next door open)")
+		}
+		pin := strings.TrimSpace(parts[3])
+		if pin == "" {
+			return fmt.Errorf("pin must not be empty")
+		}
+		sec, err := strconv.Atoi(strings.TrimSpace(parts[4]))
+		if err != nil {
+			return fmt.Errorf("extra_seconds: %w", err)
+		}
+		if sec < 0 {
+			return fmt.Errorf("extra_seconds must be >= 0")
+		}
+		if sec > int((24*time.Hour)/time.Second) {
+			return fmt.Errorf("extra_seconds too large (max 24h)")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		res, err := ctx.DB.Exec(`UPDATE access_pins SET door_hold_extra_seconds = ? WHERE pin = ?`, sec, pin)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("no access_pins row for pin %q — use: acl pin add %s", pin, pin)
+		}
+		log.Printf("INFO: Technician menu: acl pin hold_extra %d s for pin (masked)", sec)
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "door_hold_extra_seconds=%d for PIN (update saved)\n", sec) })
 		return nil
 	case "enable", "disable":
 		if len(parts) < 4 {
@@ -7173,7 +7945,7 @@ func techMenuACLCmdPin(ctx *AppContext, parts []string) error {
 		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "PIN %q enabled=%d\n", pin, en) })
 		return nil
 	default:
-		return fmt.Errorf("pin: use add, list, enable, or disable")
+		return fmt.Errorf("pin: use add, list, hold_extra, enable, or disable")
 	}
 }
 
@@ -7308,12 +8080,12 @@ func techMenuACLEnsureFK(ctx *AppContext, table, col, id, what string) error {
 
 func techMenuACLCmdProfile(ctx *AppContext, parts []string) error {
 	if len(parts) < 3 {
-		return fmt.Errorf("usage: acl profile add|list …")
+		return fmt.Errorf("usage: acl profile add|list|respects_exceptions …")
 	}
 	verb := strings.ToLower(parts[2])
 	switch verb {
 	case "list":
-		return techMenuACLQueryStrings(ctx, "access_time_profiles", "id", "display_name", "iana_timezone")
+		return techMenuACLQueryStrings(ctx, "access_time_profiles", "id", "display_name", "iana_timezone", "respects_exception_calendar")
 	case "add":
 		if len(parts) < 4 {
 			return fmt.Errorf("usage: acl profile add <id> [display_name [iana_timezone]]")
@@ -7335,7 +8107,13 @@ func techMenuACLCmdProfile(ctx *AppContext, parts []string) error {
 		}
 		aclDBMu.Lock()
 		defer aclDBMu.Unlock()
-		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_time_profiles (id, display_name, description, iana_timezone) VALUES (?, ?, ?, ?)`,
+		_, err := ctx.DB.Exec(`
+			INSERT INTO access_time_profiles (id, display_name, description, iana_timezone, respects_exception_calendar)
+			VALUES (?, ?, ?, ?, 1)
+			ON CONFLICT(id) DO UPDATE SET
+				display_name = excluded.display_name,
+				description = excluded.description,
+				iana_timezone = excluded.iana_timezone`,
 			id, nullIfEmpty(display), nil, tz)
 		if err != nil {
 			return err
@@ -7346,8 +8124,40 @@ func techMenuACLCmdProfile(ctx *AppContext, parts []string) error {
 			fmt.Fprintln(w, "  weekday: 0=Sun … 6=Sat, 7=any day; minutes 0–1439 (start>end crosses midnight)")
 		})
 		return nil
+	case "respects_exceptions":
+		if len(parts) < 5 {
+			return fmt.Errorf("usage: acl profile respects_exceptions <profile_id> on|off")
+		}
+		pid := strings.TrimSpace(parts[3])
+		if pid == "" {
+			return fmt.Errorf("profile_id must not be empty")
+		}
+		sw := strings.ToLower(strings.TrimSpace(parts[4]))
+		var v int
+		switch sw {
+		case "on", "1", "true", "yes":
+			v = 1
+		case "off", "0", "false", "no":
+			v = 0
+		default:
+			return fmt.Errorf("respects_exceptions: want on or off")
+		}
+		aclDBMu.Lock()
+		defer aclDBMu.Unlock()
+		if err := techMenuACLEnsureFK(ctx, "access_time_profiles", "id", pid, "time profile"); err != nil {
+			return err
+		}
+		_, err := ctx.DB.Exec(`UPDATE access_time_profiles SET respects_exception_calendar = ? WHERE id = ?`, v, pid)
+		if err != nil {
+			return err
+		}
+		log.Printf("INFO: Technician menu: acl profile respects_exceptions %q = %d", pid, v)
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintf(w, "Profile %q: respects_exception_calendar=%d (1=apply holiday/exception calendars)\n", pid, v)
+		})
+		return nil
 	default:
-		return fmt.Errorf("profile: use add or list")
+		return fmt.Errorf("profile: use add, list, or respects_exceptions")
 	}
 }
 

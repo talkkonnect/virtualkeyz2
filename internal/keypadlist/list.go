@@ -76,9 +76,9 @@ func Fprint(w io.Writer, usbOnly bool) error {
 	fmt.Fprintln(tw, "VirtualKeyz2 listkeypads — stable paths (by-id / by-path)")
 	fmt.Fprintln(tw, "Put USE_PATH in device.keypad_evdev_path and device.keypad_exit_evdev_path (not event numbers — those change on reboot).")
 	if usbOnly {
-		fmt.Fprintln(tw, "Filter: USB-attached devices only.\n")
+		fmt.Fprintln(tw, "Filter: USB-attached devices only.")
 	} else {
-		fmt.Fprintln(tw, "Tip: technician `kb` or CLI -usb limits to USB. BACKEND_EVENT is the resolved node for debugging only.\n")
+		fmt.Fprintln(tw, "Tip: technician `kb` or CLI -usb limits to USB. BACKEND_EVENT is the resolved node for debugging only.")
 	}
 	_, _ = fmt.Fprintln(tw, "USE_PATH\tBACKEND_EVENT\tNAME\tPHYS\tNOTES")
 	_, _ = fmt.Fprintln(tw, "—\t—\t—\t—\t—")
