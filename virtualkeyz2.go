@@ -6209,14 +6209,15 @@ func parseBCMPinList(s string) ([]uint8, error) {
 
 func setupOperationModeGPIOInputs(ctx *AppContext, gpio *GPIOManager) {
 	ctx.configMu.RLock()
-	mode := NormalizeKeypadOperationMode(ctx.Config.KeypadOperationMode)
 	ex := ctx.GPIOSettings.ExitButtonPin
 	exLow := ctx.GPIOSettings.ExitButtonActiveLow
 	en := ctx.GPIOSettings.EntryButtonPin
 	enLow := ctx.GPIOSettings.EntryButtonActiveLow
 	ctx.configMu.RUnlock()
 
-	if ex != 0 && modeUsesExitGPIOButton(mode) {
+	// Register pins whenever configured so runtime keypad_operation_mode changes take effect
+	// without restart. Callbacks gate relay pulses on the current mode.
+	if ex != 0 {
 		gpio.AddInput("exit_button", ex, exLow, func() {
 			ctx.configMu.RLock()
 			m := NormalizeKeypadOperationMode(ctx.Config.KeypadOperationMode)
@@ -6227,12 +6228,10 @@ func setupOperationModeGPIOInputs(ctx *AppContext, gpio *GPIOManager) {
 			}
 			log.Println("INFO: Exit button (GPIO REX); pulsing door relay.")
 			fireEventWebhook(ctx, "exit_button_rex", map[string]any{"operation_mode": m})
-			if ctx.GPIO != nil {
-				ctx.GPIO.ActionPulse("door", d)
-			}
+			gpio.ActionPulse("door", d)
 		})
 	}
-	if en != 0 && modeUsesEntryGPIOButton(mode) {
+	if en != 0 {
 		gpio.AddInput("entry_button", en, enLow, func() {
 			ctx.configMu.RLock()
 			m := NormalizeKeypadOperationMode(ctx.Config.KeypadOperationMode)
@@ -6243,9 +6242,7 @@ func setupOperationModeGPIOInputs(ctx *AppContext, gpio *GPIOManager) {
 			}
 			log.Println("INFO: Entry request button (GPIO); pulsing door relay.")
 			fireEventWebhook(ctx, "entry_button_rex", map[string]any{"operation_mode": m})
-			if ctx.GPIO != nil {
-				ctx.GPIO.ActionPulse("door", d)
-			}
+			gpio.ActionPulse("door", d)
 		})
 	}
 }
