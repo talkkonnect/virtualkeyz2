@@ -2,6 +2,9 @@
   "device": {
     "heartbeat_interval": "1m0s",
     "door_open_warning_after": "10s",
+    "door_open_alarm_interval": "30s",
+    "door_open_alarm_max_count": 0,
+    "door_forced_after_warnings": 0,
     "door_sensor_closed_is_low": true,
     "sound_card_name": "plughw:0,0",
     "sound_startup": "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/startup.wav",
@@ -11,7 +14,7 @@
     "sound_keypress": "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/key.wav",
     "log_level": "debug",
     "pin_length": 6,
-    "relay_pulse_duration": "1000ms",
+    "relay_pulse_duration": "1s",
     "pin_reject_buzzer_after_attempts": 3,
     "buzzer_relay_pulse_duration": "800ms",
     "mqtt_enabled": false,
@@ -35,8 +38,6 @@
     "webhook_event_url": "",
     "webhook_event_token_enabled": false,
     "webhook_event_token": "",
-    "webhook_event_types": {},
-    "webhook_event_endpoints": [],
     "webhook_heartbeat_enabled": false,
     "webhook_heartbeat_url": "",
     "webhook_heartbeat_token_enabled": false,
@@ -56,7 +57,8 @@
     "elevator_enable_pulse_duration": "",
     "dual_keypad_reject_exit_without_entry": false,
     "access_schedule_enforce": true,
-    "access_schedule_apply_to_fallback_pin": false
+    "access_schedule_apply_to_fallback_pin": false,
+    "lighting_timeout": "1m0s"
   },
   "gpio": {
     "relay_output_mode": "gpio",
@@ -80,7 +82,11 @@
     "elevator_enable_active_low": false,
     "elevator_floor_dispatch_pins": "6,12",
     "elevator_predefined_enable_pins": "",
-    "elevator_wait_floor_enable_pins": "5,10"
+    "elevator_wait_floor_enable_pins": "5,10",
+    "lighting_button_pin": 0,
+    "lighting_button_active_low": true,
+    "lighting_relay_pin": 10,
+    "lighting_relay_active_low": false
   },
   "tech_menu_prompt": "Access-Control-Room-1",
   "elevator_parameter_modes": {
