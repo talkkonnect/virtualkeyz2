@@ -1,0 +1,758 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-virtualkeyz2-rest",
+    "name": "VirtualKeyz2 REST API",
+    "description": "HTTP REST API for VirtualKeyz2 device configuration and SQLite ACL.\n\n**Auth:** `GET /health` and `GET /admin` need no token. All `/api/v1/*` routes require `Authorization: Bearer {{apiToken}}` or header `X-Api-Token: {{apiToken}}` (set `device.rest_api_token` on the device).\n\n**Variables:** `baseUrl` (e.g. `http://192.168.1.50:8080`), `apiToken`, and optional IDs for examples (`doorId`, `pin`, etc.).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8080" },
+    { "key": "apiToken", "value": "your-rest_api_token-here" },
+    { "key": "doorId", "value": "east" },
+    { "key": "elevatorId", "value": "cab_a" },
+    { "key": "pin", "value": "123456" },
+    { "key": "groupId", "value": "staff" },
+    { "key": "profileId", "value": "biz" },
+    { "key": "levelId", "value": "L1" },
+    { "key": "calendarId", "value": "national" },
+    { "key": "rowId", "value": "1" }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{apiToken}}", "type": "string" }]
+  },
+  "item": [
+    {
+      "name": "Public (no token)",
+      "auth": { "type": "noauth" },
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/health"
+          }
+        },
+        {
+          "name": "Admin stub",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/admin"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — meta",
+      "item": [
+        {
+          "name": "Version",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/version"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — config (cfg)",
+      "item": [
+        {
+          "name": "Get full config JSON",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/config"
+          }
+        },
+        {
+          "name": "Patch config (partial virtualkeyz2.json)",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"device\": {\n    \"log_level\": \"info\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/config"
+          }
+        },
+        {
+          "name": "Patch config keys (flat cfg set)",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"log_level\": \"debug\",\n  \"access_schedule_enforce\": \"true\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/config/keys"
+          }
+        },
+        {
+          "name": "Apply in-memory (MQTT, log filter)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/config/apply"
+          }
+        },
+        {
+          "name": "Save config to disk",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/config/save"
+          }
+        },
+        {
+          "name": "Reload config from disk",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/config/reload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — central server",
+      "item": [
+        {
+          "name": "Resolve central config URL",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/central/config-url"
+          }
+        },
+        {
+          "name": "Pull config from central (GET + apply)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/central/config/pull"
+          }
+        },
+        {
+          "name": "Push config to central (PUT JSON)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/central/config/push"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — ACL overview",
+      "item": [
+        {
+          "name": "ACL summary",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/summary"
+          }
+        },
+        {
+          "name": "Bind door or elevator",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"door\",\n  \"id\": \"{{doorId}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/bind"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — doors & groups",
+      "item": [
+        {
+          "name": "List doors",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/doors" }
+        },
+        {
+          "name": "Upsert door",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"{{doorId}}\",\n  \"display_name\": \"Main_Entrance\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/doors"
+          }
+        },
+        {
+          "name": "Update door display name",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"display_name\": \"East_entry\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/doors/{{doorId}}"
+          }
+        },
+        {
+          "name": "Delete door",
+          "request": { "method": "DELETE", "header": [], "url": "{{baseUrl}}/api/v1/acl/doors/{{doorId}}" }
+        },
+        {
+          "name": "List door groups",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/door-groups" }
+        },
+        {
+          "name": "Upsert door group",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"all_entries\",\n  \"display_name\": \"All_entries\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/door-groups"
+          }
+        },
+        {
+          "name": "List door group members",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/door-group-members" }
+        },
+        {
+          "name": "List door group members (filter)",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/door-group-members?door_group_id={{groupId}}" }
+        },
+        {
+          "name": "Add door group member",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"door_group_id\": \"all_entries\",\n  \"door_id\": \"{{doorId}}\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/door-group-members"
+          }
+        },
+        {
+          "name": "Delete door group member",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/door-group-members/all_entries/{{doorId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — elevators",
+      "item": [
+        {
+          "name": "List elevators",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevators" }
+        },
+        {
+          "name": "Upsert elevator",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"{{elevatorId}}\",\n  \"display_name\": \"Car_A\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/elevators"
+          }
+        },
+        {
+          "name": "List elevator groups",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevator-groups" }
+        },
+        {
+          "name": "List elevator group members",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevator-group-members" }
+        },
+        {
+          "name": "Add elevator group member",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"elevator_group_id\": \"bank1\",\n  \"elevator_id\": \"{{elevatorId}}\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-group-members"
+          }
+        },
+        {
+          "name": "Delete elevator group member",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/elevator-group-members/bank1/{{elevatorId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — PINs & user groups",
+      "item": [
+        {
+          "name": "List PINs",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/pins" }
+        },
+        {
+          "name": "Get one PIN",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/pins/{{pin}}" }
+        },
+        {
+          "name": "Create employee PIN",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"pin\": \"{{pin}}\",\n  \"label\": \"Alice\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/pins"
+          }
+        },
+        {
+          "name": "Create temporary PIN (visitor)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pin\": \"888888\",\n  \"expires_at\": \"2026-12-31T23:59:59Z\",\n  \"label\": \"Contractor\",\n  \"max_uses\": 10\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/pins/temporary"
+          }
+        },
+        {
+          "name": "Patch PIN (label, enabled, temporary, expires, max_uses, hold_extra)",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"label\": \"Bob\",\n  \"enabled\": true,\n  \"temporary\": false,\n  \"expires_at\": null,\n  \"door_hold_extra_seconds\": 30\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/pins/{{pin}}"
+          }
+        },
+        {
+          "name": "Delete PIN",
+          "request": { "method": "DELETE", "header": [], "url": "{{baseUrl}}/api/v1/acl/pins/{{pin}}" }
+        },
+        {
+          "name": "List user groups",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/user-groups" }
+        },
+        {
+          "name": "Upsert user group",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"{{groupId}}\",\n  \"display_name\": \"Staff\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/user-groups"
+          }
+        },
+        {
+          "name": "List user group members",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/user-group-members?group_id={{groupId}}" }
+        },
+        {
+          "name": "Add user group member",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"group_id\": \"{{groupId}}\",\n  \"pin\": \"{{pin}}\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/user-group-members"
+          }
+        },
+        {
+          "name": "Remove user group member",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/user-group-members/{{groupId}}/{{pin}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — schedules & levels",
+      "item": [
+        {
+          "name": "List time profiles",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/time-profiles" }
+        },
+        {
+          "name": "Upsert time profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"{{profileId}}\",\n  \"display_name\": \"Business_Hours\",\n  \"iana_timezone\": \"Asia/Bangkok\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/time-profiles"
+          }
+        },
+        {
+          "name": "Patch profile respects exception calendar",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"on\": true\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/time-profiles/{{profileId}}/respects-exceptions"
+          }
+        },
+        {
+          "name": "Delete time profile",
+          "request": { "method": "DELETE", "header": [], "url": "{{baseUrl}}/api/v1/acl/time-profiles/{{profileId}}" }
+        },
+        {
+          "name": "List time windows",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/time-windows?time_profile_id={{profileId}}" }
+        },
+        {
+          "name": "Add time window",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"time_profile_id\": \"{{profileId}}\",\n  \"weekday\": 1,\n  \"start_minute\": 525,\n  \"end_minute\": 1020\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/time-windows"
+          }
+        },
+        {
+          "name": "Patch time window",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"weekday\": 2,\n  \"start_minute\": 480,\n  \"end_minute\": 1020\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/time-windows/{{rowId}}"
+          }
+        },
+        {
+          "name": "Delete time window",
+          "request": { "method": "DELETE", "header": [], "url": "{{baseUrl}}/api/v1/acl/time-windows/{{rowId}}" }
+        },
+        {
+          "name": "List access levels",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/access-levels" }
+        },
+        {
+          "name": "Create access level",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"{{levelId}}\",\n  \"display_name\": \"Staff_biz\",\n  \"time_profile_id\": \"{{profileId}}\",\n  \"user_group_id\": \"{{groupId}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/access-levels"
+          }
+        },
+        {
+          "name": "Patch access level enabled",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"enabled\": true\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/access-levels/{{levelId}}/enabled"
+          }
+        },
+        {
+          "name": "Put access level (full update)",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"display_name\": \"Staff_biz\",\n  \"time_profile_id\": \"{{profileId}}\",\n  \"user_group_id\": \"{{groupId}}\",\n  \"enabled\": true\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/access-levels/{{levelId}}"
+          }
+        },
+        {
+          "name": "Delete access level",
+          "request": { "method": "DELETE", "header": [], "url": "{{baseUrl}}/api/v1/acl/access-levels/{{levelId}}" }
+        },
+        {
+          "name": "List level targets",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/level-targets" }
+        },
+        {
+          "name": "Add level target (door)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"door\",\n  \"access_level_id\": \"{{levelId}}\",\n  \"target_id\": \"{{doorId}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/level-targets"
+          }
+        },
+        {
+          "name": "Add level target (elevator)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"elevator\",\n  \"access_level_id\": \"{{levelId}}\",\n  \"target_id\": \"{{elevatorId}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/level-targets"
+          }
+        },
+        {
+          "name": "Delete level target by row id",
+          "request": { "method": "DELETE", "header": [], "url": "{{baseUrl}}/api/v1/acl/level-targets/{{rowId}}" }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — exception calendars",
+      "item": [
+        {
+          "name": "List exception calendars",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/exception-calendars" }
+        },
+        {
+          "name": "Upsert exception calendar",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"{{calendarId}}\",\n  \"display_name\": \"National\",\n  \"priority\": 100,\n  \"source_note\": \"HQ\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/exception-calendars"
+          }
+        },
+        {
+          "name": "Patch exception calendar",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"enabled\": true,\n  \"priority\": 100\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/exception-calendars/{{calendarId}}"
+          }
+        },
+        {
+          "name": "Delete exception calendar",
+          "request": { "method": "DELETE", "header": [], "url": "{{baseUrl}}/api/v1/acl/exception-calendars/{{calendarId}}" }
+        },
+        {
+          "name": "List exception dates",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/exception-dates?calendar_id={{calendarId}}" }
+        },
+        {
+          "name": "Add exception date (full day)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"calendar_id\": \"{{calendarId}}\",\n  \"date\": \"2026-12-25\",\n  \"kind\": \"full_closure\",\n  \"label\": \"Christmas\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/exception-dates"
+          }
+        },
+        {
+          "name": "Add exception date (early close)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"calendar_id\": \"{{calendarId}}\",\n  \"date\": \"2026-12-24\",\n  \"kind\": \"early_closure\",\n  \"early_close_minute\": 780,\n  \"label\": \"Christmas_Eve\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/exception-dates"
+          }
+        },
+        {
+          "name": "Delete exception date by row id",
+          "request": { "method": "DELETE", "header": [], "url": "{{baseUrl}}/api/v1/acl/exception-dates/{{rowId}}" }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — elevator floor ACL",
+      "item": [
+        {
+          "name": "List elevator pin floors",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevator-pin-floors" }
+        },
+        {
+          "name": "Add elevator pin floor",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pin\": \"{{pin}}\",\n  \"elevator_id\": \"{{elevatorId}}\",\n  \"floor_index\": 0\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-pin-floors"
+          }
+        },
+        {
+          "name": "Delete elevator pin floor (query)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/elevator-pin-floors?elevator_id={{elevatorId}}&pin={{pin}}&floor_index=0"
+          }
+        },
+        {
+          "name": "List elevator floor labels",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevator-floor-labels" }
+        },
+        {
+          "name": "Upsert elevator floor label",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"elevator_id\": \"{{elevatorId}}\",\n  \"floor_index\": 0,\n  \"floor_name\": \"Lobby\",\n  \"relay_pin\": 5\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-labels"
+          }
+        },
+        {
+          "name": "Put elevator floor label",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"floor_name\": \"Ground\",\n  \"relay_pin\": 5\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-labels/{{elevatorId}}/0"
+          }
+        },
+        {
+          "name": "Delete elevator floor label",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-labels/{{elevatorId}}/0"
+          }
+        },
+        {
+          "name": "List elevator floor groups",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevator-floor-groups" }
+        },
+        {
+          "name": "Create elevator floor group",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"grp_public\",\n  \"elevator_id\": \"{{elevatorId}}\",\n  \"display_name\": \"Public_floors\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-groups"
+          }
+        },
+        {
+          "name": "Patch elevator floor group",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"display_name\": \"Public\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-groups/grp_public"
+          }
+        },
+        {
+          "name": "Delete elevator floor group",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-groups/grp_public"
+          }
+        },
+        {
+          "name": "List elevator floor group members",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevator-floor-group-members" }
+        },
+        {
+          "name": "Add elevator floor group member",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"group_id\": \"grp_public\",\n  \"floor_index\": 0\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-group-members"
+          }
+        },
+        {
+          "name": "Delete elevator floor group member",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-group-members/grp_public/0"
+          }
+        },
+        {
+          "name": "List elevator pin floor groups",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevator-pin-floor-groups" }
+        },
+        {
+          "name": "Add elevator pin floor group link",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"pin\": \"{{pin}}\",\n  \"group_id\": \"grp_public\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-pin-floor-groups"
+          }
+        },
+        {
+          "name": "Delete elevator pin floor group link (query)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/elevator-pin-floor-groups?pin={{pin}}&group_id=grp_public"
+          }
+        },
+        {
+          "name": "List elevator floor time rules",
+          "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/v1/acl/elevator-floor-time-rules" }
+        },
+        {
+          "name": "Create elevator floor time rule",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"elevator_id\": \"{{elevatorId}}\",\n  \"floor_index\": 3,\n  \"time_profile_id\": \"{{profileId}}\",\n  \"action\": \"lock\",\n  \"enabled\": true\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-time-rules"
+          }
+        },
+        {
+          "name": "Patch elevator floor time rule",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"enabled\": false,\n  \"action\": \"open\"\n}" },
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-time-rules/{{rowId}}"
+          }
+        },
+        {
+          "name": "Delete elevator floor time rule",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/acl/elevator-floor-time-rules/{{rowId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "API v1 — X-Api-Token (alternate auth)",
+      "item": [
+        {
+          "name": "Version with X-Api-Token header",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [{ "key": "X-Api-Token", "value": "{{apiToken}}" }],
+            "url": "{{baseUrl}}/api/v1/version"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -32,7 +32,6 @@ import (
 	"unsafe"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/gin-gonic/gin"
 	evdev "github.com/gvalkov/golang-evdev"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stianeikeland/go-rpio/v4"
@@ -45,8 +44,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.07"
-	SoftwareReleaseUTC = "2026-04-17T11:05:35Z"
+	SoftwareVersion    = "0.08"
+	SoftwareReleaseUTC = "2026-04-17T11:43:19Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -477,6 +476,19 @@ type DeviceConfig struct {
 	AccessExceptionSiteTimezone string
 	// LightingTimeout: manual lighting button keeps lighting relay energized for this duration; each press restarts the timer. Clamped in normalizeKeypadAndPinUX.
 	LightingTimeout time.Duration
+
+	// RestAPIEnabled: when false, the HTTP listener (REST + /admin) is not started.
+	RestAPIEnabled bool
+	// RestAPIListenAddr: TCP listen address for the Gin HTTP server (e.g. ":8080" or "127.0.0.1:8765").
+	RestAPIListenAddr string
+	// RestAPIToken: when non-empty, /api/v1/* requires Authorization: Bearer <token> or X-Api-Token header.
+	RestAPIToken string
+	// CentralServerBaseURL: optional HTTPS base for centralized configuration (no trailing slash).
+	CentralServerBaseURL string
+	// CentralServerBearerToken: optional Bearer token sent to the central server on pull/push.
+	CentralServerBearerToken string
+	// CentralServerConfigPath: path appended to CentralServerBaseURL for config JSON GET/PUT (default /virtualkeyz2/v1/config).
+	CentralServerConfigPath string
 }
 
 // virtualkeyz2JSON is the on-disk shape of virtualkeyz2.json (see default file in repo).
@@ -566,6 +578,12 @@ type virtualkeyz2DeviceJSON struct {
 	AccessScheduleApplyToFallbackPin    *bool                   `json:"access_schedule_apply_to_fallback_pin,omitempty"`
 	AccessExceptionSiteTimezone         *string                 `json:"access_exception_site_timezone,omitempty"`
 	LightingTimeout                     *string                 `json:"lighting_timeout,omitempty"`
+	RestAPIEnabled                      *bool                   `json:"rest_api_enabled,omitempty"`
+	RestAPIListenAddr                   *string                 `json:"rest_api_listen_addr,omitempty"`
+	RestAPIToken                        *string                 `json:"rest_api_token,omitempty"`
+	CentralServerBaseURL                *string                 `json:"central_server_base_url,omitempty"`
+	CentralServerBearerToken            *string                 `json:"central_server_bearer_token,omitempty"`
+	CentralServerConfigPath             *string                 `json:"central_server_config_path,omitempty"`
 }
 
 type virtualkeyz2GPIOJSON struct {
@@ -1265,6 +1283,24 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if err := applyJSONDuration(&app.Config.LightingTimeout, "device", "lighting_timeout", d.LightingTimeout); err != nil {
 		return err
 	}
+	if d.RestAPIEnabled != nil {
+		app.Config.RestAPIEnabled = *d.RestAPIEnabled
+	}
+	if d.RestAPIListenAddr != nil {
+		app.Config.RestAPIListenAddr = strings.TrimSpace(*d.RestAPIListenAddr)
+	}
+	if d.RestAPIToken != nil {
+		app.Config.RestAPIToken = *d.RestAPIToken
+	}
+	if d.CentralServerBaseURL != nil {
+		app.Config.CentralServerBaseURL = strings.TrimSpace(*d.CentralServerBaseURL)
+	}
+	if d.CentralServerBearerToken != nil {
+		app.Config.CentralServerBearerToken = *d.CentralServerBearerToken
+	}
+	if d.CentralServerConfigPath != nil {
+		app.Config.CentralServerConfigPath = strings.TrimSpace(*d.CentralServerConfigPath)
+	}
 	g := &raw.GPIO
 	if g.RelayOutputMode != nil {
 		app.GPIOSettings.RelayOutputMode = strings.TrimSpace(*g.RelayOutputMode)
@@ -1555,6 +1591,12 @@ type virtualkeyz2PersistDevice struct {
 	AccessScheduleApplyToFallbackPin    bool                   `json:"access_schedule_apply_to_fallback_pin"`
 	AccessExceptionSiteTimezone         string                 `json:"access_exception_site_timezone,omitempty"`
 	LightingTimeout                     string                 `json:"lighting_timeout"`
+	RestAPIEnabled                      bool                   `json:"rest_api_enabled"`
+	RestAPIListenAddr                   string                 `json:"rest_api_listen_addr"`
+	RestAPIToken                        string                 `json:"rest_api_token"`
+	CentralServerBaseURL                string                 `json:"central_server_base_url"`
+	CentralServerBearerToken            string                 `json:"central_server_bearer_token"`
+	CentralServerConfigPath             string                 `json:"central_server_config_path"`
 }
 
 type virtualkeyz2PersistGPIO struct {
@@ -1681,6 +1723,12 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.AccessScheduleApplyToFallbackPin = c.AccessScheduleApplyToFallbackPin
 	out.Device.AccessExceptionSiteTimezone = c.AccessExceptionSiteTimezone
 	out.Device.LightingTimeout = c.LightingTimeout.String()
+	out.Device.RestAPIEnabled = c.RestAPIEnabled
+	out.Device.RestAPIListenAddr = c.RestAPIListenAddr
+	out.Device.RestAPIToken = c.RestAPIToken
+	out.Device.CentralServerBaseURL = c.CentralServerBaseURL
+	out.Device.CentralServerBearerToken = c.CentralServerBearerToken
+	out.Device.CentralServerConfigPath = c.CentralServerConfigPath
 	out.GPIO.RelayOutputMode = normalizeRelayOutputMode(g.RelayOutputMode)
 	out.GPIO.MCP23017I2CBus = g.MCP23017I2CBus
 	out.GPIO.MCP23017I2CAddr = int(g.MCP23017I2CAddr)
@@ -2265,6 +2313,18 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.AccessScheduleApplyToFallbackPin, err = strconv.ParseBool(value)
 	case "access_exception_site_timezone":
 		ctx.Config.AccessExceptionSiteTimezone = value
+	case "rest_api_enabled":
+		ctx.Config.RestAPIEnabled, err = strconv.ParseBool(value)
+	case "rest_api_listen_addr":
+		ctx.Config.RestAPIListenAddr = strings.TrimSpace(value)
+	case "rest_api_token":
+		ctx.Config.RestAPIToken = value
+	case "central_server_base_url":
+		ctx.Config.CentralServerBaseURL = strings.TrimSpace(value)
+	case "central_server_bearer_token":
+		ctx.Config.CentralServerBearerToken = value
+	case "central_server_config_path":
+		ctx.Config.CentralServerConfigPath = strings.TrimSpace(value)
 	default:
 		return fmt.Errorf("unknown key %q (try: cfg keys)", key)
 	}
@@ -2385,6 +2445,12 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   access_schedule_enforce           true|false (default true): when door/elevator id set, enforce access_levels + time windows if DB maps that target
   access_schedule_apply_to_fallback_pin  true|false (default false): subject device.fallback_access_pin to schedules
   access_exception_site_timezone    IANA zone for exception-calendar civil dates (holidays / early close); empty = system local
+  rest_api_enabled                  true|false — HTTP server (REST + /admin); false disables listener
+  rest_api_listen_addr              e.g. :8080 or 127.0.0.1:8765
+  rest_api_token                    Bearer / X-Api-Token for /api/v1/* (empty = API returns 503 until set)
+  central_server_base_url           optional https://host (no trailing slash) for centralized config pull/push
+  central_server_bearer_token       optional Bearer sent to central on pull/push
+  central_server_config_path        path on central for device JSON (default /virtualkeyz2/v1/config)
   relay_output_mode                 gpio|mcp23017|xl9535 (relays on BCM vs I2C expander; sensors/LED stay BCM)
   mcp23017_i2c_bus                  MCP23017: Linux I2C bus (default 1)
   mcp23017_i2c_addr                 MCP23017: 7-bit address, default 32 (0x20)
@@ -2509,6 +2575,9 @@ func main() {
 			AccessScheduleEnforce:            true,
 			KeypadOperationMode:              ModeAccessEntry,
 			KeypadEvdevPath:                  "/dev/input/event1",
+			RestAPIEnabled:                   true,
+			RestAPIListenAddr:                ":8080",
+			CentralServerConfigPath:          "/virtualkeyz2/v1/config",
 		},
 		GPIOSettings: GPIOSettings{
 			RelayOutputMode:      RelayOutputGPIO,
@@ -4516,36 +4585,6 @@ func startHeartbeatAPI(ctx *AppContext) {
 	}
 }
 
-func startWebServer(ctx *AppContext) *http.Server {
-	router := gin.Default()
-
-	// REST API with Token Support & ACL [cite: 7]
-	api := router.Group("/api")
-	api.Use(TokenAuthMiddleware())
-	{
-		api.POST("/remote-control", func(c *gin.Context) {
-			// Trigger GPIO based on remote REST command [cite: 7]
-			c.JSON(http.StatusOK, gin.H{"status": "door_opened"})
-		})
-	}
-
-	// Local Web Interface for Config and Monitoring
-	router.GET("/admin", func(c *gin.Context) {
-		c.String(http.StatusOK, "Local Configuration Interface")
-	})
-
-	srv := &http.Server{
-		Addr:    ":8080",
-		Handler: router,
-	}
-	go func() {
-		log.Println("INFO: Starting Web Server on port 8080")
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("CRITICAL: Web server: %v", err)
-		}
-	}()
-	return srv
-}
 
 func (ctx *AppContext) noteDoorHoldExtraGrace(d time.Duration) {
 	if d < 0 {
@@ -4826,13 +4865,6 @@ func notifyPinDisplay(ctx *AppContext, pin string) {
 		return
 	}
 	ctx.PinDisplayDigits <- pinDigitCount(pin)
-}
-
-func TokenAuthMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// Validates tokens for the REST HTTP API [cite: 7]
-		c.Next()
-	}
 }
 
 // Use evtest in linux to test the capabilities of the keypad.
@@ -5463,6 +5495,9 @@ var techMenuCfgKeysForCompletion = []string{
 	"access_schedule_enforce",
 	"buzzer_relay_active_low",
 	"buzzer_relay_pin",
+	"central_server_base_url",
+	"central_server_bearer_token",
+	"central_server_config_path",
 	"door_forced_after_warnings",
 	"door_open_alarm_interval",
 	"door_open_alarm_max_count",
@@ -5526,6 +5561,9 @@ var techMenuCfgKeysForCompletion = []string{
 	"pin_reject_buzzer_after_attempts",
 	"relay_output_mode",
 	"relay_pulse_duration",
+	"rest_api_enabled",
+	"rest_api_listen_addr",
+	"rest_api_token",
 	"sound_access_granted",
 	"sound_access_granted_enabled",
 	"sound_card_name",
@@ -6351,6 +6389,21 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 		hbTok = "(set)"
 	}
 	fmt.Fprintf(w, "  webhook_heartbeat_token: %s\n", hbTok)
+	fmt.Fprintf(w, "\n--- HTTP REST API (device management) ---\n")
+	fmt.Fprintf(w, "  rest_api_enabled: %v\n", c.RestAPIEnabled)
+	fmt.Fprintf(w, "  rest_api_listen_addr: %q\n", c.RestAPIListenAddr)
+	rtok := `""`
+	if strings.TrimSpace(c.RestAPIToken) != "" {
+		rtok = "(set)"
+	}
+	fmt.Fprintf(w, "  rest_api_token: %s\n", rtok)
+	fmt.Fprintf(w, "  central_server_base_url: %q\n", c.CentralServerBaseURL)
+	ctok := `""`
+	if strings.TrimSpace(c.CentralServerBearerToken) != "" {
+		ctok = "(set)"
+	}
+	fmt.Fprintf(w, "  central_server_bearer_token: %s\n", ctok)
+	fmt.Fprintf(w, "  central_server_config_path: %q\n", c.CentralServerConfigPath)
 	fmt.Fprintf(w, "\n--- GPIO ---\n")
 	fmt.Fprintf(w, "  relay_output_mode: %s\n", normalizeRelayOutputMode(g.RelayOutputMode))
 	fmt.Fprintf(w, "  mcp23017_i2c_bus: %d\n", g.MCP23017I2CBus)
