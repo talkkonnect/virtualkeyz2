@@ -10,10 +10,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jmoiron/sqlx"
 )
 
 // migrateAccessTimeProfilesRespectsExceptionCalendar adds respects_exception_calendar to access_time_profiles when missing.
-func migrateAccessTimeProfilesRespectsExceptionCalendar(db *sql.DB) error {
+func migrateAccessTimeProfilesRespectsExceptionCalendar(db *sqlx.DB) error {
 	if db == nil {
 		return nil
 	}
@@ -31,7 +33,7 @@ func migrateAccessTimeProfilesRespectsExceptionCalendar(db *sql.DB) error {
 	return nil
 }
 
-func accessScheduleTableHasColumn(db *sql.DB, table, col string) (bool, error) {
+func accessScheduleTableHasColumn(db *sqlx.DB, table, col string) (bool, error) {
 	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
 		return false, err
@@ -55,7 +57,7 @@ func accessScheduleTableHasColumn(db *sql.DB, table, col string) (bool, error) {
 // resolveAccessExceptionCalendarState returns the effective exception for civil date y-m-d in the site's calendar.
 // Multi-tier: among enabled calendars, the highest priority wins; at that tier, full_closure beats early_closure;
 // multiple early_closure rows use the earliest early_close_minute (most restrictive).
-func resolveAccessExceptionCalendarState(db *sql.DB, y, m, d int) (fullClosure bool, earlyEndMinute int, earlyActive bool) {
+func resolveAccessExceptionCalendarState(db *sqlx.DB, y, m, d int) (fullClosure bool, earlyEndMinute int, earlyActive bool) {
 	if db == nil {
 		return false, 0, false
 	}
@@ -128,7 +130,7 @@ func resolveAccessExceptionCalendarState(db *sql.DB, y, m, d int) (fullClosure b
 // fullClosure forces deny for profiles that respect exceptions (secured / weekend-equivalent for that day).
 // earlyActive with earlyEndMinute clips same-day windows [start,end] to end at earlyEndMinute (inclusive).
 func timeMatchesProfileWindowsWithExceptions(wd time.Weekday, minuteOfDay int, rows []struct {
-	weekday      int
+	weekday    int
 	start, end int
 }, respectsExceptions bool, fullClosure bool, earlyActive bool, earlyEndMinute int) bool {
 	if !respectsExceptions {
@@ -204,8 +206,6 @@ func techMenuACLCmdExceptionCalendar(ctx *AppContext, parts []string) error {
 	verb := strings.ToLower(strings.TrimSpace(parts[3]))
 	switch verb {
 	case "list":
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		return techMenuACLQueryStrings(ctx, "access_exception_calendars", "id", "display_name", "priority", "enabled", "source_note")
 	case "add":
 		if len(parts) < 5 {
@@ -239,8 +239,6 @@ func techMenuACLCmdExceptionCalendar(ctx *AppContext, parts []string) error {
 			}
 			note = strings.TrimSpace(strings.Join(parts[7:], " "))
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`
 			INSERT INTO access_exception_calendars (id, display_name, priority, enabled, source_note)
 			VALUES (?, ?, ?, 1, ?)
@@ -281,8 +279,6 @@ func techMenuACLCmdExceptionDate(ctx *AppContext, parts []string) error {
 		if len(parts) > 4 {
 			cal = strings.TrimSpace(parts[4])
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		if cal == "" {
 			rows, err := ctx.DB.Query(`
 				SELECT id, calendar_id, y, m, d, kind, early_close_minute, label
@@ -338,8 +334,6 @@ func techMenuACLCmdExceptionDate(ctx *AppContext, parts []string) error {
 			return fmt.Errorf("usage: acl exception date delete <row_id>")
 		}
 		rid := strings.TrimSpace(parts[4])
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		res, err := ctx.DB.Exec(`DELETE FROM access_exception_dates WHERE id = ?`, rid)
 		if err != nil {
 			return err
@@ -370,8 +364,6 @@ func techMenuACLCmdExceptionDate(ctx *AppContext, parts []string) error {
 			return fmt.Errorf("date: use YYYY-MM-DD: %w", err)
 		}
 		y, mth, d := dt.Date()
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		if err := techMenuACLEnsureFK(ctx, "access_exception_calendars", "id", calID, "exception calendar"); err != nil {
 			return err
 		}
@@ -435,8 +427,6 @@ func techMenuACLCmdExceptionImport(ctx *AppContext, parts []string) error {
 	if calID == "" || path == "" {
 		return fmt.Errorf("calendar_id and file_path must not be empty")
 	}
-	aclDBMu.Lock()
-	defer aclDBMu.Unlock()
 	if err := techMenuACLEnsureFK(ctx, "access_exception_calendars", "id", calID, "exception calendar"); err != nil {
 		return err
 	}

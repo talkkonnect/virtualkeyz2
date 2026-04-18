@@ -32,7 +32,9 @@ import (
 	"unsafe"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/gin-gonic/gin"
 	evdev "github.com/gvalkov/golang-evdev"
+	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stianeikeland/go-rpio/v4"
 	"golang.org/x/term"
@@ -45,7 +47,7 @@ import (
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
 	SoftwareVersion    = "0.08"
-	SoftwareReleaseUTC = "2026-04-17T11:43:19Z"
+	SoftwareReleaseUTC = "2026-04-18T04:38:27Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -121,16 +123,6 @@ func modeUsesExitGPIOButton(mode string) bool {
 
 func modeUsesEntryGPIOButton(mode string) bool {
 	return mode == ModeAccessExitWithEntryButton
-}
-
-// modeArmsLightingOnPINAccessGrant is true for standalone access modes where a valid PIN (or physical entry/exit button acting as PIN) shall turn on zone lighting for lighting_timeout.
-func modeArmsLightingOnPINAccessGrant(mode string) bool {
-	switch NormalizeKeypadOperationMode(mode) {
-	case ModeAccessEntry, ModeAccessExit, ModeAccessEntryWithExitButton, ModeAccessExitWithEntryButton:
-		return true
-	default:
-		return false
-	}
 }
 
 func isElevatorWaitFloorMode(mode string) bool {
@@ -237,7 +229,7 @@ type GPIOSettings struct {
 
 // AppContext holds our global connections and configurations
 type AppContext struct {
-	DB           *sql.DB
+	DB           *sqlx.DB
 	MQTTClient   mqtt.Client
 	mqttMu       sync.RWMutex // serializes reconnect vs publish/handler client reads
 	Config       DeviceConfig
@@ -287,7 +279,7 @@ type AppContext struct {
 	doorAlarmMu        sync.Mutex
 	doorHoldExtraGrace time.Duration
 
-	// Lighting control (gpio lighting_* pins + device.lighting_timeout): manual timer + dual-keypad occupancy override.
+	// Lighting control (gpio lighting_* pins + device.lighting_timeout): manual lighting button only (independent of door/PIN).
 	lightingMu       sync.Mutex
 	lightingTimerGen uint64
 	lightingOffTimer *time.Timer
@@ -476,19 +468,6 @@ type DeviceConfig struct {
 	AccessExceptionSiteTimezone string
 	// LightingTimeout: manual lighting button keeps lighting relay energized for this duration; each press restarts the timer. Clamped in normalizeKeypadAndPinUX.
 	LightingTimeout time.Duration
-
-	// RestAPIEnabled: when false, the HTTP listener (REST + /admin) is not started.
-	RestAPIEnabled bool
-	// RestAPIListenAddr: TCP listen address for the Gin HTTP server (e.g. ":8080" or "127.0.0.1:8765").
-	RestAPIListenAddr string
-	// RestAPIToken: when non-empty, /api/v1/* requires Authorization: Bearer <token> or X-Api-Token header.
-	RestAPIToken string
-	// CentralServerBaseURL: optional HTTPS base for centralized configuration (no trailing slash).
-	CentralServerBaseURL string
-	// CentralServerBearerToken: optional Bearer token sent to the central server on pull/push.
-	CentralServerBearerToken string
-	// CentralServerConfigPath: path appended to CentralServerBaseURL for config JSON GET/PUT (default /virtualkeyz2/v1/config).
-	CentralServerConfigPath string
 }
 
 // virtualkeyz2JSON is the on-disk shape of virtualkeyz2.json (see default file in repo).
@@ -578,12 +557,6 @@ type virtualkeyz2DeviceJSON struct {
 	AccessScheduleApplyToFallbackPin    *bool                   `json:"access_schedule_apply_to_fallback_pin,omitempty"`
 	AccessExceptionSiteTimezone         *string                 `json:"access_exception_site_timezone,omitempty"`
 	LightingTimeout                     *string                 `json:"lighting_timeout,omitempty"`
-	RestAPIEnabled                      *bool                   `json:"rest_api_enabled,omitempty"`
-	RestAPIListenAddr                   *string                 `json:"rest_api_listen_addr,omitempty"`
-	RestAPIToken                        *string                 `json:"rest_api_token,omitempty"`
-	CentralServerBaseURL                *string                 `json:"central_server_base_url,omitempty"`
-	CentralServerBearerToken            *string                 `json:"central_server_bearer_token,omitempty"`
-	CentralServerConfigPath             *string                 `json:"central_server_config_path,omitempty"`
 }
 
 type virtualkeyz2GPIOJSON struct {
@@ -1283,24 +1256,6 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if err := applyJSONDuration(&app.Config.LightingTimeout, "device", "lighting_timeout", d.LightingTimeout); err != nil {
 		return err
 	}
-	if d.RestAPIEnabled != nil {
-		app.Config.RestAPIEnabled = *d.RestAPIEnabled
-	}
-	if d.RestAPIListenAddr != nil {
-		app.Config.RestAPIListenAddr = strings.TrimSpace(*d.RestAPIListenAddr)
-	}
-	if d.RestAPIToken != nil {
-		app.Config.RestAPIToken = *d.RestAPIToken
-	}
-	if d.CentralServerBaseURL != nil {
-		app.Config.CentralServerBaseURL = strings.TrimSpace(*d.CentralServerBaseURL)
-	}
-	if d.CentralServerBearerToken != nil {
-		app.Config.CentralServerBearerToken = *d.CentralServerBearerToken
-	}
-	if d.CentralServerConfigPath != nil {
-		app.Config.CentralServerConfigPath = strings.TrimSpace(*d.CentralServerConfigPath)
-	}
 	g := &raw.GPIO
 	if g.RelayOutputMode != nil {
 		app.GPIOSettings.RelayOutputMode = strings.TrimSpace(*g.RelayOutputMode)
@@ -1591,12 +1546,6 @@ type virtualkeyz2PersistDevice struct {
 	AccessScheduleApplyToFallbackPin    bool                   `json:"access_schedule_apply_to_fallback_pin"`
 	AccessExceptionSiteTimezone         string                 `json:"access_exception_site_timezone,omitempty"`
 	LightingTimeout                     string                 `json:"lighting_timeout"`
-	RestAPIEnabled                      bool                   `json:"rest_api_enabled"`
-	RestAPIListenAddr                   string                 `json:"rest_api_listen_addr"`
-	RestAPIToken                        string                 `json:"rest_api_token"`
-	CentralServerBaseURL                string                 `json:"central_server_base_url"`
-	CentralServerBearerToken            string                 `json:"central_server_bearer_token"`
-	CentralServerConfigPath             string                 `json:"central_server_config_path"`
 }
 
 type virtualkeyz2PersistGPIO struct {
@@ -1723,12 +1672,6 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.AccessScheduleApplyToFallbackPin = c.AccessScheduleApplyToFallbackPin
 	out.Device.AccessExceptionSiteTimezone = c.AccessExceptionSiteTimezone
 	out.Device.LightingTimeout = c.LightingTimeout.String()
-	out.Device.RestAPIEnabled = c.RestAPIEnabled
-	out.Device.RestAPIListenAddr = c.RestAPIListenAddr
-	out.Device.RestAPIToken = c.RestAPIToken
-	out.Device.CentralServerBaseURL = c.CentralServerBaseURL
-	out.Device.CentralServerBearerToken = c.CentralServerBearerToken
-	out.Device.CentralServerConfigPath = c.CentralServerConfigPath
 	out.GPIO.RelayOutputMode = normalizeRelayOutputMode(g.RelayOutputMode)
 	out.GPIO.MCP23017I2CBus = g.MCP23017I2CBus
 	out.GPIO.MCP23017I2CAddr = int(g.MCP23017I2CAddr)
@@ -2313,18 +2256,6 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.AccessScheduleApplyToFallbackPin, err = strconv.ParseBool(value)
 	case "access_exception_site_timezone":
 		ctx.Config.AccessExceptionSiteTimezone = value
-	case "rest_api_enabled":
-		ctx.Config.RestAPIEnabled, err = strconv.ParseBool(value)
-	case "rest_api_listen_addr":
-		ctx.Config.RestAPIListenAddr = strings.TrimSpace(value)
-	case "rest_api_token":
-		ctx.Config.RestAPIToken = value
-	case "central_server_base_url":
-		ctx.Config.CentralServerBaseURL = strings.TrimSpace(value)
-	case "central_server_bearer_token":
-		ctx.Config.CentralServerBearerToken = value
-	case "central_server_config_path":
-		ctx.Config.CentralServerConfigPath = strings.TrimSpace(value)
 	default:
 		return fmt.Errorf("unknown key %q (try: cfg keys)", key)
 	}
@@ -2445,12 +2376,6 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   access_schedule_enforce           true|false (default true): when door/elevator id set, enforce access_levels + time windows if DB maps that target
   access_schedule_apply_to_fallback_pin  true|false (default false): subject device.fallback_access_pin to schedules
   access_exception_site_timezone    IANA zone for exception-calendar civil dates (holidays / early close); empty = system local
-  rest_api_enabled                  true|false — HTTP server (REST + /admin); false disables listener
-  rest_api_listen_addr              e.g. :8080 or 127.0.0.1:8765
-  rest_api_token                    Bearer / X-Api-Token for /api/v1/* (empty = API returns 503 until set)
-  central_server_base_url           optional https://host (no trailing slash) for centralized config pull/push
-  central_server_bearer_token       optional Bearer sent to central on pull/push
-  central_server_config_path        path on central for device JSON (default /virtualkeyz2/v1/config)
   relay_output_mode                 gpio|mcp23017|xl9535 (relays on BCM vs I2C expander; sensors/LED stay BCM)
   mcp23017_i2c_bus                  MCP23017: Linux I2C bus (default 1)
   mcp23017_i2c_addr                 MCP23017: 7-bit address, default 32 (0x20)
@@ -2575,9 +2500,6 @@ func main() {
 			AccessScheduleEnforce:            true,
 			KeypadOperationMode:              ModeAccessEntry,
 			KeypadEvdevPath:                  "/dev/input/event1",
-			RestAPIEnabled:                   true,
-			RestAPIListenAddr:                ":8080",
-			CentralServerConfigPath:          "/virtualkeyz2/v1/config",
 		},
 		GPIOSettings: GPIOSettings{
 			RelayOutputMode:      RelayOutputGPIO,
@@ -3063,7 +2985,7 @@ func (c *colorLogWriter) writeColoredLine(line []byte) {
 //	INSERT INTO access_elevator_pin_floor_groups (pin,group_id) VALUES ('123456','grp_public');
 //	INSERT INTO access_elevator_floor_time_rules (elevator_id,floor_index,time_profile_id,action) VALUES ('cab_a',3,'nights','lock');
 
-func accessLevelTargetsTableHasElevatorColumns(db *sql.DB) (bool, error) {
+func accessLevelTargetsTableHasElevatorColumns(db *sqlx.DB) (bool, error) {
 	rows, err := db.Query(`PRAGMA table_info(access_level_targets)`)
 	if err != nil {
 		return false, err
@@ -3089,7 +3011,7 @@ func accessLevelTargetsTableHasElevatorColumns(db *sql.DB) (bool, error) {
 
 // migrateAccessLevelTargetsElevatorSupport rebuilds access_level_targets when upgrading from a schema
 // that only had door targets, so elevator_id / elevator_group_id and the four-way CHECK apply.
-func migrateAccessLevelTargetsElevatorSupport(db *sql.DB) error {
+func migrateAccessLevelTargetsElevatorSupport(db *sqlx.DB) error {
 	ok, err := accessLevelTargetsTableHasElevatorColumns(db)
 	if err != nil || ok {
 		return err
@@ -3132,7 +3054,7 @@ func migrateAccessLevelTargetsElevatorSupport(db *sql.DB) error {
 }
 
 // initAccessScheduleSchema creates tables for named time profiles, user groups, door/elevator groups, and access levels.
-func initAccessScheduleSchema(db *sql.DB) error {
+func initAccessScheduleSchema(db *sqlx.DB) error {
 	if db == nil {
 		return nil
 	}
@@ -3355,7 +3277,7 @@ func timeMatchesProfileWindows(weekday time.Weekday, minuteOfDay int, rows []str
 	return false
 }
 
-func accessScheduleHasTargetsForDoor(db *sql.DB, doorID string) (bool, error) {
+func accessScheduleHasTargetsForDoor(db *sqlx.DB, doorID string) (bool, error) {
 	if db == nil || strings.TrimSpace(doorID) == "" {
 		return false, nil
 	}
@@ -3513,7 +3435,7 @@ func (ctx *AppContext) accessScheduleAllows(pin, doorID string, atTime time.Time
 	return false, "outside_scheduled_hours"
 }
 
-func accessScheduleHasTargetsForElevator(db *sql.DB, elevatorID string) (bool, error) {
+func accessScheduleHasTargetsForElevator(db *sqlx.DB, elevatorID string) (bool, error) {
 	if db == nil || strings.TrimSpace(elevatorID) == "" {
 		return false, nil
 	}
@@ -3686,7 +3608,7 @@ func (ctx *AppContext) effectiveAccessElevatorID() string {
 // loadElevatorPinFloorAllowSet reads per-floor allow list for this PIN and elevator from
 // access_elevator_pin_floors and from access_elevator_pin_floor_groups (union of group members).
 // When hasRows is false, the caller should treat the credential as unrestricted for floors (PIN-only rules).
-func loadElevatorPinFloorAllowSet(db *sql.DB, pin, elevatorID string) (map[int]bool, bool, error) {
+func loadElevatorPinFloorAllowSet(db *sqlx.DB, pin, elevatorID string) (map[int]bool, bool, error) {
 	pin = strings.TrimSpace(pin)
 	elevatorID = strings.TrimSpace(elevatorID)
 	if db == nil || pin == "" || elevatorID == "" {
@@ -3816,7 +3738,7 @@ func (ctx *AppContext) elevatorFloorChannelAllowed(pin, elevatorID string, floor
 }
 
 // elevatorFloorLogLabel returns a short label for logs/webhooks: "name [index N]" or "index N".
-func elevatorFloorLogLabel(db *sql.DB, elevatorID string, floorIndex int) string {
+func elevatorFloorLogLabel(db *sqlx.DB, elevatorID string, floorIndex int) string {
 	elevatorID = strings.TrimSpace(elevatorID)
 	if db == nil || elevatorID == "" || floorIndex < 0 {
 		return fmt.Sprintf("index %d", floorIndex)
@@ -3835,7 +3757,7 @@ func elevatorFloorLogLabel(db *sql.DB, elevatorID string, floorIndex int) string
 	return fmt.Sprintf("%q [index %d]", n, floorIndex)
 }
 
-func elevatorFloorLogLabels(db *sql.DB, elevatorID string, indices []int) []string {
+func elevatorFloorLogLabels(db *sqlx.DB, elevatorID string, indices []int) []string {
 	out := make([]string, 0, len(indices))
 	for _, fi := range indices {
 		out = append(out, elevatorFloorLogLabel(db, elevatorID, fi))
@@ -3868,12 +3790,17 @@ func (ctx *AppContext) elevatorPredefinedDispatchIndexForACL(cfg DeviceConfig) i
 	return idx
 }
 
-func initDatabase() *sql.DB {
+func initDatabase() *sqlx.DB {
 	// Initialize SQLite for storing logs, configs, and access control lists [cite: 6, 7]
-	db, err := sql.Open("sqlite3", "file:./access_control.db?_fk=1&_busy_timeout=5000")
+	db, err := sqlx.Open("sqlite3", "file:./access_control.db?_fk=1&_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		releaseStartupLogBuffer(os.Stdout)
 		log.Fatalf("CRITICAL: Failed to open database: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		log.Printf("WARNING: SQLite PRAGMA journal_mode=WAL: %v", err)
+	} else {
+		log.Println("INFO: SQLite journal_mode=WAL (readers no longer block writers; reduces SQLITE_BUSY vs rollback journal).")
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS access_pins (
 		pin TEXT PRIMARY KEY NOT NULL,
@@ -3924,7 +3851,7 @@ func initDatabase() *sql.DB {
 }
 
 // migrateAccessPinsLifecycle adds visitor/contractor lifecycle columns to access_pins on older databases.
-func migrateAccessPinsLifecycle(db *sql.DB) error {
+func migrateAccessPinsLifecycle(db *sqlx.DB) error {
 	rows, err := db.Query(`PRAGMA table_info(access_pins)`)
 	if err != nil {
 		return err
@@ -3982,8 +3909,6 @@ func (ctx *AppContext) accessCredentialForPIN(pin string) accessPinLookupResult 
 		return accessPinLookupResult{}
 	}
 	if ctx.DB != nil {
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		var lbl sql.NullString
 		var temporary int
 		var expiresAt sql.NullString
@@ -4044,8 +3969,6 @@ func (ctx *AppContext) credentialRecordSuccessfulUse(pin, mode, keypadRole strin
 	if NormalizeKeypadOperationMode(mode) == ModeAccessDualUSBKeypad && strings.TrimSpace(keypadRole) == "exit" {
 		return
 	}
-	aclDBMu.Lock()
-	defer aclDBMu.Unlock()
 	_, err := ctx.DB.Exec(`
 		UPDATE access_pins SET
 			use_count = use_count + 1,
@@ -4585,6 +4508,36 @@ func startHeartbeatAPI(ctx *AppContext) {
 	}
 }
 
+func startWebServer(ctx *AppContext) *http.Server {
+	router := gin.Default()
+
+	// REST API with Token Support & ACL [cite: 7]
+	api := router.Group("/api")
+	api.Use(TokenAuthMiddleware())
+	{
+		api.POST("/remote-control", func(c *gin.Context) {
+			// Trigger GPIO based on remote REST command [cite: 7]
+			c.JSON(http.StatusOK, gin.H{"status": "door_opened"})
+		})
+	}
+
+	// Local Web Interface for Config and Monitoring
+	router.GET("/admin", func(c *gin.Context) {
+		c.String(http.StatusOK, "Local Configuration Interface")
+	})
+
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: router,
+	}
+	go func() {
+		log.Println("INFO: Starting Web Server on port 8080")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("CRITICAL: Web server: %v", err)
+		}
+	}()
+	return srv
+}
 
 func (ctx *AppContext) noteDoorHoldExtraGrace(d time.Duration) {
 	if d < 0 {
@@ -4867,6 +4820,13 @@ func notifyPinDisplay(ctx *AppContext, pin string) {
 	ctx.PinDisplayDigits <- pinDigitCount(pin)
 }
 
+func TokenAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Validates tokens for the REST HTTP API [cite: 7]
+		c.Next()
+	}
+}
+
 // Use evtest in linux to test the capabilities of the keypad.
 // keypadRole is "entry", "exit", or "" for single-keypad modes (used in logs, webhooks, and dual-keypad setups).
 func runKeypadListener(ctx *AppContext, devicePath, keypadRole string) {
@@ -5128,9 +5088,6 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 		okEn = cfg.SoundAccessGrantedEnabled
 	}
 	playSoundSyncEnabled(cfg, okSound, okEn)
-	if modeArmsLightingOnPINAccessGrant(mode) {
-		ctx.lightingEnergizeAndArmTimer("access_grant")
-	}
 	relPulsed := false
 	if ctx.GPIO != nil {
 		ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
@@ -5315,9 +5272,6 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			var occMismatch string
 			if mode == ModeAccessDualUSBKeypad && (keypadRole == "entry" || keypadRole == "exit") {
 				areaTotal, insideThis, occMismatch = ctx.adjustDualKeypadOccupancy(pin, keypadRole)
-				if areaTotal == 0 {
-					ctx.lightingOffOccupancyZero()
-				}
 				log.Printf("INFO: PIN accepted (dual USB %s keypad; credential=%s; people_in_area_total=%d; this_credential_inside=%d); door relay GPIO %d.",
 					keypadRole, credTag, areaTotal, insideThis, doorBCM)
 				if occMismatch != "" {
@@ -5495,9 +5449,6 @@ var techMenuCfgKeysForCompletion = []string{
 	"access_schedule_enforce",
 	"buzzer_relay_active_low",
 	"buzzer_relay_pin",
-	"central_server_base_url",
-	"central_server_bearer_token",
-	"central_server_config_path",
 	"door_forced_after_warnings",
 	"door_open_alarm_interval",
 	"door_open_alarm_max_count",
@@ -5561,9 +5512,6 @@ var techMenuCfgKeysForCompletion = []string{
 	"pin_reject_buzzer_after_attempts",
 	"relay_output_mode",
 	"relay_pulse_duration",
-	"rest_api_enabled",
-	"rest_api_listen_addr",
-	"rest_api_token",
 	"sound_access_granted",
 	"sound_access_granted_enabled",
 	"sound_card_name",
@@ -6262,7 +6210,7 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  door_sensor_closed_is_low: %v\n", c.DoorSensorClosedIsLow)
 	fmt.Fprintf(w, "  relay_pulse_duration: %s\n", c.RelayPulseDuration)
 	fmt.Fprintf(w, "  buzzer_relay_pulse_duration: %s\n", c.BuzzerRelayPulseDuration)
-	fmt.Fprintf(w, "  lighting_timeout: %s (manual lighting button hold; default 30m; occupancy override in access_dual_usb_keypad)\n", c.LightingTimeout)
+	fmt.Fprintf(w, "  lighting_timeout: %s (manual lighting button hold; default 30m; not tied to door or PIN)\n", c.LightingTimeout)
 	fmt.Fprintf(w, "  pin_reject_buzzer_after_attempts: %d\n", c.PinRejectBuzzerAfterAttempts)
 	fmt.Fprintf(w, "  keypad_inter_digit_timeout: %s\n", c.KeypadInterDigitTimeout)
 	fmt.Fprintf(w, "  keypad_session_timeout: %s\n", c.KeypadSessionTimeout)
@@ -6389,21 +6337,6 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 		hbTok = "(set)"
 	}
 	fmt.Fprintf(w, "  webhook_heartbeat_token: %s\n", hbTok)
-	fmt.Fprintf(w, "\n--- HTTP REST API (device management) ---\n")
-	fmt.Fprintf(w, "  rest_api_enabled: %v\n", c.RestAPIEnabled)
-	fmt.Fprintf(w, "  rest_api_listen_addr: %q\n", c.RestAPIListenAddr)
-	rtok := `""`
-	if strings.TrimSpace(c.RestAPIToken) != "" {
-		rtok = "(set)"
-	}
-	fmt.Fprintf(w, "  rest_api_token: %s\n", rtok)
-	fmt.Fprintf(w, "  central_server_base_url: %q\n", c.CentralServerBaseURL)
-	ctok := `""`
-	if strings.TrimSpace(c.CentralServerBearerToken) != "" {
-		ctok = "(set)"
-	}
-	fmt.Fprintf(w, "  central_server_bearer_token: %s\n", ctok)
-	fmt.Fprintf(w, "  central_server_config_path: %q\n", c.CentralServerConfigPath)
 	fmt.Fprintf(w, "\n--- GPIO ---\n")
 	fmt.Fprintf(w, "  relay_output_mode: %s\n", normalizeRelayOutputMode(g.RelayOutputMode))
 	fmt.Fprintf(w, "  mcp23017_i2c_bus: %d\n", g.MCP23017I2CBus)
@@ -7238,7 +7171,7 @@ func lightingRelayOutputReady(ctx *AppContext) bool {
 	return relay != 0
 }
 
-// lightingEnergizeAndArmTimer turns the lighting relay on and (re)starts the auto-off timer. Used for manual button, valid PIN access grant (selected modes), etc.
+// lightingEnergizeAndArmTimer turns the lighting relay on and (re)starts the auto-off timer (manual lighting button only).
 func (ctx *AppContext) lightingEnergizeAndArmTimer(reason string) {
 	if !lightingRelayOutputReady(ctx) {
 		return
@@ -7268,28 +7201,6 @@ func (ctx *AppContext) lightingEnergizeAndArmTimer(reason string) {
 	}
 	log.Printf("INFO: Lighting: relay ON; timer reset (%s) [%s].", timeout, reason)
 	playSoundAsyncEnabled(DeviceConfig{SoundCardName: soundCard}, setPath, setEn)
-}
-
-// lightingOffOccupancyZero de-energizes the lighting relay when access_dual_usb_keypad zone occupancy drops to zero.
-func (ctx *AppContext) lightingOffOccupancyZero() {
-	if ctx.GPIO == nil || !ctx.GPIO.HasOutput("lighting") {
-		return
-	}
-	ctx.configMu.RLock()
-	relay := ctx.GPIOSettings.LightingRelayPin
-	ctx.configMu.RUnlock()
-	if relay == 0 {
-		return
-	}
-	ctx.lightingMu.Lock()
-	ctx.lightingTimerGen++
-	if ctx.lightingOffTimer != nil {
-		ctx.lightingOffTimer.Stop()
-		ctx.lightingOffTimer = nil
-	}
-	ctx.GPIO.ActionOff("lighting")
-	ctx.lightingMu.Unlock()
-	log.Printf("INFO: Lighting: relay OFF (zone person count zero).")
 }
 
 func (ctx *AppContext) lightingTimerExpired(gen uint64) {
@@ -7806,9 +7717,6 @@ func publishMQTTPairPeerPulse(ctx *AppContext, cfg DeviceConfig) {
 	log.Printf("INFO: pair-peer MQTT: published exit-unlock hint to %q", topic)
 }
 
-// aclDBMu serializes interactive ACL mutations against SQLite (avoids SQLITE_BUSY vs audit log inserts).
-var aclDBMu sync.Mutex
-
 func techMenuACLTopLevel() []string {
 	return []string{
 		"bind", "door", "door_group", "elevator", "elevator_group", "exception", "group", "help", "level", "pin", "profile", "summary", "target", "window",
@@ -8042,8 +7950,6 @@ func techMenuACLSummary(ctx *AppContext) {
 			fmt.Fprintln(w, "SQLite: (no database)")
 			return
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		type pair struct {
 			label string
 			table string
@@ -8165,8 +8071,6 @@ func techMenuACLCmdDoor(ctx *AppContext, parts []string) error {
 		if id == "" {
 			return fmt.Errorf("door id must not be empty")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_doors (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
 		if err != nil {
 			return err
@@ -8199,8 +8103,6 @@ func techMenuACLCmdDoorGroup(ctx *AppContext, parts []string) error {
 		if id == "" {
 			return fmt.Errorf("door_group id must not be empty")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_door_groups (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
 		if err != nil {
 			return err
@@ -8235,8 +8137,6 @@ func techMenuACLCmdElevator(ctx *AppContext, parts []string) error {
 		if id == "" {
 			return fmt.Errorf("elevator id must not be empty")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_elevators (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
 		if err != nil {
 			return err
@@ -8269,8 +8169,6 @@ func techMenuACLCmdElevatorGroup(ctx *AppContext, parts []string) error {
 		if id == "" {
 			return fmt.Errorf("elevator_group id must not be empty")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_elevator_groups (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
 		if err != nil {
 			return err
@@ -8320,8 +8218,6 @@ func techMenuACLCmdPinAddTemporary(ctx *AppContext, parts []string) error {
 		labelParts = append(labelParts, tail[i])
 	}
 	label := strings.TrimSpace(strings.Join(labelParts, " "))
-	aclDBMu.Lock()
-	defer aclDBMu.Unlock()
 	var err error
 	if maxUses.Valid {
 		_, err = ctx.DB.Exec(`INSERT OR REPLACE INTO access_pins (pin, label, enabled, temporary, expires_at, max_uses, use_count, door_hold_extra_seconds) VALUES (?, ?, 1, 1, ?, ?, 0, NULL)`,
@@ -8363,8 +8259,6 @@ func techMenuACLCmdPin(ctx *AppContext, parts []string) error {
 		if pin == "" {
 			return fmt.Errorf("pin must not be empty")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_pins (pin, label, enabled, temporary, expires_at, max_uses, use_count, door_hold_extra_seconds) VALUES (?, ?, 1, 0, NULL, NULL, 0, NULL)`, pin, nullIfEmpty(label))
 		if err != nil {
 			return err
@@ -8392,8 +8286,6 @@ func techMenuACLCmdPin(ctx *AppContext, parts []string) error {
 		if sec > int((24*time.Hour)/time.Second) {
 			return fmt.Errorf("extra_seconds too large (max 24h)")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		res, err := ctx.DB.Exec(`UPDATE access_pins SET door_hold_extra_seconds = ? WHERE pin = ?`, sec, pin)
 		if err != nil {
 			return err
@@ -8417,8 +8309,6 @@ func techMenuACLCmdPin(ctx *AppContext, parts []string) error {
 		if verb == "disable" {
 			en = 0
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		res, err := ctx.DB.Exec(`UPDATE access_pins SET enabled = ? WHERE pin = ?`, en, pin)
 		if err != nil {
 			return err
@@ -8442,8 +8332,6 @@ func techMenuACLCmdGroup(ctx *AppContext, parts []string) error {
 	verb := strings.ToLower(parts[2])
 	switch verb {
 	case "list":
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		rows, err := ctx.DB.Query(`SELECT g.id, g.display_name, COUNT(m.pin) FROM access_user_groups g LEFT JOIN access_user_group_members m ON m.group_id = g.id GROUP BY g.id ORDER BY g.id`)
 		if err != nil {
 			return err
@@ -8479,8 +8367,6 @@ func techMenuACLCmdGroup(ctx *AppContext, parts []string) error {
 		if id == "" {
 			return fmt.Errorf("group id must not be empty")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`INSERT OR REPLACE INTO access_user_groups (id, display_name) VALUES (?, ?)`, id, nullIfEmpty(name))
 		if err != nil {
 			return err
@@ -8497,8 +8383,6 @@ func techMenuACLCmdGroup(ctx *AppContext, parts []string) error {
 		if gid == "" || pin == "" {
 			return fmt.Errorf("group_id and pin must not be empty")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		if err := techMenuACLEnsureFK(ctx, "access_user_groups", "id", gid, "user group"); err != nil {
 			return err
 		}
@@ -8518,8 +8402,6 @@ func techMenuACLCmdGroup(ctx *AppContext, parts []string) error {
 		}
 		gid := strings.TrimSpace(parts[3])
 		pin := strings.TrimSpace(parts[4])
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`DELETE FROM access_user_group_members WHERE group_id = ? AND pin = ?`, gid, pin)
 		if err != nil {
 			return err
@@ -8591,8 +8473,6 @@ func techMenuACLCmdProfile(ctx *AppContext, parts []string) error {
 			display = strings.TrimSpace(parts[4])
 			tz = strings.TrimSpace(strings.Join(parts[5:], " "))
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		_, err := ctx.DB.Exec(`
 			INSERT INTO access_time_profiles (id, display_name, description, iana_timezone, respects_exception_calendar)
 			VALUES (?, ?, ?, ?, 1)
@@ -8628,8 +8508,6 @@ func techMenuACLCmdProfile(ctx *AppContext, parts []string) error {
 		default:
 			return fmt.Errorf("respects_exceptions: want on or off")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		if err := techMenuACLEnsureFK(ctx, "access_time_profiles", "id", pid, "time profile"); err != nil {
 			return err
 		}
@@ -8672,8 +8550,6 @@ hint: acl profile list — use existing profile_id`)
 	if wd < 0 || wd > 7 || sm < 0 || sm > 1439 || em < 0 || em > 1439 {
 		return fmt.Errorf("weekday must be 0–7, minutes 0–1439")
 	}
-	aclDBMu.Lock()
-	defer aclDBMu.Unlock()
 	if err := techMenuACLEnsureFK(ctx, "access_time_profiles", "id", pid, "time profile"); err != nil {
 		return err
 	}
@@ -8695,8 +8571,6 @@ func techMenuACLCmdLevel(ctx *AppContext, parts []string) error {
 	verb := strings.ToLower(parts[2])
 	switch verb {
 	case "list":
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		rows, err := ctx.DB.Query(`SELECT id, display_name, time_profile_id, user_group_id, enabled FROM access_levels ORDER BY id`)
 		if err != nil {
 			return err
@@ -8731,8 +8605,6 @@ hint: acl profile list | acl group list`)
 		if lid == "" || tpid == "" || ugid == "" {
 			return fmt.Errorf("level_id, time_profile_id, and user_group_id must not be empty")
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		if err := techMenuACLEnsureFK(ctx, "access_time_profiles", "id", tpid, "time profile"); err != nil {
 			return err
 		}
@@ -8758,8 +8630,6 @@ hint: acl profile list | acl group list`)
 		if verb == "disable" {
 			en = 0
 		}
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		res, err := ctx.DB.Exec(`UPDATE access_levels SET enabled = ? WHERE id = ?`, en, lid)
 		if err != nil {
 			return err
@@ -8782,8 +8652,6 @@ func techMenuACLCmdTarget(ctx *AppContext, parts []string) error {
 	}
 	verb := strings.ToLower(parts[2])
 	if verb == "list" {
-		aclDBMu.Lock()
-		defer aclDBMu.Unlock()
 		rows, err := ctx.DB.Query(`
 			SELECT t.id, t.access_level_id, t.door_id, t.door_group_id, t.elevator_id, t.elevator_group_id
 			FROM access_level_targets t ORDER BY t.access_level_id, t.id`)
@@ -8815,8 +8683,6 @@ func techMenuACLCmdTarget(ctx *AppContext, parts []string) error {
 	if lid == "" || tid == "" {
 		return fmt.Errorf("level_id and target id must not be empty")
 	}
-	aclDBMu.Lock()
-	defer aclDBMu.Unlock()
 	if err := techMenuACLEnsureFK(ctx, "access_levels", "id", lid, "access level"); err != nil {
 		return err
 	}
@@ -8866,8 +8732,6 @@ func techMenuACLQueryStrings(ctx *AppContext, table string, cols ...string) erro
 	if len(cols) == 0 {
 		return fmt.Errorf("internal: no columns")
 	}
-	aclDBMu.Lock()
-	defer aclDBMu.Unlock()
 	sb := strings.Builder{}
 	for i, c := range cols {
 		if i > 0 {

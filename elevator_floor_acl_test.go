@@ -1,16 +1,16 @@
 package main
 
 import (
-	"database/sql"
 	"testing"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-func testAccessDB(t *testing.T) *sql.DB {
+func testAccessDB(t *testing.T) *sqlx.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite3", "file:acltest?mode=memory&cache=shared&_fk=1")
+	db, err := sqlx.Open("sqlite3", "file:acltest?mode=memory&cache=shared&_fk=1")
 	if err != nil {
 		t.Fatal(err)
 	}
