@@ -46,8 +46,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.09"
-	SoftwareReleaseUTC = "2026-04-18T04:56:49Z"
+	SoftwareVersion    = "0.10"
+	SoftwareReleaseUTC = "2026-04-18T05:23:23Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -225,6 +225,10 @@ type GPIOSettings struct {
 	// LightingRelayPin: lighting controller relay (BCM or expander 0–15 per relay_output_mode). 0 = disabled.
 	LightingRelayPin       uint8
 	LightingRelayActiveLow bool
+	// FiremansServiceInputPin: BCM maintained input for fireman's / emergency bypass (0 = not used; use MQTT or technician menu only).
+	// When firemans_service_active_low is true, emergency is active while the contact reads low (typical pull-up to open, switch to GND when asserted).
+	FiremansServiceInputPin uint8
+	FiremansServiceActiveLow bool
 }
 
 // AppContext holds our global connections and configurations
@@ -283,6 +287,11 @@ type AppContext struct {
 	lightingMu       sync.Mutex
 	lightingTimerGen uint64
 	lightingOffTimer *time.Timer
+
+	// Fireman's service / emergency bypass (fail-safe): when active, all relay outputs are held off, lighting relay held on (if configured),
+	// access schedules and elevator floor rules are bypassed for valid credentials, and elevator software does not energize hoist relays.
+	firemansMu      sync.RWMutex
+	firemansActive  bool
 }
 
 // logEmitMinSeverity: emit log lines whose severity is >= this (0=DEBUG all, 1=INFO+, 2=WARNING+, 3=ERROR+, 4=CRITICAL only).
@@ -468,6 +477,14 @@ type DeviceConfig struct {
 	AccessExceptionSiteTimezone string
 	// LightingTimeout: lighting relay hold after manual button or accepted PIN; each new press or PIN restarts the full timer without toggling the relay off until expiry. Clamped in normalizeKeypadAndPinUX.
 	LightingTimeout time.Duration
+
+	// FiremansServiceEnabled: when true, fireman's service (emergency bypass) may be triggered by GPIO, MQTT, or technician menu.
+	FiremansServiceEnabled bool
+	// SoundFiremansActivated / SoundFiremansDeactivated: optional WAV announcements when emergency bypass is turned on or off.
+	SoundFiremansActivated   string
+	SoundFiremansDeactivated string
+	SoundFiremansActivatedEnabled   bool
+	SoundFiremansDeactivatedEnabled bool
 }
 
 // virtualkeyz2JSON is the on-disk shape of virtualkeyz2.json (see default file in repo).
@@ -557,6 +574,11 @@ type virtualkeyz2DeviceJSON struct {
 	AccessScheduleApplyToFallbackPin    *bool                   `json:"access_schedule_apply_to_fallback_pin,omitempty"`
 	AccessExceptionSiteTimezone         *string                 `json:"access_exception_site_timezone,omitempty"`
 	LightingTimeout                     *string                 `json:"lighting_timeout,omitempty"`
+	FiremansServiceEnabled              *bool                   `json:"firemans_service_enabled,omitempty"`
+	SoundFiremansActivated              *string                 `json:"sound_firemans_activated,omitempty"`
+	SoundFiremansDeactivated            *string                 `json:"sound_firemans_deactivated,omitempty"`
+	SoundFiremansActivatedEnabled       *bool                   `json:"sound_firemans_activated_enabled,omitempty"`
+	SoundFiremansDeactivatedEnabled     *bool                   `json:"sound_firemans_deactivated_enabled,omitempty"`
 }
 
 type virtualkeyz2GPIOJSON struct {
@@ -586,6 +608,8 @@ type virtualkeyz2GPIOJSON struct {
 	LightingButtonActiveLow      *bool   `json:"lighting_button_active_low"`
 	LightingRelayPin             *int    `json:"lighting_relay_pin"`
 	LightingRelayActiveLow       *bool   `json:"lighting_relay_active_low"`
+	FiremansServiceInputPin      *int    `json:"firemans_service_input_pin,omitempty"`
+	FiremansServiceActiveLow     *bool   `json:"firemans_service_active_low,omitempty"`
 }
 
 func bcmUint8(field string, v int) (uint8, error) {
@@ -1256,6 +1280,21 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if err := applyJSONDuration(&app.Config.LightingTimeout, "device", "lighting_timeout", d.LightingTimeout); err != nil {
 		return err
 	}
+	if d.FiremansServiceEnabled != nil {
+		app.Config.FiremansServiceEnabled = *d.FiremansServiceEnabled
+	}
+	if d.SoundFiremansActivated != nil {
+		app.Config.SoundFiremansActivated = strings.TrimSpace(*d.SoundFiremansActivated)
+	}
+	if d.SoundFiremansDeactivated != nil {
+		app.Config.SoundFiremansDeactivated = strings.TrimSpace(*d.SoundFiremansDeactivated)
+	}
+	if d.SoundFiremansActivatedEnabled != nil {
+		app.Config.SoundFiremansActivatedEnabled = *d.SoundFiremansActivatedEnabled
+	}
+	if d.SoundFiremansDeactivatedEnabled != nil {
+		app.Config.SoundFiremansDeactivatedEnabled = *d.SoundFiremansDeactivatedEnabled
+	}
 	g := &raw.GPIO
 	if g.RelayOutputMode != nil {
 		app.GPIOSettings.RelayOutputMode = strings.TrimSpace(*g.RelayOutputMode)
@@ -1356,6 +1395,16 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if g.LightingRelayActiveLow != nil {
 		app.GPIOSettings.LightingRelayActiveLow = *g.LightingRelayActiveLow
+	}
+	if g.FiremansServiceInputPin != nil {
+		u, err := bcmUint8("firemans_service_input_pin", *g.FiremansServiceInputPin)
+		if err != nil {
+			return err
+		}
+		app.GPIOSettings.FiremansServiceInputPin = u
+	}
+	if g.FiremansServiceActiveLow != nil {
+		app.GPIOSettings.FiremansServiceActiveLow = *g.FiremansServiceActiveLow
 	}
 	if g.ElevatorDispatchRelayPin != nil {
 		u, err := relayPinUint8("elevator_dispatch_relay_pin", *g.ElevatorDispatchRelayPin, relayMode)
@@ -1493,6 +1542,11 @@ type virtualkeyz2PersistDevice struct {
 	SoundLightingTimerSetEnabled        bool                   `json:"sound_lighting_timer_set_enabled"`
 	SoundLightingTimerExpiredEnabled    bool                   `json:"sound_lighting_timer_expired_enabled"`
 	SoundDoorOpenEnabled                bool                   `json:"sound_door_open_enabled"`
+	SoundFiremansActivated              string                 `json:"sound_firemans_activated"`
+	SoundFiremansDeactivated            string                 `json:"sound_firemans_deactivated"`
+	SoundFiremansActivatedEnabled       bool                   `json:"sound_firemans_activated_enabled"`
+	SoundFiremansDeactivatedEnabled     bool                   `json:"sound_firemans_deactivated_enabled"`
+	FiremansServiceEnabled              bool                   `json:"firemans_service_enabled"`
 	LogLevel                            string                 `json:"log_level"`
 	PinLength                           int                    `json:"pin_length"`
 	RelayPulseDuration                  string                 `json:"relay_pulse_duration"`
@@ -1575,6 +1629,8 @@ type virtualkeyz2PersistGPIO struct {
 	LightingButtonActiveLow      bool   `json:"lighting_button_active_low"`
 	LightingRelayPin             int    `json:"lighting_relay_pin"`
 	LightingRelayActiveLow       bool   `json:"lighting_relay_active_low"`
+	FiremansServiceInputPin      int    `json:"firemans_service_input_pin"`
+	FiremansServiceActiveLow     bool   `json:"firemans_service_active_low"`
 }
 
 func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
@@ -1609,6 +1665,11 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.SoundLightingTimerSetEnabled = c.SoundLightingTimerSetEnabled
 	out.Device.SoundLightingTimerExpiredEnabled = c.SoundLightingTimerExpiredEnabled
 	out.Device.SoundDoorOpenEnabled = c.SoundDoorOpenEnabled
+	out.Device.SoundFiremansActivated = c.SoundFiremansActivated
+	out.Device.SoundFiremansDeactivated = c.SoundFiremansDeactivated
+	out.Device.SoundFiremansActivatedEnabled = c.SoundFiremansActivatedEnabled
+	out.Device.SoundFiremansDeactivatedEnabled = c.SoundFiremansDeactivatedEnabled
+	out.Device.FiremansServiceEnabled = c.FiremansServiceEnabled
 	out.Device.LogLevel = c.LogLevel
 	out.Device.PinLength = c.PinLength
 	out.Device.RelayPulseDuration = c.RelayPulseDuration.String()
@@ -1698,6 +1759,8 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.GPIO.LightingButtonActiveLow = g.LightingButtonActiveLow
 	out.GPIO.LightingRelayPin = int(g.LightingRelayPin)
 	out.GPIO.LightingRelayActiveLow = g.LightingRelayActiveLow
+	out.GPIO.FiremansServiceInputPin = int(g.FiremansServiceInputPin)
+	out.GPIO.FiremansServiceActiveLow = g.FiremansServiceActiveLow
 	if len(app.elevatorParameterModesDoc) > 0 {
 		out.ElevatorParameterModes = app.elevatorParameterModesDoc
 	}
@@ -1814,6 +1877,7 @@ func reloadVirtualKeyz2ConfigLive(ctx *AppContext) error {
 	log.Println("INFO: Configuration reloaded from disk (MQTT reconnecting; GPIO / relay_output_mode changes need a full restart).")
 	ctx.reconnectMQTT()
 	ctx.techHistoryTrimToMax()
+	ctx.syncFiremansServiceAfterConfigReload()
 	return nil
 }
 
@@ -1835,6 +1899,59 @@ func applyInMemoryConfigLive(ctx *AppContext) {
 	syncLogFilterFromConfigLevel(lvl)
 	log.Println("INFO: In-memory configuration applied live (MQTT reconnect; GPIO pin map unchanged until reboot).")
 	ctx.reconnectMQTT()
+	ctx.syncFiremansServiceAfterConfigReload()
+}
+
+// restartCurrentProgram replaces this OS process with a new instance of the same executable, preserving
+// os.Args[1:] and the environment. On success it does not return. Use after cfg reload when GPIO or other
+// hardware must be reopened from a clean process (live reload does not re-run GPIO setup).
+func restartCurrentProgram() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("os.Executable: %w", err)
+	}
+	argv := make([]string, 0, len(os.Args))
+	argv = append(argv, exe)
+	argv = append(argv, os.Args[1:]...)
+	return syscall.Exec(exe, argv, os.Environ())
+}
+
+func techMenuHandleFiremans(ctx *AppContext, parts []string) {
+	if len(parts) < 2 {
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintln(w, "Fireman's service (emergency bypass):")
+			fmt.Fprintln(w, "  firemans on|off|status")
+			fmt.Fprintln(w, "Requires device.firemans_service_enabled true (JSON or cfg set). GPIO optional: gpio.firemans_service_input_pin.")
+		})
+		return
+	}
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	ctx.configMu.RLock()
+	en := ctx.Config.FiremansServiceEnabled
+	ctx.configMu.RUnlock()
+	switch sub {
+	case "on", "1", "true", "activate":
+		if !en {
+			techMenuSyncPrint(func(w io.Writer) { fmt.Fprintln(w, "firemans_service_enabled is false — enable in JSON or: cfg set firemans_service_enabled true") })
+			log.Println("WARNING: Technician menu: firemans on ignored (feature disabled in configuration).")
+			return
+		}
+		ctx.applyFiremansServiceTransition(true, "tech_menu")
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintln(w, "Fireman's service set ON (see logs / DEBUG for relay actions).") })
+		log.Println("INFO: Technician menu: fireman's service ON.")
+	case "off", "0", "false", "deactivate":
+		ctx.applyFiremansServiceTransition(false, "tech_menu")
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintln(w, "Fireman's service set OFF.") })
+		log.Println("INFO: Technician menu: fireman's service OFF.")
+	case "status", "stat", "?":
+		active := ctx.FiremansServiceActive()
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintf(w, "firemans_service_enabled=%v  runtime_active=%v\n", en, active)
+		})
+		log.Printf("INFO: Technician menu: fireman's service status enabled=%v active=%v", en, active)
+	default:
+		techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "Unknown firemans subcommand %q (use on|off|status).\n", parts[1]) })
+	}
 }
 
 func techMenuHandleCfg(ctx *AppContext, line string, parts []string) {
@@ -1864,6 +1981,17 @@ func techMenuHandleCfg(ctx *AppContext, line string, parts []string) {
 			techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "cfg reload failed: %v\n", err) })
 		} else {
 			techMenuSyncPrint(func(w io.Writer) { fmt.Fprintln(w, "Reloaded from disk and applied live.") })
+		}
+	case "restart", "reboot":
+		log.Println("INFO: Technician menu: cfg restart — replacing process (same binary and arguments; GPIO re-inits on next run).")
+		techMenuSyncPrint(func(w io.Writer) {
+			fmt.Fprintln(w, "Restarting: this process will be replaced by exec (no graceful HTTP shutdown).")
+		})
+		disableTechBottomTerminalLayout()
+		terminalHardReset()
+		if err := restartCurrentProgram(); err != nil {
+			log.Printf("CRITICAL: cfg restart: %v", err)
+			techMenuSyncPrint(func(w io.Writer) { fmt.Fprintf(w, "cfg restart failed: %v\n", err) })
 		}
 	case "apply", "live":
 		applyInMemoryConfigLive(ctx)
@@ -2256,6 +2384,24 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.AccessScheduleApplyToFallbackPin, err = strconv.ParseBool(value)
 	case "access_exception_site_timezone":
 		ctx.Config.AccessExceptionSiteTimezone = value
+	case "firemans_service_enabled":
+		ctx.Config.FiremansServiceEnabled, err = strconv.ParseBool(value)
+	case "sound_firemans_activated":
+		ctx.Config.SoundFiremansActivated = value
+	case "sound_firemans_deactivated":
+		ctx.Config.SoundFiremansDeactivated = value
+	case "sound_firemans_activated_enabled":
+		ctx.Config.SoundFiremansActivatedEnabled, err = strconv.ParseBool(value)
+	case "sound_firemans_deactivated_enabled":
+		ctx.Config.SoundFiremansDeactivatedEnabled, err = strconv.ParseBool(value)
+	case "firemans_service_input_pin":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.GPIOSettings.FiremansServiceInputPin, err = bcmUint8("firemans_service_input_pin", int(n))
+		}
+	case "firemans_service_active_low":
+		ctx.GPIOSettings.FiremansServiceActiveLow, err = strconv.ParseBool(value)
 	default:
 		return fmt.Errorf("unknown key %q (try: cfg keys)", key)
 	}
@@ -2330,6 +2476,11 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   sound_lighting_timer_set_enabled  true|false
   sound_lighting_timer_expired_enabled true|false
   sound_door_open_enabled           true|false
+  firemans_service_enabled          true|false — master enable for fireman's / emergency bypass (GPIO, MQTT, or menu)
+  sound_firemans_activated          WAV when emergency bypass turns ON
+  sound_firemans_deactivated        WAV when emergency bypass turns OFF
+  sound_firemans_activated_enabled  true|false
+  sound_firemans_deactivated_enabled true|false
   mqtt_enabled                      true|false
   mqtt_broker
   mqtt_client_id
@@ -2389,6 +2540,8 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   lighting_button_active_low        true|false
   lighting_relay_pin                lighting controller relay (BCM or expander 0–15; 0=disabled)
   lighting_relay_active_low         true|false
+  firemans_service_input_pin        BCM maintained fireman's / emergency input (0=disabled; use MQTT/menu only)
+  firemans_service_active_low       true = emergency active when pin reads low (pull-up wiring)
   elevator_dispatch_relay_pin       0 = use door relay when elevator_floor_dispatch_pins empty
   elevator_dispatch_active_low      true|false
   elevator_floor_dispatch_pins      wait-floor+cab sense: one per elevator_floor_input_pins. wait-floor+cab ignore: one per wait-floor enable channel. predefined: optional single dispatch when no cab inputs (or use elevator_dispatch_relay_pin)
@@ -2411,6 +2564,7 @@ Commands:
   cfg set <key> <value>             change in memory
   cfg save                          write JSON (-config path)
   cfg reload                        load JSON + live apply
+  cfg restart                       replace process via exec (same argv/env; re-inits GPIO — use after pin map changes)
   cfg history clear                 clear command history
 `)
 }
@@ -2605,8 +2759,13 @@ func main() {
 			}
 		}
 		setupOperationModeGPIOInputs(appCtx, gpio)
+		setupFiremansServiceGPIOInput(appCtx, gpio)
 		appCtx.GPIO = gpio
 		go gpio.StartListening()
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			appCtx.syncFiremansServiceFromHardwareReason("startup")
+		}()
 	}
 
 	// 5. Initialize MQTT for Centralized Remote Control [cite: 6, 7]
@@ -3315,6 +3474,9 @@ func (ctx *AppContext) accessScheduleAllows(pin, doorID string, atTime time.Time
 	if ctx.DB == nil || doorID == "" || !enforce {
 		return true, ""
 	}
+	if ctx.FiremansServiceActive() {
+		return true, ""
+	}
 	if viaFallback && !applyFallback {
 		return true, ""
 	}
@@ -3471,6 +3633,9 @@ func (ctx *AppContext) accessScheduleAllowsElevator(pin, elevatorID string, atTi
 	ctx.configMu.RUnlock()
 
 	if ctx.DB == nil || elevatorID == "" || !enforce {
+		return true, ""
+	}
+	if ctx.FiremansServiceActive() {
 		return true, ""
 	}
 	if viaFallback && !applyFallback {
@@ -3724,6 +3889,9 @@ func (ctx *AppContext) elevatorFloorTimedPolicy(elevatorID string, floorIndex in
 func (ctx *AppContext) elevatorFloorChannelAllowed(pin, elevatorID string, floorIndex int, viaFallback bool, at time.Time) bool {
 	pin = strings.TrimSpace(pin)
 	elevatorID = strings.TrimSpace(elevatorID)
+	if ctx.FiremansServiceActive() {
+		return true
+	}
 	if ctx.DB == nil || elevatorID == "" || floorIndex < 0 {
 		return true
 	}
@@ -4279,6 +4447,12 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 	switch cmdLower {
 	case "open_door", "door_open", "unlock":
 		log.Printf("INFO: MQTT remote: open door (topic=%s)", topic)
+		if ctx.FiremansServiceActive() {
+			log.Printf("DEBUG: Fireman's service: MQTT door open ignored (all access relays held off).")
+			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_active", Detail: "door relay not pulsed during emergency bypass"})
+			fireEventWebhook(ctx, "mqtt_remote_door_open_denied", map[string]any{"mqtt_topic": topic, "reason": "firemans_service_active"})
+			return
+		}
 		playSoundAsyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 		if ctx.GPIO != nil {
 			ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
@@ -4289,8 +4463,33 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 			log.Println("WARNING: MQTT open_door: GPIO unavailable.")
 		}
 
+	case "firemans_service_on", "firemans_on", "emergency_bypass_on":
+		if !cfg.FiremansServiceEnabled {
+			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_disabled_in_config"})
+			return
+		}
+		log.Printf("INFO: MQTT remote: fireman's service ON (topic=%s)", topic)
+		ctx.applyFiremansServiceTransition(true, "mqtt:"+cmdLower)
+		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "firemans_service_activated"})
+	case "firemans_service_off", "firemans_off", "emergency_bypass_off":
+		if !cfg.FiremansServiceEnabled {
+			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_disabled_in_config"})
+			return
+		}
+		log.Printf("INFO: MQTT remote: fireman's service OFF (topic=%s)", topic)
+		ctx.applyFiremansServiceTransition(false, "mqtt:"+cmdLower)
+		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "firemans_service_deactivated"})
+	case "firemans_service_status", "firemans_status":
+		active := ctx.FiremansServiceActive()
+		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: fmt.Sprintf("firemans_service_active=%v", active)})
+
 	case "buzzer", "buzz", "alarm":
 		log.Printf("INFO: MQTT remote: buzzer (topic=%s)", topic)
+		if ctx.FiremansServiceActive() {
+			log.Printf("DEBUG: Fireman's service: MQTT buzzer ignored (buzzer relay held off).")
+			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_active"})
+			return
+		}
 		if ctx.GPIO != nil {
 			ctx.GPIO.ActionPulse("buzzer", cfg.BuzzerRelayPulseDuration)
 			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "buzzer relay pulsed"})
@@ -5050,6 +5249,10 @@ func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, 
 	ctx.configMu.RUnlock()
 	buzzFire := buzzTh > 0 && failCount >= buzzTh && failCount%buzzTh == 0
 	lockFire := lockOn && lockN > 0 && failCount >= lockN
+	if buzzFire && ctx.FiremansServiceActive() {
+		log.Printf("DEBUG: Fireman's service: wrong-PIN buzzer suppressed (buzzer relay held off).")
+		buzzFire = false
+	}
 	if buzzFire {
 		log.Printf("INFO: Wrong PIN count %d; pulsing buzzer relay (GPIO %d).", failCount, buzzerBCM)
 		fireEventWebhook(ctx, "wrong_pin_buzzer", map[string]any{"wrong_pin_streak": failCount, "buzzer_relay_gpio": int(buzzerBCM)})
@@ -5089,13 +5292,15 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 	}
 	playSoundSyncEnabled(cfg, okSound, okEn)
 	relPulsed := false
-	if ctx.GPIO != nil {
+	if ctx.FiremansServiceActive() {
+		log.Printf("DEBUG: Fireman's service: grant path — door relay pulse suppressed; PIN lighting timer skipped (emergency lighting policy).")
+	} else if ctx.GPIO != nil {
 		ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
 		relPulsed = true
 	} else {
 		log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
 	}
-	if strings.TrimSpace(pin) != "" {
+	if strings.TrimSpace(pin) != "" && !ctx.FiremansServiceActive() {
 		ctx.lightingEnergizeAndArmTimer(fmt.Sprintf("pin_accepted_%s", strings.TrimSpace(keypadRole)))
 	}
 	if pairedEntryPublishesToPeer(mode, cfg.PairPeerRole) {
@@ -5107,6 +5312,9 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 		"credential_label": credLabel,
 		"door_relay_gpio":  int(doorBCM),
 		"relay_pulsed":     relPulsed,
+	}
+	if ctx.FiremansServiceActive() {
+		wh["firemans_service"] = true
 	}
 	for k, v := range whExtra {
 		wh[k] = v
@@ -5145,7 +5353,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		return
 	}
 
-	if ctx.keypadLockoutActive() {
+	if ctx.keypadLockoutActive() && !ctx.FiremansServiceActive() {
 		log.Printf("INFO: PIN rejected (keypad lockout; %s keypad).", keypadLogTag(keypadRole))
 		fireEventWebhook(ctx, "pin_rejected", map[string]any{"reason": "keypad_lockout", "keypad_role": keypadRole})
 		playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
@@ -5166,7 +5374,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 	pinOK := cred.OK
 	credLabel := cred.Label
 	modePre := NormalizeKeypadOperationMode(cfg.KeypadOperationMode)
-	if pinOK && modePre == ModeAccessDualUSBKeypad && keypadRole == "exit" && cfg.DualKeypadRejectExitWithoutEntry && ctx.dualKeypadExitWouldMismatch(pin) {
+	if pinOK && modePre == ModeAccessDualUSBKeypad && keypadRole == "exit" && cfg.DualKeypadRejectExitWithoutEntry && !ctx.FiremansServiceActive() && ctx.dualKeypadExitWouldMismatch(pin) {
 		log.Printf("INFO: PIN rejected (exit keypad; no recorded entry for this credential; door not opened).")
 		ex := map[string]any{}
 		if credLabel != "" {
@@ -5215,6 +5423,22 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		switch mode {
 		case ModeElevatorWaitFloorButtons:
 			cabSense := normalizeElevatorWaitFloorCabSense(cfg.ElevatorWaitFloorCabSense)
+			if ctx.FiremansServiceActive() {
+				log.Printf("INFO: PIN accepted (elevator wait-floor; fireman's service; %s keypad; credential=%s); software enable/dispatch relays not used (cab_sense=%s).", kTag, credTag, cabSense)
+				log.Printf("DEBUG: Fireman's service: elevator_wait_floor_buttons — skipping enable relay window and floor selection handler state.")
+				playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+				fireEventWebhook(ctx, "pin_accepted", map[string]any{
+					"operation_mode":                mode,
+					"keypad_role":                   keypadRole,
+					"credential_label":              credLabel,
+					"elevator_phase":                "firemans_bypass_no_relay",
+					"elevator_wait_floor_cab_sense": cabSense,
+					"door_relay_gpio":               int(doorBCM),
+					"firemans_service":              true,
+				})
+				time.Sleep(feedbackDelay)
+				return
+			}
 			ctx.elevatorMu.Lock()
 			ctx.elevatorGrantPIN = pin
 			ctx.elevatorGrantViaFallback = cred.ViaFallback
@@ -5480,6 +5704,9 @@ var techMenuCfgKeysForCompletion = []string{
 	"exit_button_active_low",
 	"exit_button_pin",
 	"fallback_access_pin",
+	"firemans_service_active_low",
+	"firemans_service_enabled",
+	"firemans_service_input_pin",
 	"heartbeat_interval",
 	"heartbeat_led_pin",
 	"keypad_evdev_path",
@@ -5520,6 +5747,10 @@ var techMenuCfgKeysForCompletion = []string{
 	"sound_card_name",
 	"sound_door_open",
 	"sound_door_open_enabled",
+	"sound_firemans_activated",
+	"sound_firemans_activated_enabled",
+	"sound_firemans_deactivated",
+	"sound_firemans_deactivated_enabled",
 	"sound_keypress",
 	"sound_keypress_enabled",
 	"sound_lighting_timer_expired",
@@ -5555,6 +5786,7 @@ func techMenuRootCommands() []string {
 		"acl",
 		"c", "cfg", "ch", "clear", "cls",
 		"exit",
+		"firemans", "fireman", "fs",
 		"h", "help", "i", "kb", "kbd", "keypads",
 		"m", "menu", "occ", "p", "q", "quit",
 		"v", "z",
@@ -5565,7 +5797,7 @@ func techMenuRootCommands() []string {
 func techMenuCfgSubcommands() []string {
 	return []string{
 		"apply", "help", "history", "keys", "list", "live",
-		"reread", "reload", "save", "set", "show", "write",
+		"reboot", "reread", "reload", "restart", "save", "set", "show", "write",
 	}
 }
 
@@ -5909,6 +6141,8 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
   cfg apply     Live apply in-memory (log filter, prompt, MQTT reconnect)
   cfg save      Write virtualkeyz2.json (-config path)
   cfg reload    Read JSON from disk + live apply
+  cfg restart   Exec same binary (GPIO re-init); use after reload when gpio.* changed
+  firemans on|off|status   Fireman's service / emergency bypass (needs firemans_service_enabled)
  -------------------------------------------------------------------------------
   ... Quit Program (Shutdown)
  -------------------------------------------------------------------------------
@@ -5947,6 +6181,13 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
 		}
 
 		parts := strings.Fields(line)
+		if len(parts) > 0 {
+			switch strings.ToLower(parts[0]) {
+			case "firemans", "fireman", "fs":
+				techMenuHandleFiremans(ctx, parts)
+				continue
+			}
+		}
 		if len(parts) > 0 && strings.EqualFold(parts[0], "cfg") {
 			techMenuHandleCfg(ctx, line, parts)
 			continue
@@ -6292,6 +6533,12 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  sound_lighting_timer_set_enabled: %v\n", c.SoundLightingTimerSetEnabled)
 	fmt.Fprintf(w, "  sound_lighting_timer_expired_enabled: %v\n", c.SoundLightingTimerExpiredEnabled)
 	fmt.Fprintf(w, "  sound_door_open_enabled: %v\n", c.SoundDoorOpenEnabled)
+	fmt.Fprintf(w, "  firemans_service_enabled: %v\n", c.FiremansServiceEnabled)
+	fmt.Fprintf(w, "  sound_firemans_activated: %q\n", c.SoundFiremansActivated)
+	fmt.Fprintf(w, "  sound_firemans_deactivated: %q\n", c.SoundFiremansDeactivated)
+	fmt.Fprintf(w, "  sound_firemans_activated_enabled: %v\n", c.SoundFiremansActivatedEnabled)
+	fmt.Fprintf(w, "  sound_firemans_deactivated_enabled: %v\n", c.SoundFiremansDeactivatedEnabled)
+	fmt.Fprintf(w, "  firemans_service_runtime_active: %v\n", ctx.FiremansServiceActive())
 	fmt.Fprintf(w, "\n--- MQTT ---\n")
 	fmt.Fprintf(w, "  mqtt_enabled: %v\n", c.MQTTEnabled)
 	fmt.Fprintf(w, "  mqtt_broker: %q\n", c.MQTTBroker)
@@ -6360,6 +6607,8 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  lighting_button_active_low: %v\n", g.LightingButtonActiveLow)
 	fmt.Fprintf(w, "  lighting_relay_pin: %d\n", g.LightingRelayPin)
 	fmt.Fprintf(w, "  lighting_relay_active_low: %v\n", g.LightingRelayActiveLow)
+	fmt.Fprintf(w, "  firemans_service_input_pin: %d (0=not used)\n", g.FiremansServiceInputPin)
+	fmt.Fprintf(w, "  firemans_service_active_low: %v\n", g.FiremansServiceActiveLow)
 	fmt.Fprintf(w, "  elevator_dispatch_relay_pin: %d\n", g.ElevatorDispatchRelayPin)
 	fmt.Fprintf(w, "  elevator_dispatch_active_low: %v\n", g.ElevatorDispatchActiveLow)
 	fmt.Fprintf(w, "  elevator_enable_relay_pin: %d\n", g.ElevatorEnableRelayPin)
@@ -6883,6 +7132,7 @@ type InputConfig struct {
 	PinNumber    uint8
 	PullUp       bool          // Enable internal pull-up resistor
 	DebounceTime time.Duration // Time to ignore subsequent triggers
+	AnyEdge      bool // When true, both rising and falling edges are detected (maintained switches).
 	Pin          rpio.Pin
 	Action       func()    // The function to call when triggered
 	lastTrigger  time.Time // Used for debouncing
@@ -7010,23 +7260,41 @@ func (m *GPIOManager) AddOutput(name string, pin uint8, activeLow bool, useI2CRe
 	m.ActionOff(name)
 }
 
-// AddInput registers a new input pin and its callback function
+// AddInput registers a new input pin and its callback function (single edge: fall if pull-up, rise if pull-down).
 func (m *GPIOManager) AddInput(name string, pin uint8, pullUp bool, action func()) {
+	m.addInputEdge(name, pin, pullUp, false, action)
+}
+
+// AddInputAnyEdge registers an input that fires on both edges (debounced); use for maintained contacts.
+func (m *GPIOManager) AddInputAnyEdge(name string, pin uint8, pullUp bool, action func()) {
+	m.addInputEdge(name, pin, pullUp, true, action)
+}
+
+func (m *GPIOManager) addInputEdge(name string, pin uint8, pullUp bool, anyEdge bool, action func()) {
 	p := rpio.Pin(pin)
 	p.Input()
 
 	if pullUp {
 		p.PullUp()
-		p.Detect(rpio.FallEdge) // Detect when pulled to ground
+		if anyEdge {
+			p.Detect(rpio.AnyEdge)
+		} else {
+			p.Detect(rpio.FallEdge) // Detect when pulled to ground
+		}
 	} else {
 		p.PullDown()
-		p.Detect(rpio.RiseEdge) // Detect when voltage is applied
+		if anyEdge {
+			p.Detect(rpio.AnyEdge)
+		} else {
+			p.Detect(rpio.RiseEdge) // Detect when voltage is applied
+		}
 	}
 
 	m.Inputs[name] = &InputConfig{
 		PinNumber:    pin,
 		PullUp:       pullUp,
 		DebounceTime: 300 * time.Millisecond,
+		AnyEdge:      anyEdge,
 		Pin:          p,
 		Action:       action,
 		lastTrigger:  time.Now(),
@@ -7178,6 +7446,10 @@ func lightingRelayOutputReady(ctx *AppContext) bool {
 func (ctx *AppContext) lightingEnergizeAndArmTimer(reason string) {
 	if strings.TrimSpace(reason) == "" {
 		reason = "timer_reset"
+	}
+	if ctx.FiremansServiceActive() {
+		log.Printf("DEBUG: Fireman's service: lighting timer arm skipped (%s); emergency mode holds lighting relay on without auto-off.", reason)
+		return
 	}
 	if !lightingRelayOutputReady(ctx) {
 		log.Printf("DEBUG: Lighting: skip arm (%s): relay output not ready (GPIO or lighting_relay_pin).", reason)
@@ -7341,7 +7613,159 @@ func clearElevatorGrantState(ctx *AppContext) {
 	}
 }
 
+// FiremansServiceActive reports whether emergency bypass / fireman's service is engaged (runtime state).
+func (ctx *AppContext) FiremansServiceActive() bool {
+	ctx.firemansMu.RLock()
+	defer ctx.firemansMu.RUnlock()
+	return ctx.firemansActive
+}
+
+func deenergizeAllRelayOutputs(gpio *GPIOManager) {
+	if gpio == nil {
+		return
+	}
+	names := make([]string, 0, len(gpio.Outputs))
+	for n := range gpio.Outputs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		gpio.ActionOff(n)
+	}
+}
+
+func (ctx *AppContext) firemansStopLightingAutoOffTimer() {
+	ctx.lightingMu.Lock()
+	if ctx.lightingOffTimer != nil {
+		ctx.lightingOffTimer.Stop()
+		ctx.lightingOffTimer = nil
+	}
+	ctx.lightingTimerGen++
+	ctx.lightingMu.Unlock()
+}
+
+func (ctx *AppContext) syncFiremansServiceAfterConfigReload() {
+	ctx.configMu.RLock()
+	en := ctx.Config.FiremansServiceEnabled
+	ctx.configMu.RUnlock()
+	if !en && ctx.FiremansServiceActive() {
+		ctx.applyFiremansServiceTransition(false, "config_reload_disabled")
+		return
+	}
+	if en {
+		ctx.syncFiremansServiceFromHardwareReason("config_reload")
+	}
+}
+
+// syncFiremansServiceFromHardwareReason reads the fireman's GPIO (if configured) and aligns runtime state.
+func (ctx *AppContext) syncFiremansServiceFromHardwareReason(reason string) {
+	ctx.configMu.RLock()
+	en := ctx.Config.FiremansServiceEnabled
+	pin := ctx.GPIOSettings.FiremansServiceInputPin
+	activeLow := ctx.GPIOSettings.FiremansServiceActiveLow
+	ctx.configMu.RUnlock()
+	if !en || pin == 0 || ctx.GPIO == nil {
+		return
+	}
+	inp, ok := ctx.GPIO.Inputs["firemans_service"]
+	if !ok {
+		return
+	}
+	isLow := inp.Pin.Read() == rpio.Low
+	want := isLow == activeLow
+	log.Printf("DEBUG: Fireman's service: GPIO sample BCM=%d read_low=%v active_low_wiring=%v => emergency_active=%v (%s).",
+		pin, isLow, activeLow, want, reason)
+	ctx.applyFiremansServiceTransition(want, "gpio:"+reason)
+}
+
+// applyFiremansServiceTransition sets emergency bypass on or off (idempotent). Respects device.firemans_service_enabled for activate only.
+func (ctx *AppContext) applyFiremansServiceTransition(wantActive bool, reason string) {
+	ctx.configMu.RLock()
+	en := ctx.Config.FiremansServiceEnabled
+	ctx.configMu.RUnlock()
+	if wantActive && !en {
+		log.Printf("DEBUG: Fireman's service: ignoring activate (reason=%q); firemans_service_enabled is false.", reason)
+		return
+	}
+
+	ctx.firemansMu.Lock()
+	prev := ctx.firemansActive
+	if prev == wantActive {
+		ctx.firemansMu.Unlock()
+		return
+	}
+	ctx.firemansActive = wantActive
+	ctx.firemansMu.Unlock()
+
+	if wantActive {
+		ctx.runFiremansServiceEnter(reason)
+	} else {
+		ctx.runFiremansServiceExit(reason)
+	}
+}
+
+func (ctx *AppContext) runFiremansServiceEnter(reason string) {
+	log.Printf("INFO: Fireman's service ACTIVATED (emergency bypass; reason=%q): de-energizing all relay outputs; lighting on; access schedules and elevator floor rules bypassed for valid credentials.", reason)
+	log.Printf("DEBUG: Fireman's service: enter — clearing elevator grant state and lighting auto-off timer.")
+	ctx.firemansStopLightingAutoOffTimer()
+	clearElevatorGrantState(ctx)
+	if ctx.GPIO != nil {
+		deenergizeAllRelayOutputs(ctx.GPIO)
+		if ctx.GPIO.HasOutput("lighting") {
+			ctx.GPIO.ActionOn("lighting")
+			log.Printf("DEBUG: Fireman's service: lighting relay held ON (emergency illumination).")
+		} else {
+			log.Printf("DEBUG: Fireman's service: no lighting_relay_pin configured; skip lighting hold.")
+		}
+	} else {
+		log.Printf("DEBUG: Fireman's service: GPIO unavailable; software bypass only (no relay or lighting control).")
+	}
+
+	ctx.configMu.RLock()
+	cfg := ctx.Config
+	ctx.configMu.RUnlock()
+	playSoundAsyncEnabled(cfg, cfg.SoundFiremansActivated, cfg.SoundFiremansActivatedEnabled)
+	fireEventWebhook(ctx, "firemans_service_activated", map[string]any{"reason": reason})
+}
+
+func (ctx *AppContext) runFiremansServiceExit(reason string) {
+	log.Printf("INFO: Fireman's service DEACTIVATED (reason=%q): returning to normal software relay control; lighting relay off if configured.", reason)
+	log.Printf("DEBUG: Fireman's service: exit — stopping lighting auto-off timer; clearing elevator grant.")
+	ctx.firemansStopLightingAutoOffTimer()
+	clearElevatorGrantState(ctx)
+	if ctx.GPIO != nil && ctx.GPIO.HasOutput("lighting") {
+		ctx.GPIO.ActionOff("lighting")
+		log.Printf("DEBUG: Fireman's service: lighting relay OFF after emergency mode end.")
+	}
+
+	ctx.configMu.RLock()
+	cfg := ctx.Config
+	ctx.configMu.RUnlock()
+	playSoundAsyncEnabled(cfg, cfg.SoundFiremansDeactivated, cfg.SoundFiremansDeactivatedEnabled)
+	fireEventWebhook(ctx, "firemans_service_deactivated", map[string]any{"reason": reason})
+}
+
+func setupFiremansServiceGPIOInput(ctx *AppContext, gpio *GPIOManager) {
+	ctx.configMu.RLock()
+	en := ctx.Config.FiremansServiceEnabled
+	pin := ctx.GPIOSettings.FiremansServiceInputPin
+	pullUp := ctx.GPIOSettings.FiremansServiceActiveLow
+	ctx.configMu.RUnlock()
+	if !en || pin == 0 {
+		return
+	}
+	gpio.AddInputAnyEdge("firemans_service", pin, pullUp, func() {
+		ctx.syncFiremansServiceFromHardwareReason("edge")
+	})
+	log.Printf("INFO: Fireman's service input: BCM %d (active_low_wiring=%v, pull_up=%v).", pin, pullUp, pullUp)
+}
+
 func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
+	if ctx.FiremansServiceActive() {
+		log.Printf("DEBUG: Fireman's service: startElevatorFloorWaitGrant skipped (enable relays stay de-energized).")
+		clearElevatorGrantState(ctx)
+		return
+	}
 	ctx.elevatorMu.Lock()
 	pin := ctx.elevatorGrantPIN
 	via := ctx.elevatorGrantViaFallback
@@ -7450,6 +7874,19 @@ func pulseElevatorPredefinedDispatchAtIndex(ctx *AppContext, cfg DeviceConfig, i
 // The second return is false when elevatorFloorChannelAllowed denies (PIN floor list / floor groups, or timed lock).
 func activateElevatorPredefinedFloor(ctx *AppContext, cfg DeviceConfig, kTag, credTag, pin string, viaFallback bool) (map[string]any, bool) {
 	extra := map[string]any{}
+	if ctx.FiremansServiceActive() {
+		aclIdx := ctx.elevatorPredefinedDispatchIndexForACL(cfg)
+		elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
+		log.Printf("INFO: PIN accepted (elevator predefined; fireman's service; %s keypad; credential=%s); relay pulses skipped (%s).",
+			kTag, credTag, elevatorFloorLogLabel(ctx.DB, elevID, aclIdx))
+		log.Printf("DEBUG: Fireman's service: elevator_predefined_floor — enable/dispatch outputs not pulsed.")
+		extra["firemans_service"] = true
+		extra["elevator_floor_index"] = aclIdx
+		if elevID != "" {
+			extra["access_control_elevator_id"] = elevID
+		}
+		return extra, true
+	}
 	aclIdx := ctx.elevatorPredefinedDispatchIndexForACL(cfg)
 	elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
 	if !ctx.elevatorFloorChannelAllowed(pin, elevID, aclIdx, viaFallback, time.Now()) {
@@ -7532,6 +7969,16 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 		senseCab := elevatorWaitFloorSenseCabInputs(ctx.Config)
 		ctx.configMu.RUnlock()
 		if mode != ModeElevatorWaitFloorButtons {
+			continue
+		}
+		if ctx.FiremansServiceActive() {
+			ctx.elevatorMu.Lock()
+			untilFS := ctx.elevatorGrantUntil
+			ctx.elevatorMu.Unlock()
+			if !untilFS.IsZero() {
+				log.Printf("DEBUG: Fireman's service: clearing elevator wait-floor grant (enable relays must remain off).")
+				clearElevatorGrantState(ctx)
+			}
 			continue
 		}
 		ctx.elevatorMu.Lock()

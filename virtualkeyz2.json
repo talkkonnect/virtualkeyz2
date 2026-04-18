@@ -25,6 +25,11 @@
     "sound_lighting_timer_set_enabled": true,
     "sound_lighting_timer_expired_enabled": true,
     "sound_door_open_enabled": true,
+    "sound_firemans_activated": "",
+    "sound_firemans_deactivated": "",
+    "sound_firemans_activated_enabled": false,
+    "sound_firemans_deactivated_enabled": false,
+    "firemans_service_enabled": false,
     "log_level": "debug",
     "pin_length": 6,
     "relay_pulse_duration": "1s",
@@ -99,7 +104,9 @@
     "lighting_button_pin": 25,
     "lighting_button_active_low": true,
     "lighting_relay_pin": 10,
-    "lighting_relay_active_low": false
+    "lighting_relay_active_low": false,
+    "firemans_service_input_pin": 0,
+    "firemans_service_active_low": false
   },
   "tech_menu_prompt": "Access-Control-Room-1",
   "elevator_parameter_modes": {
