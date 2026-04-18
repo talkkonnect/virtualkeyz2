@@ -46,8 +46,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.10"
-	SoftwareReleaseUTC = "2026-04-18T05:23:23Z"
+	SoftwareVersion    = "0.11"
+	SoftwareReleaseUTC = "2026-04-18T05:44:43Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -227,8 +227,25 @@ type GPIOSettings struct {
 	LightingRelayActiveLow bool
 	// FiremansServiceInputPin: BCM maintained input for fireman's / emergency bypass (0 = not used; use MQTT or technician menu only).
 	// When firemans_service_active_low is true, emergency is active while the contact reads low (typical pull-up to open, switch to GND when asserted).
-	FiremansServiceInputPin uint8
+	FiremansServiceInputPin  uint8
 	FiremansServiceActiveLow bool
+
+	// AutomaticDoorOperatorRelayPin: optional relay (BCM or expander 0–15) pulsed alongside authorized door unlock — e.g. automatic door operator / gate opener. 0 = disabled.
+	AutomaticDoorOperatorRelayPin       uint8
+	AutomaticDoorOperatorRelayActiveLow bool
+	// IntercomCameraTriggerRelayPin: optional short pulse on authorized access — e.g. intercom / camera trigger. 0 = disabled.
+	IntercomCameraTriggerRelayPin       uint8
+	IntercomCameraTriggerRelayActiveLow bool
+
+	// FireAlarmInterfacePin: BCM opto input; when active, main door relay is held open for evacuation (independent of fireman's service). 0 = disabled.
+	FireAlarmInterfacePin       uint8
+	FireAlarmInterfaceActiveLow bool
+	// TamperSwitchPin: BCM opto input; enclosure tamper (both edges logged). 0 = disabled.
+	TamperSwitchPin       uint8
+	TamperSwitchActiveLow bool
+	// MotionSensorPin: BCM opto input; presence / PIR (active edge logged). 0 = disabled.
+	MotionSensorPin       uint8
+	MotionSensorActiveLow bool
 }
 
 // AppContext holds our global connections and configurations
@@ -290,8 +307,12 @@ type AppContext struct {
 
 	// Fireman's service / emergency bypass (fail-safe): when active, all relay outputs are held off, lighting relay held on (if configured),
 	// access schedules and elevator floor rules are bypassed for valid credentials, and elevator software does not energize hoist relays.
-	firemansMu      sync.RWMutex
-	firemansActive  bool
+	firemansMu     sync.RWMutex
+	firemansActive bool
+
+	// Fire alarm interface (fail-safe unlock): when active, main door relay is held energized until the alarm input clears.
+	fireAlarmMu     sync.RWMutex
+	fireAlarmActive bool
 }
 
 // logEmitMinSeverity: emit log lines whose severity is >= this (0=DEBUG all, 1=INFO+, 2=WARNING+, 3=ERROR+, 4=CRITICAL only).
@@ -385,6 +406,10 @@ type DeviceConfig struct {
 	PinLength int
 	// RelayPulseDuration is how long the door relay stays energized after a valid PIN.
 	RelayPulseDuration time.Duration
+	// AutomaticDoorOperatorPulseDuration: pulse length for gpio.automatic_door_operator_relay_pin on authorized access; zero uses RelayPulseDuration.
+	AutomaticDoorOperatorPulseDuration time.Duration
+	// IntercomCameraTriggerPulseDuration: pulse length for gpio.intercom_camera_trigger_relay_pin on authorized access; zero defaults to 800ms after normalizeKeypadAndPinUX.
+	IntercomCameraTriggerPulseDuration time.Duration
 	// PinRejectBuzzerAfterAttempts: after this many consecutive wrong PINs, pulse the buzzer relay (GPIO in GPIOSettings). Zero disables the buzzer.
 	PinRejectBuzzerAfterAttempts int
 	// BuzzerRelayPulseDuration is how long the buzzer relay stays on when the wrong-PIN threshold is reached.
@@ -481,8 +506,8 @@ type DeviceConfig struct {
 	// FiremansServiceEnabled: when true, fireman's service (emergency bypass) may be triggered by GPIO, MQTT, or technician menu.
 	FiremansServiceEnabled bool
 	// SoundFiremansActivated / SoundFiremansDeactivated: optional WAV announcements when emergency bypass is turned on or off.
-	SoundFiremansActivated   string
-	SoundFiremansDeactivated string
+	SoundFiremansActivated          string
+	SoundFiremansDeactivated        string
 	SoundFiremansActivatedEnabled   bool
 	SoundFiremansDeactivatedEnabled bool
 }
@@ -579,37 +604,49 @@ type virtualkeyz2DeviceJSON struct {
 	SoundFiremansDeactivated            *string                 `json:"sound_firemans_deactivated,omitempty"`
 	SoundFiremansActivatedEnabled       *bool                   `json:"sound_firemans_activated_enabled,omitempty"`
 	SoundFiremansDeactivatedEnabled     *bool                   `json:"sound_firemans_deactivated_enabled,omitempty"`
+	AutomaticDoorOperatorPulseDuration  *string                 `json:"automatic_door_operator_pulse_duration,omitempty"`
+	IntercomCameraTriggerPulseDuration  *string                 `json:"intercom_camera_trigger_pulse_duration,omitempty"`
 }
 
 type virtualkeyz2GPIOJSON struct {
-	RelayOutputMode              *string `json:"relay_output_mode"`
-	MCP23017I2CBus               *int    `json:"mcp23017_i2c_bus"`
-	MCP23017I2CAddr              *int    `json:"mcp23017_i2c_addr"`
-	XL9535I2CBus                 *int    `json:"xl9535_i2c_bus"`
-	XL9535I2CAddr                *int    `json:"xl9535_i2c_addr"`
-	DoorRelayPin                 *int    `json:"door_relay_pin"`
-	DoorRelayActiveLow           *bool   `json:"door_relay_active_low"`
-	BuzzerRelayPin               *int    `json:"buzzer_relay_pin"`
-	BuzzerRelayActiveLow         *bool   `json:"buzzer_relay_active_low"`
-	DoorSensorPin                *int    `json:"door_sensor_pin"`
-	HeartbeatLEDPin              *int    `json:"heartbeat_led_pin"`
-	ExitButtonPin                *int    `json:"exit_button_pin"`
-	ExitButtonActiveLow          *bool   `json:"exit_button_active_low"`
-	EntryButtonPin               *int    `json:"entry_button_pin"`
-	EntryButtonActiveLow         *bool   `json:"entry_button_active_low"`
-	ElevatorDispatchRelayPin     *int    `json:"elevator_dispatch_relay_pin"`
-	ElevatorDispatchActiveLow    *bool   `json:"elevator_dispatch_active_low"`
-	ElevatorEnableRelayPin       *int    `json:"elevator_enable_relay_pin"`
-	ElevatorEnableActiveLow      *bool   `json:"elevator_enable_active_low"`
-	ElevatorFloorDispatchPins    *string `json:"elevator_floor_dispatch_pins"`
-	ElevatorPredefinedEnablePins *string `json:"elevator_predefined_enable_pins"`
-	ElevatorWaitFloorEnablePins  *string `json:"elevator_wait_floor_enable_pins"`
-	LightingButtonPin            *int    `json:"lighting_button_pin"`
-	LightingButtonActiveLow      *bool   `json:"lighting_button_active_low"`
-	LightingRelayPin             *int    `json:"lighting_relay_pin"`
-	LightingRelayActiveLow       *bool   `json:"lighting_relay_active_low"`
-	FiremansServiceInputPin      *int    `json:"firemans_service_input_pin,omitempty"`
-	FiremansServiceActiveLow     *bool   `json:"firemans_service_active_low,omitempty"`
+	RelayOutputMode                     *string `json:"relay_output_mode"`
+	MCP23017I2CBus                      *int    `json:"mcp23017_i2c_bus"`
+	MCP23017I2CAddr                     *int    `json:"mcp23017_i2c_addr"`
+	XL9535I2CBus                        *int    `json:"xl9535_i2c_bus"`
+	XL9535I2CAddr                       *int    `json:"xl9535_i2c_addr"`
+	DoorRelayPin                        *int    `json:"door_relay_pin"`
+	DoorRelayActiveLow                  *bool   `json:"door_relay_active_low"`
+	BuzzerRelayPin                      *int    `json:"buzzer_relay_pin"`
+	BuzzerRelayActiveLow                *bool   `json:"buzzer_relay_active_low"`
+	DoorSensorPin                       *int    `json:"door_sensor_pin"`
+	HeartbeatLEDPin                     *int    `json:"heartbeat_led_pin"`
+	ExitButtonPin                       *int    `json:"exit_button_pin"`
+	ExitButtonActiveLow                 *bool   `json:"exit_button_active_low"`
+	EntryButtonPin                      *int    `json:"entry_button_pin"`
+	EntryButtonActiveLow                *bool   `json:"entry_button_active_low"`
+	ElevatorDispatchRelayPin            *int    `json:"elevator_dispatch_relay_pin"`
+	ElevatorDispatchActiveLow           *bool   `json:"elevator_dispatch_active_low"`
+	ElevatorEnableRelayPin              *int    `json:"elevator_enable_relay_pin"`
+	ElevatorEnableActiveLow             *bool   `json:"elevator_enable_active_low"`
+	ElevatorFloorDispatchPins           *string `json:"elevator_floor_dispatch_pins"`
+	ElevatorPredefinedEnablePins        *string `json:"elevator_predefined_enable_pins"`
+	ElevatorWaitFloorEnablePins         *string `json:"elevator_wait_floor_enable_pins"`
+	LightingButtonPin                   *int    `json:"lighting_button_pin"`
+	LightingButtonActiveLow             *bool   `json:"lighting_button_active_low"`
+	LightingRelayPin                    *int    `json:"lighting_relay_pin"`
+	LightingRelayActiveLow              *bool   `json:"lighting_relay_active_low"`
+	FiremansServiceInputPin             *int    `json:"firemans_service_input_pin,omitempty"`
+	FiremansServiceActiveLow            *bool   `json:"firemans_service_active_low,omitempty"`
+	AutomaticDoorOperatorRelayPin       *int    `json:"automatic_door_operator_relay_pin,omitempty"`
+	AutomaticDoorOperatorRelayActiveLow *bool   `json:"automatic_door_operator_relay_active_low,omitempty"`
+	IntercomCameraTriggerRelayPin       *int    `json:"intercom_camera_trigger_relay_pin,omitempty"`
+	IntercomCameraTriggerRelayActiveLow *bool   `json:"intercom_camera_trigger_relay_active_low,omitempty"`
+	FireAlarmInterfacePin               *int    `json:"fire_alarm_interface_pin,omitempty"`
+	FireAlarmInterfaceActiveLow         *bool   `json:"fire_alarm_interface_active_low,omitempty"`
+	TamperSwitchPin                     *int    `json:"tamper_switch_pin,omitempty"`
+	TamperSwitchActiveLow               *bool   `json:"tamper_switch_active_low,omitempty"`
+	MotionSensorPin                     *int    `json:"motion_sensor_pin,omitempty"`
+	MotionSensorActiveLow               *bool   `json:"motion_sensor_active_low,omitempty"`
 }
 
 func bcmUint8(field string, v int) (uint8, error) {
@@ -982,6 +1019,16 @@ func normalizeKeypadAndPinUX(c *DeviceConfig) {
 	} else {
 		c.LightingTimeout = clampDuration(c.LightingTimeout, 5*time.Second, 24*time.Hour)
 	}
+	if c.IntercomCameraTriggerPulseDuration <= 0 {
+		c.IntercomCameraTriggerPulseDuration = 800 * time.Millisecond
+	} else {
+		c.IntercomCameraTriggerPulseDuration = clampDuration(c.IntercomCameraTriggerPulseDuration, 50*time.Millisecond, 60*time.Second)
+	}
+	if c.AutomaticDoorOperatorPulseDuration < 0 {
+		c.AutomaticDoorOperatorPulseDuration = 0
+	} else if c.AutomaticDoorOperatorPulseDuration > 0 {
+		c.AutomaticDoorOperatorPulseDuration = clampDuration(c.AutomaticDoorOperatorPulseDuration, 50*time.Millisecond, 60*time.Second)
+	}
 	normalizeOperationModeConfig(c)
 }
 
@@ -1052,6 +1099,12 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 		return err
 	}
 	if err := applyJSONDuration(&app.Config.BuzzerRelayPulseDuration, "device", "buzzer_relay_pulse_duration", d.BuzzerRelayPulseDuration); err != nil {
+		return err
+	}
+	if err := applyJSONDuration(&app.Config.AutomaticDoorOperatorPulseDuration, "device", "automatic_door_operator_pulse_duration", d.AutomaticDoorOperatorPulseDuration); err != nil {
+		return err
+	}
+	if err := applyJSONDuration(&app.Config.IntercomCameraTriggerPulseDuration, "device", "intercom_camera_trigger_pulse_duration", d.IntercomCameraTriggerPulseDuration); err != nil {
 		return err
 	}
 	if err := applyJSONDuration(&app.Config.KeypadInterDigitTimeout, "device", "keypad_inter_digit_timeout", d.KeypadInterDigitTimeout); err != nil {
@@ -1406,6 +1459,56 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if g.FiremansServiceActiveLow != nil {
 		app.GPIOSettings.FiremansServiceActiveLow = *g.FiremansServiceActiveLow
 	}
+	if g.AutomaticDoorOperatorRelayPin != nil {
+		u, err := relayPinUint8("automatic_door_operator_relay_pin", *g.AutomaticDoorOperatorRelayPin, relayMode)
+		if err != nil {
+			return err
+		}
+		app.GPIOSettings.AutomaticDoorOperatorRelayPin = u
+	}
+	if g.AutomaticDoorOperatorRelayActiveLow != nil {
+		app.GPIOSettings.AutomaticDoorOperatorRelayActiveLow = *g.AutomaticDoorOperatorRelayActiveLow
+	}
+	if g.IntercomCameraTriggerRelayPin != nil {
+		u, err := relayPinUint8("intercom_camera_trigger_relay_pin", *g.IntercomCameraTriggerRelayPin, relayMode)
+		if err != nil {
+			return err
+		}
+		app.GPIOSettings.IntercomCameraTriggerRelayPin = u
+	}
+	if g.IntercomCameraTriggerRelayActiveLow != nil {
+		app.GPIOSettings.IntercomCameraTriggerRelayActiveLow = *g.IntercomCameraTriggerRelayActiveLow
+	}
+	if g.FireAlarmInterfacePin != nil {
+		u, err := bcmUint8("fire_alarm_interface_pin", *g.FireAlarmInterfacePin)
+		if err != nil {
+			return err
+		}
+		app.GPIOSettings.FireAlarmInterfacePin = u
+	}
+	if g.FireAlarmInterfaceActiveLow != nil {
+		app.GPIOSettings.FireAlarmInterfaceActiveLow = *g.FireAlarmInterfaceActiveLow
+	}
+	if g.TamperSwitchPin != nil {
+		u, err := bcmUint8("tamper_switch_pin", *g.TamperSwitchPin)
+		if err != nil {
+			return err
+		}
+		app.GPIOSettings.TamperSwitchPin = u
+	}
+	if g.TamperSwitchActiveLow != nil {
+		app.GPIOSettings.TamperSwitchActiveLow = *g.TamperSwitchActiveLow
+	}
+	if g.MotionSensorPin != nil {
+		u, err := bcmUint8("motion_sensor_pin", *g.MotionSensorPin)
+		if err != nil {
+			return err
+		}
+		app.GPIOSettings.MotionSensorPin = u
+	}
+	if g.MotionSensorActiveLow != nil {
+		app.GPIOSettings.MotionSensorActiveLow = *g.MotionSensorActiveLow
+	}
 	if g.ElevatorDispatchRelayPin != nil {
 		u, err := relayPinUint8("elevator_dispatch_relay_pin", *g.ElevatorDispatchRelayPin, relayMode)
 		if err != nil {
@@ -1547,6 +1650,8 @@ type virtualkeyz2PersistDevice struct {
 	SoundFiremansActivatedEnabled       bool                   `json:"sound_firemans_activated_enabled"`
 	SoundFiremansDeactivatedEnabled     bool                   `json:"sound_firemans_deactivated_enabled"`
 	FiremansServiceEnabled              bool                   `json:"firemans_service_enabled"`
+	AutomaticDoorOperatorPulseDuration  string                 `json:"automatic_door_operator_pulse_duration,omitempty"`
+	IntercomCameraTriggerPulseDuration  string                 `json:"intercom_camera_trigger_pulse_duration,omitempty"`
 	LogLevel                            string                 `json:"log_level"`
 	PinLength                           int                    `json:"pin_length"`
 	RelayPulseDuration                  string                 `json:"relay_pulse_duration"`
@@ -1603,34 +1708,44 @@ type virtualkeyz2PersistDevice struct {
 }
 
 type virtualkeyz2PersistGPIO struct {
-	RelayOutputMode              string `json:"relay_output_mode"`
-	MCP23017I2CBus               int    `json:"mcp23017_i2c_bus"`
-	MCP23017I2CAddr              int    `json:"mcp23017_i2c_addr"`
-	XL9535I2CBus                 int    `json:"xl9535_i2c_bus"`
-	XL9535I2CAddr                int    `json:"xl9535_i2c_addr"`
-	DoorRelayPin                 int    `json:"door_relay_pin"`
-	DoorRelayActiveLow           bool   `json:"door_relay_active_low"`
-	BuzzerRelayPin               int    `json:"buzzer_relay_pin"`
-	BuzzerRelayActiveLow         bool   `json:"buzzer_relay_active_low"`
-	DoorSensorPin                int    `json:"door_sensor_pin"`
-	HeartbeatLEDPin              int    `json:"heartbeat_led_pin"`
-	ExitButtonPin                int    `json:"exit_button_pin"`
-	ExitButtonActiveLow          bool   `json:"exit_button_active_low"`
-	EntryButtonPin               int    `json:"entry_button_pin"`
-	EntryButtonActiveLow         bool   `json:"entry_button_active_low"`
-	ElevatorDispatchRelayPin     int    `json:"elevator_dispatch_relay_pin"`
-	ElevatorDispatchActiveLow    bool   `json:"elevator_dispatch_active_low"`
-	ElevatorEnableRelayPin       int    `json:"elevator_enable_relay_pin"`
-	ElevatorEnableActiveLow      bool   `json:"elevator_enable_active_low"`
-	ElevatorFloorDispatchPins    string `json:"elevator_floor_dispatch_pins"`
-	ElevatorPredefinedEnablePins string `json:"elevator_predefined_enable_pins"`
-	ElevatorWaitFloorEnablePins  string `json:"elevator_wait_floor_enable_pins"`
-	LightingButtonPin            int    `json:"lighting_button_pin"`
-	LightingButtonActiveLow      bool   `json:"lighting_button_active_low"`
-	LightingRelayPin             int    `json:"lighting_relay_pin"`
-	LightingRelayActiveLow       bool   `json:"lighting_relay_active_low"`
-	FiremansServiceInputPin      int    `json:"firemans_service_input_pin"`
-	FiremansServiceActiveLow     bool   `json:"firemans_service_active_low"`
+	RelayOutputMode                     string `json:"relay_output_mode"`
+	MCP23017I2CBus                      int    `json:"mcp23017_i2c_bus"`
+	MCP23017I2CAddr                     int    `json:"mcp23017_i2c_addr"`
+	XL9535I2CBus                        int    `json:"xl9535_i2c_bus"`
+	XL9535I2CAddr                       int    `json:"xl9535_i2c_addr"`
+	DoorRelayPin                        int    `json:"door_relay_pin"`
+	DoorRelayActiveLow                  bool   `json:"door_relay_active_low"`
+	BuzzerRelayPin                      int    `json:"buzzer_relay_pin"`
+	BuzzerRelayActiveLow                bool   `json:"buzzer_relay_active_low"`
+	DoorSensorPin                       int    `json:"door_sensor_pin"`
+	HeartbeatLEDPin                     int    `json:"heartbeat_led_pin"`
+	ExitButtonPin                       int    `json:"exit_button_pin"`
+	ExitButtonActiveLow                 bool   `json:"exit_button_active_low"`
+	EntryButtonPin                      int    `json:"entry_button_pin"`
+	EntryButtonActiveLow                bool   `json:"entry_button_active_low"`
+	ElevatorDispatchRelayPin            int    `json:"elevator_dispatch_relay_pin"`
+	ElevatorDispatchActiveLow           bool   `json:"elevator_dispatch_active_low"`
+	ElevatorEnableRelayPin              int    `json:"elevator_enable_relay_pin"`
+	ElevatorEnableActiveLow             bool   `json:"elevator_enable_active_low"`
+	ElevatorFloorDispatchPins           string `json:"elevator_floor_dispatch_pins"`
+	ElevatorPredefinedEnablePins        string `json:"elevator_predefined_enable_pins"`
+	ElevatorWaitFloorEnablePins         string `json:"elevator_wait_floor_enable_pins"`
+	LightingButtonPin                   int    `json:"lighting_button_pin"`
+	LightingButtonActiveLow             bool   `json:"lighting_button_active_low"`
+	LightingRelayPin                    int    `json:"lighting_relay_pin"`
+	LightingRelayActiveLow              bool   `json:"lighting_relay_active_low"`
+	FiremansServiceInputPin             int    `json:"firemans_service_input_pin"`
+	FiremansServiceActiveLow            bool   `json:"firemans_service_active_low"`
+	AutomaticDoorOperatorRelayPin       int    `json:"automatic_door_operator_relay_pin"`
+	AutomaticDoorOperatorRelayActiveLow bool   `json:"automatic_door_operator_relay_active_low"`
+	IntercomCameraTriggerRelayPin       int    `json:"intercom_camera_trigger_relay_pin"`
+	IntercomCameraTriggerRelayActiveLow bool   `json:"intercom_camera_trigger_relay_active_low"`
+	FireAlarmInterfacePin               int    `json:"fire_alarm_interface_pin"`
+	FireAlarmInterfaceActiveLow         bool   `json:"fire_alarm_interface_active_low"`
+	TamperSwitchPin                     int    `json:"tamper_switch_pin"`
+	TamperSwitchActiveLow               bool   `json:"tamper_switch_active_low"`
+	MotionSensorPin                     int    `json:"motion_sensor_pin"`
+	MotionSensorActiveLow               bool   `json:"motion_sensor_active_low"`
 }
 
 func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
@@ -1670,6 +1785,12 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.SoundFiremansActivatedEnabled = c.SoundFiremansActivatedEnabled
 	out.Device.SoundFiremansDeactivatedEnabled = c.SoundFiremansDeactivatedEnabled
 	out.Device.FiremansServiceEnabled = c.FiremansServiceEnabled
+	if c.AutomaticDoorOperatorPulseDuration > 0 {
+		out.Device.AutomaticDoorOperatorPulseDuration = c.AutomaticDoorOperatorPulseDuration.String()
+	}
+	if c.IntercomCameraTriggerPulseDuration > 0 {
+		out.Device.IntercomCameraTriggerPulseDuration = c.IntercomCameraTriggerPulseDuration.String()
+	}
 	out.Device.LogLevel = c.LogLevel
 	out.Device.PinLength = c.PinLength
 	out.Device.RelayPulseDuration = c.RelayPulseDuration.String()
@@ -1761,6 +1882,16 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.GPIO.LightingRelayActiveLow = g.LightingRelayActiveLow
 	out.GPIO.FiremansServiceInputPin = int(g.FiremansServiceInputPin)
 	out.GPIO.FiremansServiceActiveLow = g.FiremansServiceActiveLow
+	out.GPIO.AutomaticDoorOperatorRelayPin = int(g.AutomaticDoorOperatorRelayPin)
+	out.GPIO.AutomaticDoorOperatorRelayActiveLow = g.AutomaticDoorOperatorRelayActiveLow
+	out.GPIO.IntercomCameraTriggerRelayPin = int(g.IntercomCameraTriggerRelayPin)
+	out.GPIO.IntercomCameraTriggerRelayActiveLow = g.IntercomCameraTriggerRelayActiveLow
+	out.GPIO.FireAlarmInterfacePin = int(g.FireAlarmInterfacePin)
+	out.GPIO.FireAlarmInterfaceActiveLow = g.FireAlarmInterfaceActiveLow
+	out.GPIO.TamperSwitchPin = int(g.TamperSwitchPin)
+	out.GPIO.TamperSwitchActiveLow = g.TamperSwitchActiveLow
+	out.GPIO.MotionSensorPin = int(g.MotionSensorPin)
+	out.GPIO.MotionSensorActiveLow = g.MotionSensorActiveLow
 	if len(app.elevatorParameterModesDoc) > 0 {
 		out.ElevatorParameterModes = app.elevatorParameterModesDoc
 	}
@@ -1878,6 +2009,7 @@ func reloadVirtualKeyz2ConfigLive(ctx *AppContext) error {
 	ctx.reconnectMQTT()
 	ctx.techHistoryTrimToMax()
 	ctx.syncFiremansServiceAfterConfigReload()
+	ctx.syncFireAlarmAfterConfigReload()
 	return nil
 }
 
@@ -1900,6 +2032,7 @@ func applyInMemoryConfigLive(ctx *AppContext) {
 	log.Println("INFO: In-memory configuration applied live (MQTT reconnect; GPIO pin map unchanged until reboot).")
 	ctx.reconnectMQTT()
 	ctx.syncFiremansServiceAfterConfigReload()
+	ctx.syncFireAlarmAfterConfigReload()
 }
 
 // restartCurrentProgram replaces this OS process with a new instance of the same executable, preserving
@@ -1932,7 +2065,9 @@ func techMenuHandleFiremans(ctx *AppContext, parts []string) {
 	switch sub {
 	case "on", "1", "true", "activate":
 		if !en {
-			techMenuSyncPrint(func(w io.Writer) { fmt.Fprintln(w, "firemans_service_enabled is false — enable in JSON or: cfg set firemans_service_enabled true") })
+			techMenuSyncPrint(func(w io.Writer) {
+				fmt.Fprintln(w, "firemans_service_enabled is false — enable in JSON or: cfg set firemans_service_enabled true")
+			})
 			log.Println("WARNING: Technician menu: firemans on ignored (feature disabled in configuration).")
 			return
 		}
@@ -2062,6 +2197,15 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		}
 	case "relay_pulse_duration":
 		err = applyJSONDuration(&ctx.Config.RelayPulseDuration, "device", "relay_pulse_duration", &value)
+	case "automatic_door_operator_pulse_duration":
+		ev := strings.TrimSpace(value)
+		if ev == "" {
+			ctx.Config.AutomaticDoorOperatorPulseDuration = 0
+		} else {
+			err = applyJSONDuration(&ctx.Config.AutomaticDoorOperatorPulseDuration, "device", "automatic_door_operator_pulse_duration", &value)
+		}
+	case "intercom_camera_trigger_pulse_duration":
+		err = applyJSONDuration(&ctx.Config.IntercomCameraTriggerPulseDuration, "device", "intercom_camera_trigger_pulse_duration", &value)
 	case "buzzer_relay_pulse_duration":
 		err = applyJSONDuration(&ctx.Config.BuzzerRelayPulseDuration, "device", "buzzer_relay_pulse_duration", &value)
 	case "door_sensor_closed_is_low":
@@ -2402,6 +2546,48 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		}
 	case "firemans_service_active_low":
 		ctx.GPIOSettings.FiremansServiceActiveLow, err = strconv.ParseBool(value)
+	case "automatic_door_operator_relay_pin":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+			ctx.GPIOSettings.AutomaticDoorOperatorRelayPin, err = relayPinUint8("automatic_door_operator_relay_pin", int(n), mode)
+		}
+	case "automatic_door_operator_relay_active_low":
+		ctx.GPIOSettings.AutomaticDoorOperatorRelayActiveLow, err = strconv.ParseBool(value)
+	case "intercom_camera_trigger_relay_pin":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			mode := normalizeRelayOutputMode(ctx.GPIOSettings.RelayOutputMode)
+			ctx.GPIOSettings.IntercomCameraTriggerRelayPin, err = relayPinUint8("intercom_camera_trigger_relay_pin", int(n), mode)
+		}
+	case "intercom_camera_trigger_relay_active_low":
+		ctx.GPIOSettings.IntercomCameraTriggerRelayActiveLow, err = strconv.ParseBool(value)
+	case "fire_alarm_interface_pin":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.GPIOSettings.FireAlarmInterfacePin, err = bcmUint8("fire_alarm_interface_pin", int(n))
+		}
+	case "fire_alarm_interface_active_low":
+		ctx.GPIOSettings.FireAlarmInterfaceActiveLow, err = strconv.ParseBool(value)
+	case "tamper_switch_pin":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.GPIOSettings.TamperSwitchPin, err = bcmUint8("tamper_switch_pin", int(n))
+		}
+	case "tamper_switch_active_low":
+		ctx.GPIOSettings.TamperSwitchActiveLow, err = strconv.ParseBool(value)
+	case "motion_sensor_pin":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.GPIOSettings.MotionSensorPin, err = bcmUint8("motion_sensor_pin", int(n))
+		}
+	case "motion_sensor_active_low":
+		ctx.GPIOSettings.MotionSensorActiveLow, err = strconv.ParseBool(value)
 	default:
 		return fmt.Errorf("unknown key %q (try: cfg keys)", key)
 	}
@@ -2455,6 +2641,8 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   door_sensor_closed_is_low         true|false
   relay_pulse_duration              e.g. 400ms
   buzzer_relay_pulse_duration       e.g. 800ms
+  automatic_door_operator_pulse_duration  optional; empty/0 = same as relay_pulse_duration for automatic_door_operator relay
+  intercom_camera_trigger_pulse_duration  optional; default 800ms after normalize (device JSON)
   pin_length                        0 = Enter to submit
   pin_reject_buzzer_after_attempts  0 disables buzzer
   sound_card_name                   ALSA -D e.g. plughw:1,0
@@ -2542,6 +2730,16 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   lighting_relay_active_low         true|false
   firemans_service_input_pin        BCM maintained fireman's / emergency input (0=disabled; use MQTT/menu only)
   firemans_service_active_low       true = emergency active when pin reads low (pull-up wiring)
+  automatic_door_operator_relay_pin  optional; pulse with authorized access (door operator / gate opener); BCM or expander 0–15
+  automatic_door_operator_relay_active_low  true|false
+  intercom_camera_trigger_relay_pin  optional; short pulse on authorized access (intercom / camera trigger)
+  intercom_camera_trigger_relay_active_low  true|false
+  fire_alarm_interface_pin          BCM opto: when active, door relay held open (evacuation); 0=disabled
+  fire_alarm_interface_active_low   true = alarm active when pin reads low (pull-up wiring)
+  tamper_switch_pin                 BCM opto: enclosure tamper (both edges logged); 0=disabled
+  tamper_switch_active_low          secure/normal state wiring (see DEBUG logs on change)
+  motion_sensor_pin                 BCM opto: presence / PIR assert edge (DEBUG on detection); 0=disabled
+  motion_sensor_active_low          true = assert on falling edge (pull-up, active low)
   elevator_dispatch_relay_pin       0 = use door relay when elevator_floor_dispatch_pins empty
   elevator_dispatch_active_low      true|false
   elevator_floor_dispatch_pins      wait-floor+cab sense: one per elevator_floor_input_pins. wait-floor+cab ignore: one per wait-floor enable channel. predefined: optional single dispatch when no cab inputs (or use elevator_dispatch_relay_pin)
@@ -2748,7 +2946,14 @@ func main() {
 			} else if appCtx.GPIOSettings.ElevatorEnableRelayPin != 0 {
 				gpio.AddOutput("elevator_enable", appCtx.GPIOSettings.ElevatorEnableRelayPin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
 			}
+			if appCtx.GPIOSettings.AutomaticDoorOperatorRelayPin != 0 {
+				gpio.AddOutput("automatic_door_operator", appCtx.GPIOSettings.AutomaticDoorOperatorRelayPin, appCtx.GPIOSettings.AutomaticDoorOperatorRelayActiveLow, useI2CExpander)
+			}
+			if appCtx.GPIOSettings.IntercomCameraTriggerRelayPin != 0 {
+				gpio.AddOutput("intercom_camera_trigger", appCtx.GPIOSettings.IntercomCameraTriggerRelayPin, appCtx.GPIOSettings.IntercomCameraTriggerRelayActiveLow, useI2CExpander)
+			}
 		}
+		gpio.SetDoorHoldOpenWhile(func() bool { return appCtx.FireAlarmInterfaceActive() })
 		gpio.ConfigureDoorSensor(appCtx.GPIOSettings.DoorSensorPin)
 		waitMode := NormalizeKeypadOperationMode(appCtx.Config.KeypadOperationMode) == ModeElevatorWaitFloorButtons
 		if waitMode && elevatorWaitFloorSenseCabInputs(appCtx.Config) {
@@ -2760,11 +2965,15 @@ func main() {
 		}
 		setupOperationModeGPIOInputs(appCtx, gpio)
 		setupFiremansServiceGPIOInput(appCtx, gpio)
+		setupFireAlarmInterfaceGPIOInput(appCtx, gpio)
+		setupTamperSwitchGPIOInput(appCtx, gpio)
+		setupMotionSensorGPIOInput(appCtx, gpio)
 		appCtx.GPIO = gpio
 		go gpio.StartListening()
 		go func() {
 			time.Sleep(200 * time.Millisecond)
 			appCtx.syncFiremansServiceFromHardwareReason("startup")
+			appCtx.syncFireAlarmFromHardwareReason("startup")
 		}()
 	}
 
@@ -4456,6 +4665,7 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 		playSoundAsyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 		if ctx.GPIO != nil {
 			ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
+			ctx.pulseAuthorizedAccessAuxRelays(cfg)
 			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "door relay pulsed"})
 			fireEventWebhook(ctx, "mqtt_remote_door_open", map[string]any{"mqtt_topic": topic})
 		} else {
@@ -5297,6 +5507,7 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 	} else if ctx.GPIO != nil {
 		ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
 		relPulsed = true
+		ctx.pulseAuthorizedAccessAuxRelays(cfg)
 	} else {
 		log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
 	}
@@ -5674,6 +5885,9 @@ var techMenuCfgKeysForCompletion = []string{
 	"access_exception_site_timezone",
 	"access_schedule_apply_to_fallback_pin",
 	"access_schedule_enforce",
+	"automatic_door_operator_pulse_duration",
+	"automatic_door_operator_relay_active_low",
+	"automatic_door_operator_relay_pin",
 	"buzzer_relay_active_low",
 	"buzzer_relay_pin",
 	"door_forced_after_warnings",
@@ -5704,11 +5918,16 @@ var techMenuCfgKeysForCompletion = []string{
 	"exit_button_active_low",
 	"exit_button_pin",
 	"fallback_access_pin",
+	"fire_alarm_interface_active_low",
+	"fire_alarm_interface_pin",
 	"firemans_service_active_low",
 	"firemans_service_enabled",
 	"firemans_service_input_pin",
 	"heartbeat_interval",
 	"heartbeat_led_pin",
+	"intercom_camera_trigger_pulse_duration",
+	"intercom_camera_trigger_relay_active_low",
+	"intercom_camera_trigger_relay_pin",
 	"keypad_evdev_path",
 	"keypad_exit_evdev_path",
 	"keypad_inter_digit_timeout",
@@ -5731,6 +5950,8 @@ var techMenuCfgKeysForCompletion = []string{
 	"mqtt_password",
 	"mqtt_status_topic",
 	"mqtt_username",
+	"motion_sensor_active_low",
+	"motion_sensor_pin",
 	"pair_peer_role",
 	"pair_peer_token",
 	"pin_entry_feedback_delay",
@@ -5765,6 +5986,8 @@ var techMenuCfgKeysForCompletion = []string{
 	"sound_shutdown_enabled",
 	"sound_startup",
 	"sound_startup_enabled",
+	"tamper_switch_active_low",
+	"tamper_switch_pin",
 	"tech_menu_history_max",
 	"tech_menu_prompt",
 	"webhook_event_enabled",
@@ -6454,6 +6677,12 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  door_sensor_closed_is_low: %v\n", c.DoorSensorClosedIsLow)
 	fmt.Fprintf(w, "  relay_pulse_duration: %s\n", c.RelayPulseDuration)
 	fmt.Fprintf(w, "  buzzer_relay_pulse_duration: %s\n", c.BuzzerRelayPulseDuration)
+	if c.AutomaticDoorOperatorPulseDuration > 0 {
+		fmt.Fprintf(w, "  automatic_door_operator_pulse_duration: %s (0 in file = use relay_pulse_duration)\n", c.AutomaticDoorOperatorPulseDuration)
+	} else {
+		fmt.Fprintln(w, "  automatic_door_operator_pulse_duration: (unset; uses relay_pulse_duration)")
+	}
+	fmt.Fprintf(w, "  intercom_camera_trigger_pulse_duration: %s\n", c.IntercomCameraTriggerPulseDuration)
 	fmt.Fprintf(w, "  lighting_timeout: %s (manual button or accepted PIN; default 30m; full reset each trigger; relay off only at expiry)\n", c.LightingTimeout)
 	fmt.Fprintf(w, "  pin_reject_buzzer_after_attempts: %d\n", c.PinRejectBuzzerAfterAttempts)
 	fmt.Fprintf(w, "  keypad_inter_digit_timeout: %s\n", c.KeypadInterDigitTimeout)
@@ -6609,6 +6838,17 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  lighting_relay_active_low: %v\n", g.LightingRelayActiveLow)
 	fmt.Fprintf(w, "  firemans_service_input_pin: %d (0=not used)\n", g.FiremansServiceInputPin)
 	fmt.Fprintf(w, "  firemans_service_active_low: %v\n", g.FiremansServiceActiveLow)
+	fmt.Fprintf(w, "  automatic_door_operator_relay_pin: %d (0=disabled)\n", g.AutomaticDoorOperatorRelayPin)
+	fmt.Fprintf(w, "  automatic_door_operator_relay_active_low: %v\n", g.AutomaticDoorOperatorRelayActiveLow)
+	fmt.Fprintf(w, "  intercom_camera_trigger_relay_pin: %d (0=disabled)\n", g.IntercomCameraTriggerRelayPin)
+	fmt.Fprintf(w, "  intercom_camera_trigger_relay_active_low: %v\n", g.IntercomCameraTriggerRelayActiveLow)
+	fmt.Fprintf(w, "  fire_alarm_interface_pin: %d (0=disabled)\n", g.FireAlarmInterfacePin)
+	fmt.Fprintf(w, "  fire_alarm_interface_active_low: %v\n", g.FireAlarmInterfaceActiveLow)
+	fmt.Fprintf(w, "  fire_alarm_interface_runtime_active: %v\n", ctx.FireAlarmInterfaceActive())
+	fmt.Fprintf(w, "  tamper_switch_pin: %d (0=disabled)\n", g.TamperSwitchPin)
+	fmt.Fprintf(w, "  tamper_switch_active_low: %v\n", g.TamperSwitchActiveLow)
+	fmt.Fprintf(w, "  motion_sensor_pin: %d (0=disabled)\n", g.MotionSensorPin)
+	fmt.Fprintf(w, "  motion_sensor_active_low: %v\n", g.MotionSensorActiveLow)
 	fmt.Fprintf(w, "  elevator_dispatch_relay_pin: %d\n", g.ElevatorDispatchRelayPin)
 	fmt.Fprintf(w, "  elevator_dispatch_active_low: %v\n", g.ElevatorDispatchActiveLow)
 	fmt.Fprintf(w, "  elevator_enable_relay_pin: %d\n", g.ElevatorEnableRelayPin)
@@ -7132,7 +7372,7 @@ type InputConfig struct {
 	PinNumber    uint8
 	PullUp       bool          // Enable internal pull-up resistor
 	DebounceTime time.Duration // Time to ignore subsequent triggers
-	AnyEdge      bool // When true, both rising and falling edges are detected (maintained switches).
+	AnyEdge      bool          // When true, both rising and falling edges are detected (maintained switches).
 	Pin          rpio.Pin
 	Action       func()    // The function to call when triggered
 	lastTrigger  time.Time // Used for debouncing
@@ -7151,6 +7391,10 @@ type GPIOManager struct {
 
 	i2cRelay i2cRelayExpander
 
+	// doorHoldWhile, if set, is consulted at the end of ActionPulse("door", ...): when true the door relay
+	// stays energized (fire alarm interface fail-unlock) instead of returning to off.
+	doorHoldWhile func() bool
+
 	doorSensorPin   rpio.Pin
 	doorSensorReady bool
 
@@ -7164,6 +7408,11 @@ func NewGPIOManager() *GPIOManager {
 		Outputs: make(map[string]*OutputConfig),
 		Inputs:  make(map[string]*InputConfig),
 	}
+}
+
+// SetDoorHoldOpenWhile sets a callback used by ActionPulse on output "door" to leave the relay on when true.
+func (m *GPIOManager) SetDoorHoldOpenWhile(f func() bool) {
+	m.doorHoldWhile = f
 }
 
 // SetI2CRelayExpander attaches an MCP23017 or XL9535 for outputs registered with UseI2CRelay true.
@@ -7365,6 +7614,10 @@ func (m *GPIOManager) ActionPulse(name string, duration time.Duration) {
 
 		m.ActionOn(name)
 		time.Sleep(duration)
+		if name == "door" && m.doorHoldWhile != nil && m.doorHoldWhile() {
+			log.Printf("DEBUG: Fire alarm interface: door relay hold-open active — skipping off phase after pulse.")
+			return
+		}
 		m.ActionOff(name)
 	}()
 }
@@ -7620,7 +7873,143 @@ func (ctx *AppContext) FiremansServiceActive() bool {
 	return ctx.firemansActive
 }
 
-func deenergizeAllRelayOutputs(gpio *GPIOManager) {
+// FireAlarmInterfaceActive reports whether the fire-alarm interface input is latched active (fail-unlock / door held).
+func (ctx *AppContext) FireAlarmInterfaceActive() bool {
+	ctx.fireAlarmMu.RLock()
+	defer ctx.fireAlarmMu.RUnlock()
+	return ctx.fireAlarmActive
+}
+
+func (ctx *AppContext) applyFireAlarmInterfaceTransition(wantActive bool, reason string) {
+	ctx.fireAlarmMu.Lock()
+	prev := ctx.fireAlarmActive
+	if prev == wantActive {
+		ctx.fireAlarmMu.Unlock()
+		return
+	}
+	ctx.fireAlarmActive = wantActive
+	ctx.fireAlarmMu.Unlock()
+
+	if wantActive {
+		log.Printf("INFO: Fire alarm interface ACTIVE (fail-unlock; reason=%q): holding door relay energized.", reason)
+		log.Printf("DEBUG: Fire alarm interface: GPIO latched active — door strike / operator held open until input clears.")
+		if ctx.GPIO != nil && ctx.GPIO.HasOutput("door") {
+			ctx.GPIO.ActionOn("door")
+		} else if ctx.GPIO == nil {
+			log.Printf("DEBUG: Fire alarm interface: no GPIO manager; software state only.")
+		}
+		return
+	}
+	log.Printf("INFO: Fire alarm interface CLEARED (reason=%q): releasing door relay hold.", reason)
+	log.Printf("DEBUG: Fire alarm interface: GPIO inactive — returning door relay to software control.")
+	if ctx.GPIO != nil && ctx.GPIO.HasOutput("door") {
+		ctx.GPIO.ActionOff("door")
+	}
+}
+
+// syncFireAlarmFromHardwareReason samples the fire-alarm interface BCM input (if configured) and updates runtime state.
+func (ctx *AppContext) syncFireAlarmFromHardwareReason(reason string) {
+	ctx.configMu.RLock()
+	pin := ctx.GPIOSettings.FireAlarmInterfacePin
+	activeLow := ctx.GPIOSettings.FireAlarmInterfaceActiveLow
+	ctx.configMu.RUnlock()
+	if pin == 0 || ctx.GPIO == nil {
+		return
+	}
+	inp, ok := ctx.GPIO.Inputs["fire_alarm_interface"]
+	if !ok {
+		return
+	}
+	isLow := inp.Pin.Read() == rpio.Low
+	want := isLow == activeLow
+	log.Printf("DEBUG: Fire alarm interface: GPIO sample BCM=%d read_low=%v active_low_wiring=%v => alarm_active=%v (%s).",
+		pin, isLow, activeLow, want, reason)
+	ctx.applyFireAlarmInterfaceTransition(want, "gpio:"+reason)
+}
+
+func (ctx *AppContext) syncFireAlarmAfterConfigReload() {
+	ctx.configMu.RLock()
+	pin := ctx.GPIOSettings.FireAlarmInterfacePin
+	ctx.configMu.RUnlock()
+	if pin == 0 && ctx.FireAlarmInterfaceActive() {
+		ctx.applyFireAlarmInterfaceTransition(false, "config_reload_pin_disabled")
+		return
+	}
+	if pin != 0 {
+		ctx.syncFireAlarmFromHardwareReason("config_reload")
+	}
+}
+
+func setupFireAlarmInterfaceGPIOInput(ctx *AppContext, gpio *GPIOManager) {
+	ctx.configMu.RLock()
+	pin := ctx.GPIOSettings.FireAlarmInterfacePin
+	pullUp := ctx.GPIOSettings.FireAlarmInterfaceActiveLow
+	ctx.configMu.RUnlock()
+	if pin == 0 {
+		return
+	}
+	gpio.AddInputAnyEdge("fire_alarm_interface", pin, pullUp, func() {
+		ctx.syncFireAlarmFromHardwareReason("edge")
+	})
+	log.Printf("INFO: Fire alarm interface input: BCM %d (active_low_wiring=%v, pull_up=%v).", pin, pullUp, pullUp)
+}
+
+func setupTamperSwitchGPIOInput(ctx *AppContext, gpio *GPIOManager) {
+	ctx.configMu.RLock()
+	pin := ctx.GPIOSettings.TamperSwitchPin
+	activeLow := ctx.GPIOSettings.TamperSwitchActiveLow
+	ctx.configMu.RUnlock()
+	if pin == 0 {
+		return
+	}
+	gpio.AddInputAnyEdge("tamper_switch", pin, activeLow, func() {
+		inp, ok := gpio.Inputs["tamper_switch"]
+		if !ok {
+			return
+		}
+		isLow := inp.Pin.Read() == rpio.Low
+		secure := isLow == activeLow
+		log.Printf("DEBUG: Tamper switch: edge on BCM %d read_low=%v active_low_wiring=%v => enclosure_secure=%v.",
+			pin, isLow, activeLow, secure)
+	})
+	log.Printf("INFO: Tamper switch input: BCM %d (active_low_wiring=%v, pull_up=%v).", pin, activeLow, activeLow)
+}
+
+func setupMotionSensorGPIOInput(ctx *AppContext, gpio *GPIOManager) {
+	ctx.configMu.RLock()
+	pin := ctx.GPIOSettings.MotionSensorPin
+	activeLow := ctx.GPIOSettings.MotionSensorActiveLow
+	ctx.configMu.RUnlock()
+	if pin == 0 {
+		return
+	}
+	gpio.AddInput("motion_sensor", pin, activeLow, func() {
+		log.Printf("DEBUG: Motion sensor: presence / approach detected on BCM %d (active_low_wiring=%v).", pin, activeLow)
+	})
+	log.Printf("INFO: Motion sensor input: BCM %d (active_low_wiring=%v, pull_up=%v; edge=asserted).", pin, activeLow, activeLow)
+}
+
+// pulseAuthorizedAccessAuxRelays pulses automatic door operator and intercom/camera trigger relays after a normal access grant.
+func (ctx *AppContext) pulseAuthorizedAccessAuxRelays(cfg DeviceConfig) {
+	if ctx.GPIO == nil || ctx.FiremansServiceActive() {
+		return
+	}
+	ado := cfg.AutomaticDoorOperatorPulseDuration
+	if ado <= 0 {
+		ado = cfg.RelayPulseDuration
+	}
+	ict := cfg.IntercomCameraTriggerPulseDuration
+	if ctx.GPIO.HasOutput("automatic_door_operator") {
+		log.Printf("DEBUG: Automatic door operator relay: pulse %s (authorized access).", ado)
+		ctx.GPIO.ActionPulse("automatic_door_operator", ado)
+	}
+	if ctx.GPIO.HasOutput("intercom_camera_trigger") {
+		log.Printf("DEBUG: Intercom/camera trigger relay: pulse %s (authorized access).", ict)
+		ctx.GPIO.ActionPulse("intercom_camera_trigger", ict)
+	}
+}
+
+func deenergizeAllRelayOutputs(gpio *GPIOManager, holdDoorOpenForFireAlarm bool) {
 	if gpio == nil {
 		return
 	}
@@ -7630,6 +8019,10 @@ func deenergizeAllRelayOutputs(gpio *GPIOManager) {
 	}
 	sort.Strings(names)
 	for _, n := range names {
+		if holdDoorOpenForFireAlarm && n == "door" {
+			log.Printf("DEBUG: Fire alarm interface: skipping door relay in bulk de-energize (fail-unlock hold).")
+			continue
+		}
 		gpio.ActionOff(n)
 	}
 }
@@ -7710,7 +8103,11 @@ func (ctx *AppContext) runFiremansServiceEnter(reason string) {
 	ctx.firemansStopLightingAutoOffTimer()
 	clearElevatorGrantState(ctx)
 	if ctx.GPIO != nil {
-		deenergizeAllRelayOutputs(ctx.GPIO)
+		deenergizeAllRelayOutputs(ctx.GPIO, ctx.FireAlarmInterfaceActive())
+		if ctx.FireAlarmInterfaceActive() && ctx.GPIO.HasOutput("door") {
+			ctx.GPIO.ActionOn("door")
+			log.Printf("DEBUG: Fire alarm interface: door relay re-energized after fireman's service bulk off (fail-unlock).")
+		}
 		if ctx.GPIO.HasOutput("lighting") {
 			ctx.GPIO.ActionOn("lighting")
 			log.Printf("DEBUG: Fireman's service: lighting relay held ON (emergency illumination).")
@@ -8152,6 +8549,7 @@ func handleMQTTPairPeerPayload(ctx *AppContext, payload []byte) {
 	fireEventWebhook(ctx, "mqtt_pair_peer_exit_pulse", map[string]any{"cmd": cmd, "operation_mode": mode})
 	if ctx.GPIO != nil {
 		ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
+		ctx.pulseAuthorizedAccessAuxRelays(cfg)
 	}
 }
 

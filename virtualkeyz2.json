@@ -106,7 +106,17 @@
     "lighting_relay_pin": 10,
     "lighting_relay_active_low": false,
     "firemans_service_input_pin": 0,
-    "firemans_service_active_low": false
+    "firemans_service_active_low": false,
+    "automatic_door_operator_relay_pin": 0,
+    "automatic_door_operator_relay_active_low": false,
+    "intercom_camera_trigger_relay_pin": 0,
+    "intercom_camera_trigger_relay_active_low": false,
+    "fire_alarm_interface_pin": 0,
+    "fire_alarm_interface_active_low": true,
+    "tamper_switch_pin": 0,
+    "tamper_switch_active_low": true,
+    "motion_sensor_pin": 0,
+    "motion_sensor_active_low": true
   },
   "tech_menu_prompt": "Access-Control-Room-1",
   "elevator_parameter_modes": {
