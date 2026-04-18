@@ -46,8 +46,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.08"
-	SoftwareReleaseUTC = "2026-04-18T04:38:27Z"
+	SoftwareVersion    = "0.09"
+	SoftwareReleaseUTC = "2026-04-18T04:56:49Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -279,7 +279,7 @@ type AppContext struct {
 	doorAlarmMu        sync.Mutex
 	doorHoldExtraGrace time.Duration
 
-	// Lighting control (gpio lighting_* pins + device.lighting_timeout): manual lighting button only (independent of door/PIN).
+	// Lighting control (gpio lighting_* pins + device.lighting_timeout): manual lighting button and valid PIN (default access modes); timer reload does not de-energize the relay.
 	lightingMu       sync.Mutex
 	lightingTimerGen uint64
 	lightingOffTimer *time.Timer
@@ -466,7 +466,7 @@ type DeviceConfig struct {
 	AccessScheduleApplyToFallbackPin bool
 	// AccessExceptionSiteTimezone: IANA timezone for interpreting exception-calendar civil dates (holidays / early closures). Empty uses the system local timezone.
 	AccessExceptionSiteTimezone string
-	// LightingTimeout: manual lighting button keeps lighting relay energized for this duration; each press restarts the timer. Clamped in normalizeKeypadAndPinUX.
+	// LightingTimeout: lighting relay hold after manual button or accepted PIN; each new press or PIN restarts the full timer without toggling the relay off until expiry. Clamped in normalizeKeypadAndPinUX.
 	LightingTimeout time.Duration
 }
 
@@ -2341,7 +2341,7 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   tech_menu_history_max             default 100, max 10000
   keypad_inter_digit_timeout        3s–10s, default 5s
   keypad_session_timeout            10s–60s from first digit, default 30s
-  lighting_timeout                  manual lighting relay hold after button press (default 30m; each press resets)
+  lighting_timeout                  lighting relay hold after manual button or accepted PIN (default 30m; each resets full duration; relay off only when timer expires)
   pin_entry_feedback_delay          2s–10s after PIN sound, default 3s
   pin_lockout_enabled               true|false (false disables keypad lockout entirely)
   pin_lockout_after_attempts        0=off, else 3–5 failed PINs, default 5
@@ -5095,6 +5095,9 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 	} else {
 		log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
 	}
+	if strings.TrimSpace(pin) != "" {
+		ctx.lightingEnergizeAndArmTimer(fmt.Sprintf("pin_accepted_%s", strings.TrimSpace(keypadRole)))
+	}
 	if pairedEntryPublishesToPeer(mode, cfg.PairPeerRole) {
 		publishMQTTPairPeerPulse(ctx, cfg)
 	}
@@ -6210,7 +6213,7 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  door_sensor_closed_is_low: %v\n", c.DoorSensorClosedIsLow)
 	fmt.Fprintf(w, "  relay_pulse_duration: %s\n", c.RelayPulseDuration)
 	fmt.Fprintf(w, "  buzzer_relay_pulse_duration: %s\n", c.BuzzerRelayPulseDuration)
-	fmt.Fprintf(w, "  lighting_timeout: %s (manual lighting button hold; default 30m; not tied to door or PIN)\n", c.LightingTimeout)
+	fmt.Fprintf(w, "  lighting_timeout: %s (manual button or accepted PIN; default 30m; full reset each trigger; relay off only at expiry)\n", c.LightingTimeout)
 	fmt.Fprintf(w, "  pin_reject_buzzer_after_attempts: %d\n", c.PinRejectBuzzerAfterAttempts)
 	fmt.Fprintf(w, "  keypad_inter_digit_timeout: %s\n", c.KeypadInterDigitTimeout)
 	fmt.Fprintf(w, "  keypad_session_timeout: %s\n", c.KeypadSessionTimeout)
@@ -7171,9 +7174,13 @@ func lightingRelayOutputReady(ctx *AppContext) bool {
 	return relay != 0
 }
 
-// lightingEnergizeAndArmTimer turns the lighting relay on and (re)starts the auto-off timer (manual lighting button only).
+// lightingEnergizeAndArmTimer turns the lighting relay on (if not already held by an active auto-off timer) and (re)starts the auto-off timer. Reloading the timer while it is running does not pulse the relay off; the relay is only de-energized when the timer fires.
 func (ctx *AppContext) lightingEnergizeAndArmTimer(reason string) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "timer_reset"
+	}
 	if !lightingRelayOutputReady(ctx) {
+		log.Printf("DEBUG: Lighting: skip arm (%s): relay output not ready (GPIO or lighting_relay_pin).", reason)
 		return
 	}
 	ctx.configMu.RLock()
@@ -7184,38 +7191,45 @@ func (ctx *AppContext) lightingEnergizeAndArmTimer(reason string) {
 	ctx.configMu.RUnlock()
 
 	ctx.lightingMu.Lock()
-	ctx.lightingTimerGen++
-	gen := ctx.lightingTimerGen
+	hadRunningTimer := ctx.lightingOffTimer != nil
 	if ctx.lightingOffTimer != nil {
+		log.Printf("DEBUG: Lighting: stopping previous auto-off timer before re-arm (%s).", reason)
 		ctx.lightingOffTimer.Stop()
 		ctx.lightingOffTimer = nil
 	}
-	ctx.GPIO.ActionOn("lighting")
+	ctx.lightingTimerGen++
+	gen := ctx.lightingTimerGen
+	if hadRunningTimer {
+		log.Printf("DEBUG: Lighting: timer reload to full duration %s (%s); relay left ON (gen=%d).", timeout, reason, gen)
+	} else {
+		log.Printf("DEBUG: Lighting: energizing relay and starting auto-off %s (%s; gen=%d).", timeout, reason, gen)
+		ctx.GPIO.ActionOn("lighting")
+	}
 	ctx.lightingOffTimer = time.AfterFunc(timeout, func() {
 		ctx.lightingTimerExpired(gen)
 	})
 	ctx.lightingMu.Unlock()
 
-	if strings.TrimSpace(reason) == "" {
-		reason = "timer_reset"
-	}
-	log.Printf("INFO: Lighting: relay ON; timer reset (%s) [%s].", timeout, reason)
+	log.Printf("DEBUG: Lighting: auto-off timer armed for %s [%s] gen=%d.", timeout, reason, gen)
 	playSoundAsyncEnabled(DeviceConfig{SoundCardName: soundCard}, setPath, setEn)
 }
 
 func (ctx *AppContext) lightingTimerExpired(gen uint64) {
+	log.Printf("DEBUG: Lighting: auto-off callback fired (gen=%d).", gen)
 	ctx.lightingMu.Lock()
 	if gen != ctx.lightingTimerGen {
+		log.Printf("DEBUG: Lighting: auto-off ignored (stale gen=%d, current=%d); relay unchanged.", gen, ctx.lightingTimerGen)
 		ctx.lightingMu.Unlock()
 		return
 	}
 	ctx.lightingOffTimer = nil
 	if ctx.GPIO != nil {
+		log.Printf("DEBUG: Lighting: de-energizing relay (timer expired, gen=%d).", gen)
 		ctx.GPIO.ActionOff("lighting")
 	}
 	ctx.lightingMu.Unlock()
 
-	log.Printf("INFO: Lighting: relay OFF (timeout).")
+	log.Printf("DEBUG: Lighting: relay OFF after lighting_timeout (gen=%d).", gen)
 	ctx.configMu.RLock()
 	expPath := strings.TrimSpace(ctx.Config.SoundLightingTimerExpired)
 	soundCard := ctx.Config.SoundCardName
