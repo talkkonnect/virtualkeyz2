@@ -45,8 +45,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.16"
-	SoftwareReleaseUTC = "2026-04-19T03:35:52Z"
+	SoftwareVersion    = "0.17"
+	SoftwareReleaseUTC = "2026-04-19T05:46:44Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -193,6 +193,8 @@ type GPIOSettings struct {
 	// XL9535I2CBus / XL9535I2CAddr: used when relay_output_mode=xl9535 (defaults match MCP23017).
 	XL9535I2CBus  int
 	XL9535I2CAddr uint8
+	// I2CBusRecoverySCLBCM: BCM GPIO wired to the I2C SCL line for stuck-bus recovery (9 clock pulses after closing /dev/i2c-*). 0 = skip bit-bang (adapter close+reopen only).
+	I2CBusRecoverySCLBCM uint8
 
 	DoorRelayPin         uint8
 	DoorRelayActiveLow   bool
@@ -631,6 +633,7 @@ type virtualkeyz2GPIOJSON struct {
 	MCP23017I2CAddr                     *int    `json:"mcp23017_i2c_addr"`
 	XL9535I2CBus                        *int    `json:"xl9535_i2c_bus"`
 	XL9535I2CAddr                       *int    `json:"xl9535_i2c_addr"`
+	I2CBusRecoverySCLBCM                *int    `json:"i2c_bus_recovery_scl_bcm,omitempty"`
 	DoorRelayPin                        *int    `json:"door_relay_pin"`
 	DoorRelayActiveLow                  *bool   `json:"door_relay_active_low"`
 	BuzzerRelayPin                      *int    `json:"buzzer_relay_pin"`
@@ -1433,6 +1436,13 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 		}
 		app.GPIOSettings.XL9535I2CAddr = uint8(a)
 	}
+	if g.I2CBusRecoverySCLBCM != nil {
+		u, err := bcmUint8("i2c_bus_recovery_scl_bcm", *g.I2CBusRecoverySCLBCM)
+		if err != nil {
+			return err
+		}
+		app.GPIOSettings.I2CBusRecoverySCLBCM = u
+	}
 	normalizeGPIORelaySettings(&app.GPIOSettings)
 	relayMode := normalizeRelayOutputMode(app.GPIOSettings.RelayOutputMode)
 
@@ -1779,6 +1789,7 @@ type virtualkeyz2PersistGPIO struct {
 	MCP23017I2CAddr                     int    `json:"mcp23017_i2c_addr"`
 	XL9535I2CBus                        int    `json:"xl9535_i2c_bus"`
 	XL9535I2CAddr                       int    `json:"xl9535_i2c_addr"`
+	I2CBusRecoverySCLBCM                int    `json:"i2c_bus_recovery_scl_bcm"`
 	DoorRelayPin                        int    `json:"door_relay_pin"`
 	DoorRelayActiveLow                  bool   `json:"door_relay_active_low"`
 	BuzzerRelayPin                      int    `json:"buzzer_relay_pin"`
@@ -1930,6 +1941,7 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.GPIO.MCP23017I2CAddr = int(g.MCP23017I2CAddr)
 	out.GPIO.XL9535I2CBus = g.XL9535I2CBus
 	out.GPIO.XL9535I2CAddr = int(g.XL9535I2CAddr)
+	out.GPIO.I2CBusRecoverySCLBCM = int(g.I2CBusRecoverySCLBCM)
 	out.GPIO.DoorRelayPin = int(g.DoorRelayPin)
 	out.GPIO.DoorRelayActiveLow = g.DoorRelayActiveLow
 	out.GPIO.BuzzerRelayPin = int(g.BuzzerRelayPin)
@@ -2395,6 +2407,16 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 				normalizeGPIORelaySettings(&ctx.GPIOSettings)
 			}
 		}
+	case "i2c_bus_recovery_scl_bcm":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			var u uint8
+			u, err = bcmUint8("i2c_bus_recovery_scl_bcm", int(n))
+			if err == nil {
+				ctx.GPIOSettings.I2CBusRecoverySCLBCM = u
+			}
+		}
 	case "door_relay_pin":
 		var n int64
 		n, err = strconv.ParseInt(value, 10, 32)
@@ -2814,6 +2836,7 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   mcp23017_i2c_addr                 MCP23017: 7-bit address, default 32 (0x20)
   xl9535_i2c_bus                    XL9535: Linux I2C bus (default 1)
   xl9535_i2c_addr                   XL9535: 7-bit address, default 32 (0x20)
+  i2c_bus_recovery_scl_bcm          optional BCM wired to I2C SCL for stuck-bus recovery (9 clock pulses after /dev/i2c-* close); 0=skip bit-bang
   exit_button_pin                   REX GPIO (access_entry_with_exit_button)
   exit_button_active_low            true|false
   entry_button_pin                  GPIO (access_exit_with_entry_button)
@@ -2986,6 +3009,7 @@ func main() {
 	} else {
 		go manageHardwareHeartbeat(appCtx.GPIOSettings.HeartbeatLEDPin)
 		gpio := NewGPIOManager()
+		defer gpio.CloseI2CRelayForShutdown()
 		relayI2CMode := isRelayOutputI2CExpander(appCtx.GPIOSettings.RelayOutputMode)
 		useI2CExpander := false
 		relayOutMode := normalizeRelayOutputMode(appCtx.GPIOSettings.RelayOutputMode)
@@ -3000,8 +3024,10 @@ func main() {
 					log.Println("WARNING: Relay outputs disabled (mcp23017 mode but expander not available; pins 0-15 are not valid BCM numbers).")
 				} else {
 					gpio.SetI2CRelayExpander(mcpDev)
+					gpio.SetI2CRelayBusRecovery(func() (i2cRelayExpander, error) {
+						return mcp23017.Open(bus, addr)
+					}, appCtx.GPIOSettings.I2CBusRecoverySCLBCM)
 					useI2CExpander = true
-					defer mcpDev.Close()
 					log.Printf("INFO: Relay outputs on MCP23017 bus %d address 0x%02x (pins 0-15 = GPA0..GPB7).", bus, addr)
 				}
 			case RelayOutputXL9535:
@@ -3013,8 +3039,10 @@ func main() {
 					log.Println("WARNING: Relay outputs disabled (xl9535 mode but expander not available; pins 0-15 are not valid BCM numbers).")
 				} else {
 					gpio.SetI2CRelayExpander(xlDev)
+					gpio.SetI2CRelayBusRecovery(func() (i2cRelayExpander, error) {
+						return xl9535.Open(bus, addr)
+					}, appCtx.GPIOSettings.I2CBusRecoverySCLBCM)
 					useI2CExpander = true
-					defer xlDev.Close()
 					log.Printf("INFO: Relay outputs on XL9535 bus %d address 0x%02x (pins 0-7 = port0, 8-15 = port1).", bus, addr)
 				}
 			}
@@ -4488,17 +4516,19 @@ func (ctx *AppContext) sumOccupancyInMemory() (total int) {
 }
 
 // adjustDualKeypadOccupancy updates per-PIN "inside" counts for access_dual_usb_keypad (entry +1, exit −1). Returns total people across all PINs and this PIN's inside count after the change.
-func (ctx *AppContext) adjustDualKeypadOccupancy(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string) {
+// zoneBookkeepingChanged is true when this call modified stored occupancy (used to roll back after a failed hardware actuation).
+func (ctx *AppContext) adjustDualKeypadOccupancy(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string, zoneBookkeepingChanged bool) {
 	pin = strings.TrimSpace(pin)
 	if ctx.DB != nil {
 		return ctx.adjustDualKeypadOccupancyDB(pin, keypadRole)
 	}
 	if pin == "" {
-		return 0, 0, ""
+		return 0, 0, "", false
 	}
 	switch keypadRole {
 	case "entry":
 		insideThisPIN = int(ctx.occupancyGetOrCreateAtomic(pin).Add(1))
+		zoneBookkeepingChanged = true
 	case "exit":
 		v, ok := ctx.occupancyCounters.Load(pin)
 		if !ok {
@@ -4516,31 +4546,32 @@ func (ctx *AppContext) adjustDualKeypadOccupancy(pin, keypadRole string) (areaTo
 			}
 			if ctr.CompareAndSwap(cur, cur-1) {
 				insideThisPIN = int(cur - 1)
+				zoneBookkeepingChanged = true
 				break
 			}
 		}
 	default:
-		return 0, 0, ""
+		return 0, 0, "", false
 	}
-	return ctx.sumOccupancyInMemory(), insideThisPIN, mismatch
+	return ctx.sumOccupancyInMemory(), insideThisPIN, mismatch, zoneBookkeepingChanged
 }
 
 // adjustDualKeypadOccupancyDB updates dual_keypad_zone_occupancy in a single transaction.
-func (ctx *AppContext) adjustDualKeypadOccupancyDB(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string) {
+func (ctx *AppContext) adjustDualKeypadOccupancyDB(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string, zoneBookkeepingChanged bool) {
 	pin = strings.TrimSpace(pin)
 	if pin == "" {
-		return 0, 0, ""
+		return 0, 0, "", false
 	}
 	switch keypadRole {
 	case "entry", "exit":
 	default:
-		return 0, 0, ""
+		return 0, 0, "", false
 	}
 
 	tx, err := ctx.DB.BeginTx(context.Background(), nil)
 	if err != nil {
 		log.Printf("WARNING: dual keypad occupancy tx begin: %v", err)
-		return 0, 0, ""
+		return 0, 0, "", false
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -4552,12 +4583,13 @@ func (ctx *AppContext) adjustDualKeypadOccupancyDB(pin, keypadRole string) (area
 		`, pin)
 		if err != nil {
 			log.Printf("WARNING: dual keypad occupancy entry: %v", err)
-			return 0, 0, ""
+			return 0, 0, "", false
 		}
 		if err = tx.QueryRow(`SELECT inside_count FROM dual_keypad_zone_occupancy WHERE pin = ?`, pin).Scan(&insideThisPIN); err != nil {
 			log.Printf("WARNING: dual keypad occupancy entry read: %v", err)
-			return 0, 0, ""
+			return 0, 0, "", false
 		}
+		zoneBookkeepingChanged = true
 	case "exit":
 		var cur int
 		err = tx.QueryRow(`SELECT inside_count FROM dual_keypad_zone_occupancy WHERE pin = ?`, pin).Scan(&cur)
@@ -4566,36 +4598,54 @@ func (ctx *AppContext) adjustDualKeypadOccupancyDB(pin, keypadRole string) (area
 			insideThisPIN = 0
 		} else if err != nil {
 			log.Printf("WARNING: dual keypad occupancy exit read: %v", err)
-			return 0, 0, ""
+			return 0, 0, "", false
 		} else if cur <= 0 {
 			mismatch = "exit_without_recorded_entry"
 			insideThisPIN = 0
 		} else {
 			if _, err = tx.Exec(`UPDATE dual_keypad_zone_occupancy SET inside_count = inside_count - 1 WHERE pin = ? AND inside_count > 0`, pin); err != nil {
 				log.Printf("WARNING: dual keypad occupancy exit update: %v", err)
-				return 0, 0, ""
+				return 0, 0, "", false
 			}
 			insideThisPIN = cur - 1
 			if insideThisPIN == 0 {
 				if _, err = tx.Exec(`DELETE FROM dual_keypad_zone_occupancy WHERE pin = ?`, pin); err != nil {
 					log.Printf("WARNING: dual keypad occupancy exit delete: %v", err)
-					return 0, 0, ""
+					return 0, 0, "", false
 				}
 			}
+			zoneBookkeepingChanged = true
 		}
 	}
 
 	var sum int64
 	if err = tx.QueryRow(`SELECT COALESCE(SUM(inside_count), 0) FROM dual_keypad_zone_occupancy`).Scan(&sum); err != nil {
 		log.Printf("WARNING: dual keypad occupancy sum: %v", err)
-		return 0, 0, ""
+		return 0, 0, "", false
 	}
 	areaTotal = int(sum)
 	if err = tx.Commit(); err != nil {
 		log.Printf("WARNING: dual keypad occupancy commit: %v", err)
-		return 0, 0, ""
+		return 0, 0, "", false
 	}
-	return areaTotal, insideThisPIN, mismatch
+	return areaTotal, insideThisPIN, mismatch, zoneBookkeepingChanged
+}
+
+// revertDualKeypadZoneAfterFailedActuation undoes adjustDualKeypadOccupancy when a door relay actuation failed after occupancy was updated.
+func (ctx *AppContext) revertDualKeypadZoneAfterFailedActuation(pin, keypadRole string) {
+	pin = strings.TrimSpace(pin)
+	if pin == "" {
+		return
+	}
+	switch strings.TrimSpace(keypadRole) {
+	case "entry":
+		_, _, _, _ = ctx.adjustDualKeypadOccupancy(pin, "exit")
+	case "exit":
+		_, _, _, _ = ctx.adjustDualKeypadOccupancy(pin, "entry")
+	default:
+		return
+	}
+	log.Printf("INFO: Dual keypad zone occupancy reverted after hardware actuation failure (pin=%s role=%s).", maskPINForTechDisplay(pin), keypadRole)
 }
 
 func keypadLogTag(keypadRole string) string {
@@ -4780,10 +4830,16 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 			fireEventWebhook(ctx, "mqtt_remote_door_open_denied", map[string]any{"mqtt_topic": topic, "reason": "firemans_service_active"})
 			return
 		}
-		playSoundAsyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 		if ctx.GPIO != nil {
-			ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
+			if err := ctx.GPIO.ActionPulseBlocking("door", cfg.RelayPulseDuration); err != nil {
+				mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "hardware_actuation_failed", Detail: err.Error()})
+				fireEventWebhook(ctx, "hardware_actuation_failed", map[string]any{"mqtt_topic": topic, "source": "mqtt_remote_door_open", "error": err.Error()})
+				playSoundAsyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+				log.Printf("ERROR: MQTT open_door: door relay actuation failed: %v", err)
+				return
+			}
 			ctx.pulseAuthorizedAccessAuxRelays(cfg)
+			playSoundAsyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "door relay pulsed"})
 			fireEventWebhook(ctx, "mqtt_remote_door_open", map[string]any{"mqtt_topic": topic})
 		} else {
@@ -5813,11 +5869,13 @@ func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, 
 }
 
 // grantDefaultModeDoorUnlockLikePIN performs the same unlock side effects as processPIN's default branch
-// (non-elevator modes): welcome sound, door relay pulse, optional pair-peer MQTT, pin_accepted webhook,
+// (non-elevator modes): door relay pulse (blocking when GPIO relays are used), welcome sound, optional pair-peer MQTT, pin_accepted webhook,
 // then pin_entry_feedback_delay. whExtra is merged into the webhook payload (e.g. dual-keypad occupancy).
-// pin is the credential (empty for physical entry/exit buttons); temporary credentials consume a use_count here when applicable.
+// pin is the credential (empty for physical entry/exit buttons); temporary credentials consume a use_count only after a successful door actuation.
+// dualKeypadZoneBookkeepingChanged: when true and the door relay fails, dual-keypad occupancy updated before this call is reverted.
 // doorHoldExtra extends the configured door_open_warning_after for the next open period (accessibility); use 0 when not from access_pins.
-func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceConfig, mode, keypadRole, credLabel string, doorBCM uint8, feedbackDelay time.Duration, doorHoldExtra time.Duration, whExtra map[string]any) {
+// Returns false when the door relay could not be actuated (after I2C retries and bus recovery); true on software-only grants and successful pulses.
+func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceConfig, mode, keypadRole, credLabel string, doorBCM uint8, feedbackDelay time.Duration, doorHoldExtra time.Duration, whExtra map[string]any, dualKeypadZoneBookkeepingChanged bool) bool {
 	ctx.noteDoorHoldExtraGrace(doorHoldExtra)
 	okSound := cfg.SoundPinOK
 	okEn := cfg.SoundPinOKEnabled
@@ -5825,17 +5883,37 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 		okSound = cfg.SoundAccessGranted
 		okEn = cfg.SoundAccessGrantedEnabled
 	}
-	playSoundSyncEnabled(cfg, okSound, okEn)
 	relPulsed := false
 	if ctx.FiremansServiceActive() {
 		log.Printf("DEBUG: Fireman's service: grant path — door relay pulse suppressed; PIN lighting timer skipped (emergency lighting policy).")
 	} else if ctx.GPIO != nil {
-		ctx.GPIO.ActionPulse("door", cfg.RelayPulseDuration)
+		if err := ctx.GPIO.ActionPulseBlocking("door", cfg.RelayPulseDuration); err != nil {
+			ctx.clearDoorHoldExtraGrace()
+			if dualKeypadZoneBookkeepingChanged {
+				ctx.revertDualKeypadZoneAfterFailedActuation(pin, keypadRole)
+			}
+			failWh := map[string]any{
+				"operation_mode":   mode,
+				"keypad_role":      keypadRole,
+				"credential_label": credLabel,
+				"door_relay_gpio":  int(doorBCM),
+				"error":            err.Error(),
+			}
+			for k, v := range whExtra {
+				failWh[k] = v
+			}
+			fireEventWebhook(ctx, "hardware_actuation_failed", failWh)
+			log.Printf("ERROR: Door relay actuation failed (hardware_actuation_failed): %v", err)
+			playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+			time.Sleep(feedbackDelay)
+			return false
+		}
 		relPulsed = true
 		ctx.pulseAuthorizedAccessAuxRelays(cfg)
 	} else {
 		log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
 	}
+	playSoundSyncEnabled(cfg, okSound, okEn)
 	if strings.TrimSpace(pin) != "" && !ctx.FiremansServiceActive() {
 		ctx.lightingEnergizeAndArmTimer(fmt.Sprintf("pin_accepted_%s", strings.TrimSpace(keypadRole)))
 	}
@@ -5858,6 +5936,7 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 	fireEventWebhook(ctx, "pin_accepted", wh)
 	ctx.credentialRecordSuccessfulUse(pin, mode, keypadRole)
 	time.Sleep(feedbackDelay)
+	return true
 }
 
 func processPIN(ctx *AppContext, pin string, keypadRole string) {
@@ -6033,8 +6112,9 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		default:
 			var areaTotal, insideThis int
 			var occMismatch string
+			var zoneBookkeepingChanged bool
 			if mode == ModeAccessDualUSBKeypad && (keypadRole == "entry" || keypadRole == "exit") {
-				areaTotal, insideThis, occMismatch = ctx.adjustDualKeypadOccupancy(pin, keypadRole)
+				areaTotal, insideThis, occMismatch, zoneBookkeepingChanged = ctx.adjustDualKeypadOccupancy(pin, keypadRole)
 				log.Printf("INFO: PIN accepted (dual USB %s keypad; credential=%s; people_in_area_total=%d; this_credential_inside=%d); door relay GPIO %d.",
 					keypadRole, credTag, areaTotal, insideThis, doorBCM)
 				if occMismatch != "" {
@@ -6056,7 +6136,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 					whExtra["occupancy_mismatch"] = occMismatch
 				}
 			}
-			ctx.grantDefaultModeDoorUnlockLikePIN(pin, cfg, mode, keypadRole, credLabel, doorBCM, feedbackDelay, cred.DoorHoldExtra, whExtra)
+			ctx.grantDefaultModeDoorUnlockLikePIN(pin, cfg, mode, keypadRole, credLabel, doorBCM, feedbackDelay, cred.DoorHoldExtra, whExtra, zoneBookkeepingChanged)
 			return
 		}
 	}
@@ -6250,6 +6330,7 @@ var techMenuCfgKeysForCompletion = []string{
 	"firemans_service_input_pin",
 	"heartbeat_interval",
 	"heartbeat_led_pin",
+	"i2c_bus_recovery_scl_bcm",
 	"intercom_camera_trigger_pulse_duration",
 	"intercom_camera_trigger_relay_active_low",
 	"intercom_camera_trigger_relay_pin",
@@ -7153,6 +7234,7 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  mcp23017_i2c_addr: %d\n", int(g.MCP23017I2CAddr))
 	fmt.Fprintf(w, "  xl9535_i2c_bus: %d\n", g.XL9535I2CBus)
 	fmt.Fprintf(w, "  xl9535_i2c_addr: %d\n", int(g.XL9535I2CAddr))
+	fmt.Fprintf(w, "  i2c_bus_recovery_scl_bcm: %d\n", g.I2CBusRecoverySCLBCM)
 	fmt.Fprintf(w, "  door_relay_pin: %d\n", g.DoorRelayPin)
 	fmt.Fprintf(w, "  door_relay_active_low: %v\n", g.DoorRelayActiveLow)
 	fmt.Fprintf(w, "  buzzer_relay_pin: %d\n", g.BuzzerRelayPin)
@@ -7731,6 +7813,42 @@ func gpioLineIsPhysicalLow(line *gpiocdev.Line) (bool, error) {
 	return v == 0, nil
 }
 
+// i2cRelayRetryDelays are backoff delays before I2C relay write attempts 2–5 within a phase (5 ms, 15 ms, then ×3).
+var i2cRelayRetryDelays = []time.Duration{
+	5 * time.Millisecond,
+	15 * time.Millisecond,
+	45 * time.Millisecond,
+	135 * time.Millisecond,
+}
+
+const i2cRelayAttemptsPerPhase = 5
+
+// bitbangI2CBusRecoverySCL emits up to nine SCL pulses on a BCM line (I2C adapter closed) to clock a stuck slave off SDA.
+func bitbangI2CBusRecoverySCL(chip string, sclBCM uint8) {
+	if chip == "" || sclBCM == 0 {
+		return
+	}
+	ln, err := gpiocdev.RequestLine(chip, int(sclBCM), gpiocdev.AsOutput(1), gpiocdev.WithConsumer("virtualkeyz2-i2c-recovery"))
+	if err != nil {
+		log.Printf("WARNING: I2C bus recovery: cannot request SCL GPIO %d: %v", sclBCM, err)
+		return
+	}
+	defer ln.Close()
+	toggle := func(high bool) {
+		v := 0
+		if high {
+			v = 1
+		}
+		_ = ln.SetValue(v)
+		time.Sleep(5 * time.Microsecond)
+	}
+	for i := 0; i < 9; i++ {
+		toggle(false)
+		toggle(true)
+	}
+	log.Printf("INFO: I2C bus recovery: completed SCL bit-bang on BCM %d.", sclBCM)
+}
+
 // --- Structures ---
 
 // i2cRelayExpander drives relay outputs 0–15 on an MCP23017 or XL9535 (see gpio.relay_output_mode).
@@ -7771,7 +7889,11 @@ type GPIOManager struct {
 	Outputs map[string]*OutputConfig
 	Inputs  map[string]*InputConfig
 
-	i2cRelay i2cRelayExpander
+	i2cRelay       i2cRelayExpander
+	i2cRelayCloser io.Closer
+	i2cOpsMu       sync.Mutex // serializes expander I/O, bus recovery, and adapter reinit
+	i2cReopenFn    func() (i2cRelayExpander, error)
+	i2cBusRecoverySCLBCM uint8
 
 	// doorHoldWhile, if set, is consulted at the end of ActionPulse("door", ...): when true the door relay
 	// stays energized (fire alarm interface fail-unlock) instead of returning to off.
@@ -7799,7 +7921,140 @@ func (m *GPIOManager) SetDoorHoldOpenWhile(f func() bool) {
 
 // SetI2CRelayExpander attaches an MCP23017 or XL9535 for outputs registered with UseI2CRelay true.
 func (m *GPIOManager) SetI2CRelayExpander(d i2cRelayExpander) {
+	m.i2cOpsMu.Lock()
+	defer m.i2cOpsMu.Unlock()
+	m.setI2CRelayExpanderLocked(d)
+}
+
+func (m *GPIOManager) setI2CRelayExpanderLocked(d i2cRelayExpander) {
 	m.i2cRelay = d
+	if c, ok := d.(io.Closer); ok {
+		m.i2cRelayCloser = c
+	} else {
+		m.i2cRelayCloser = nil
+	}
+}
+
+// SetI2CRelayBusRecovery registers reopen after closing /dev/i2c-* and optional SCL bit-bang (BCM). Used only in I2C relay modes.
+func (m *GPIOManager) SetI2CRelayBusRecovery(reopen func() (i2cRelayExpander, error), sclRecoveryBCM uint8) {
+	m.i2cReopenFn = reopen
+	m.i2cBusRecoverySCLBCM = sclRecoveryBCM
+}
+
+// CloseI2CRelayForShutdown closes the active I2C expander handle (call from process exit; safe if no I2C relays).
+func (m *GPIOManager) CloseI2CRelayForShutdown() {
+	if m == nil {
+		return
+	}
+	m.i2cOpsMu.Lock()
+	defer m.i2cOpsMu.Unlock()
+	if m.i2cRelayCloser != nil {
+		_ = m.i2cRelayCloser.Close()
+	}
+	m.i2cRelayCloser = nil
+	m.i2cRelay = nil
+}
+
+func (m *GPIOManager) recoverI2CRelayAdapter() error {
+	m.i2cOpsMu.Lock()
+	defer m.i2cOpsMu.Unlock()
+	if m.i2cReopenFn == nil {
+		return errors.New("i2c bus recovery: reopen function not configured")
+	}
+	if m.i2cRelayCloser != nil {
+		_ = m.i2cRelayCloser.Close()
+	}
+	m.i2cRelayCloser = nil
+	m.i2cRelay = nil
+	if m.i2cBusRecoverySCLBCM != 0 {
+		if gpioChipName != "" {
+			bitbangI2CBusRecoverySCL(gpioChipName, m.i2cBusRecoverySCLBCM)
+		} else {
+			log.Println("WARNING: I2C bus recovery: GPIO chip not initialized; skipping SCL bit-bang.")
+		}
+	}
+	time.Sleep(2 * time.Millisecond)
+	dev, err := m.i2cReopenFn()
+	if err != nil {
+		return fmt.Errorf("i2c bus recovery: reopen expander: %w", err)
+	}
+	m.setI2CRelayExpanderLocked(dev)
+	log.Println("INFO: I2C bus recovery: expander reinitialized after adapter close.")
+	return nil
+}
+
+// i2cSetPinReliable performs several write attempts with exponential backoff, then optional bus recovery and a second attempt batch.
+func (m *GPIOManager) i2cSetPinReliable(pin uint8, high bool) error {
+	tryBatch := func() error {
+		m.i2cOpsMu.Lock()
+		defer m.i2cOpsMu.Unlock()
+		rel := m.i2cRelay
+		if rel == nil {
+			return errors.New("i2c relay expander not initialized")
+		}
+		var lastErr error
+		for attempt := 0; attempt < i2cRelayAttemptsPerPhase; attempt++ {
+			if attempt > 0 {
+				time.Sleep(i2cRelayRetryDelays[attempt-1])
+			}
+			err := rel.SetPin(pin, high)
+			if err == nil {
+				return nil
+			}
+			lastErr = err
+			log.Printf("WARNING: I2C relay SetPin pin=%d high=%v attempt %d/%d: %v", pin, high, attempt+1, i2cRelayAttemptsPerPhase, err)
+		}
+		return lastErr
+	}
+	if err := tryBatch(); err == nil {
+		return nil
+	}
+	log.Printf("WARNING: I2C relay SetPin pin=%d high=%v: exhausted %d attempts; running bus recovery.", pin, high, i2cRelayAttemptsPerPhase)
+	if err := m.recoverI2CRelayAdapter(); err != nil {
+		return err
+	}
+	if err := tryBatch(); err != nil {
+		return fmt.Errorf("i2c relay SetPin after bus recovery pin=%d high=%v: %w", pin, high, err)
+	}
+	return nil
+}
+
+func (m *GPIOManager) actionOnErr(name string) error {
+	out, exists := m.Outputs[name]
+	if !exists {
+		return fmt.Errorf("output %q not found", name)
+	}
+	if out.UseI2CRelay {
+		logicHigh := !out.ActiveLow
+		return m.i2cSetPinReliable(out.PinNumber, logicHigh)
+	}
+	if out.Line == nil {
+		return fmt.Errorf("output %q has no SoC GPIO line", name)
+	}
+	v := gpioLogicalOutputValue(out.ActiveLow, true)
+	if err := out.Line.SetValue(v); err != nil {
+		return fmt.Errorf("output %q SetValue: %w", name, err)
+	}
+	return nil
+}
+
+func (m *GPIOManager) actionOffErr(name string) error {
+	out, exists := m.Outputs[name]
+	if !exists {
+		return fmt.Errorf("output %q not found", name)
+	}
+	if out.UseI2CRelay {
+		logicHigh := out.ActiveLow
+		return m.i2cSetPinReliable(out.PinNumber, logicHigh)
+	}
+	if out.Line == nil {
+		return fmt.Errorf("output %q has no SoC GPIO line", name)
+	}
+	v := gpioLogicalOutputValue(out.ActiveLow, false)
+	if err := out.Line.SetValue(v); err != nil {
+		return fmt.Errorf("output %q SetValue: %w", name, err)
+	}
+	return nil
 }
 
 // ConfigureDoorSensor sets up a BCM GPIO as digital input with pull-up for a door contact (call once after openGPIOController).
@@ -7981,52 +8236,16 @@ func (m *GPIOManager) addInputEdge(name string, pin uint8, pullUp bool, anyEdge 
 
 // ActionOn turns the output on continuously
 func (m *GPIOManager) ActionOn(name string) {
-	out, exists := m.Outputs[name]
-	if !exists {
-		log.Printf("ERROR: Output '%s' not found", name)
-		return
-	}
-	if out.UseI2CRelay {
-		if m.i2cRelay == nil {
-			log.Printf("ERROR: Output '%s' uses I2C relay expander but device is not initialized", name)
-			return
-		}
-		// Energized: active-low => drive low; active-high => drive high.
-		logicHigh := !out.ActiveLow
-		if err := m.i2cRelay.SetPin(out.PinNumber, logicHigh); err != nil {
-			log.Printf("ERROR: I2C relay output %q pin %d: %v", name, out.PinNumber, err)
-		}
-		return
-	}
-	if out.Line == nil {
-		log.Printf("ERROR: Output '%s' has no SoC GPIO line", name)
-		return
-	}
-	v := gpioLogicalOutputValue(out.ActiveLow, true)
-	if err := out.Line.SetValue(v); err != nil {
-		log.Printf("ERROR: output %q SetValue: %v", name, err)
+	if err := m.actionOnErr(name); err != nil {
+		log.Printf("ERROR: ActionOn %q: %v", name, err)
 	}
 }
 
 // ActionOff turns the output off continuously
 func (m *GPIOManager) ActionOff(name string) {
-	out, exists := m.Outputs[name]
-	if !exists {
-		return
+	if err := m.actionOffErr(name); err != nil {
+		log.Printf("ERROR: ActionOff %q: %v", name, err)
 	}
-	if out.UseI2CRelay {
-		if m.i2cRelay == nil {
-			return
-		}
-		logicHigh := out.ActiveLow
-		_ = m.i2cRelay.SetPin(out.PinNumber, logicHigh)
-		return
-	}
-	if out.Line == nil {
-		return
-	}
-	v := gpioLogicalOutputValue(out.ActiveLow, false)
-	_ = out.Line.SetValue(v)
 }
 
 // ActionPulse turns the output on for a duration, then off.
@@ -8042,14 +8261,40 @@ func (m *GPIOManager) ActionPulse(name string, duration time.Duration) {
 		out.mu.Lock()
 		defer out.mu.Unlock()
 
-		m.ActionOn(name)
+		if err := m.actionOnErr(name); err != nil {
+			log.Printf("ERROR: ActionPulse %q on-phase: %v", name, err)
+			return
+		}
 		time.Sleep(duration)
 		if name == "door" && m.doorHoldWhile != nil && m.doorHoldWhile() {
 			log.Printf("DEBUG: Fire alarm interface: door relay hold-open active — skipping off phase after pulse.")
 			return
 		}
-		m.ActionOff(name)
+		if err := m.actionOffErr(name); err != nil {
+			log.Printf("ERROR: ActionPulse %q off-phase: %v", name, err)
+		}
 	}()
+}
+
+// ActionPulseBlocking runs the same pulse as ActionPulse but blocks until complete and returns the first error (on-phase, then off-phase).
+func (m *GPIOManager) ActionPulseBlocking(name string, duration time.Duration) error {
+	out, exists := m.Outputs[name]
+	if !exists {
+		return fmt.Errorf("ActionPulseBlocking: output %q not found", name)
+	}
+	out.mu.Lock()
+	defer out.mu.Unlock()
+	if err := m.actionOnErr(name); err != nil {
+		return fmt.Errorf("pulse %q on-phase: %w", name, err)
+	}
+	time.Sleep(duration)
+	if name == "door" && m.doorHoldWhile != nil && m.doorHoldWhile() {
+		return nil
+	}
+	if err := m.actionOffErr(name); err != nil {
+		return fmt.Errorf("pulse %q off-phase: %w", name, err)
+	}
+	return nil
 }
 
 // parseBCMPinList parses comma-separated BCM numbers (e.g. "17,27,22") for elevator floor sense inputs.
@@ -8200,7 +8445,7 @@ func setupOperationModeGPIOInputs(ctx *AppContext, gpio *GPIOManager) {
 			}
 			kTag := keypadLogTag("")
 			log.Printf("INFO: PIN accepted (mode=%s %s keypad; credential=%s); door relay GPIO %d.", m, kTag, "exit_button", doorBCM)
-			ctx.grantDefaultModeDoorUnlockLikePIN("", cfg, m, "", "exit_button", doorBCM, feedbackDelay, 0, nil)
+			ctx.grantDefaultModeDoorUnlockLikePIN("", cfg, m, "", "exit_button", doorBCM, feedbackDelay, 0, nil, false)
 		})
 	}
 	if en != 0 {
@@ -8216,7 +8461,7 @@ func setupOperationModeGPIOInputs(ctx *AppContext, gpio *GPIOManager) {
 			}
 			kTag := keypadLogTag("")
 			log.Printf("INFO: PIN accepted (mode=%s %s keypad; credential=%s); door relay GPIO %d.", m, kTag, "entry_button", doorBCM)
-			ctx.grantDefaultModeDoorUnlockLikePIN("", cfg, m, "", "entry_button", doorBCM, feedbackDelay, 0, nil)
+			ctx.grantDefaultModeDoorUnlockLikePIN("", cfg, m, "", "entry_button", doorBCM, feedbackDelay, 0, nil, false)
 		})
 	}
 	if lb != 0 {
