@@ -4,6 +4,8 @@
 #   ./tools/bump-version.sh "What you changed"
 #
 
+[0.15] 2026-04-19T03:27:17Z  fixed pinDisplayDigits to be non-blocking
+[0.14] 2026-04-19T03:26:07Z  removed gin using standard library
 [0.13] 2026-04-19T02:55:40Z  removed gin using standard library
 [0.12] 2026-04-19T02:41:41Z  replaced gpio library with go-gpiocdev
 [0.11] 2026-04-18T05:44:43Z  added various gpio functionality

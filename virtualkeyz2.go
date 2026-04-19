@@ -45,8 +45,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.13"
-	SoftwareReleaseUTC = "2026-04-19T02:55:40Z"
+	SoftwareVersion    = "0.15"
+	SoftwareReleaseUTC = "2026-04-19T03:27:17Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -261,6 +261,7 @@ type AppContext struct {
 	// ConfigPath is the JSON path from -config; used for cfg save/reload from the technician menu.
 	ConfigPath string
 	// PinDisplayDigits receives how many PIN digits are entered; displayController prints that many asterisks.
+	// Buffered (see pinDisplayDigitsBuffer); notifyPinDisplay uses a non-blocking send so a stuck display goroutine cannot block keypad input.
 	PinDisplayDigits chan int
 
 	pinFailMu  sync.Mutex
@@ -282,9 +283,8 @@ type AppContext struct {
 	elevatorGrantPIN             string    // credential used for current wait-floor grant (for DB floor ACL)
 	elevatorGrantViaFallback     bool
 
-	// Dual USB keypad: per-PIN "inside" counts (entry +1, exit −1). Persisted in SQLite dual_keypad_zone_occupancy when DB is open; in-memory map only if DB is nil.
-	occupancyMu    sync.Mutex
-	occupancyByPIN map[string]int
+	// Dual USB keypad: per-PIN / per–secure-zone "inside" counts (entry +1, exit −1). When DB is nil, each PIN uses an atomic counter in occupancyCounters. When DB is open, counts live in SQLite dual_keypad_zone_occupancy.
+	occupancyCounters sync.Map // string (PIN) -> *atomic.Int32; used only when ctx.DB == nil
 
 	// elevatorFloorDispatchPins: parsed from GPIOSettings.ElevatorFloorDispatchPins; len matches cab floor inputs when non-empty.
 	elevatorFloorDispatchPins []uint8
@@ -2965,7 +2965,7 @@ func main() {
 			DoorSensorPin:        7,
 			HeartbeatLEDPin:      26,
 		},
-		PinDisplayDigits: make(chan int, 16),
+		PinDisplayDigits: make(chan int, pinDisplayDigitsBuffer),
 		TechMenuPrompt:   "MeSpace-Siam-5th-Floor-Right-Door",
 	}
 	if err := loadVirtualKeyz2Config(*configPath, appCtx); err != nil {
@@ -4468,43 +4468,65 @@ func (ctx *AppContext) pinRejectCredentialLifecycle(cfg DeviceConfig, keypadRole
 	time.Sleep(feedbackDelay)
 }
 
+// occupancyGetOrCreateAtomic returns the per-PIN counter for dual-keypad occupancy when DB is nil (secure zone = credential PIN).
+func (ctx *AppContext) occupancyGetOrCreateAtomic(pin string) *atomic.Int32 {
+	var fresh atomic.Int32
+	v, _ := ctx.occupancyCounters.LoadOrStore(pin, &fresh)
+	return v.(*atomic.Int32)
+}
+
+// sumOccupancyInMemory totals inside counts across all PINs (atomic path, DB nil).
+func (ctx *AppContext) sumOccupancyInMemory() (total int) {
+	ctx.occupancyCounters.Range(func(_, value any) bool {
+		n := int(value.(*atomic.Int32).Load())
+		if n > 0 {
+			total += n
+		}
+		return true
+	})
+	return total
+}
+
 // adjustDualKeypadOccupancy updates per-PIN "inside" counts for access_dual_usb_keypad (entry +1, exit −1). Returns total people across all PINs and this PIN's inside count after the change.
 func (ctx *AppContext) adjustDualKeypadOccupancy(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string) {
-	ctx.occupancyMu.Lock()
-	defer ctx.occupancyMu.Unlock()
+	pin = strings.TrimSpace(pin)
 	if ctx.DB != nil {
-		return ctx.adjustDualKeypadOccupancyDBLocked(pin, keypadRole)
+		return ctx.adjustDualKeypadOccupancyDB(pin, keypadRole)
 	}
-	if ctx.occupancyByPIN == nil {
-		ctx.occupancyByPIN = make(map[string]int)
+	if pin == "" {
+		return 0, 0, ""
 	}
 	switch keypadRole {
 	case "entry":
-		ctx.occupancyByPIN[pin]++
-		insideThisPIN = ctx.occupancyByPIN[pin]
+		insideThisPIN = int(ctx.occupancyGetOrCreateAtomic(pin).Add(1))
 	case "exit":
-		if ctx.occupancyByPIN[pin] > 0 {
-			ctx.occupancyByPIN[pin]--
-			insideThisPIN = ctx.occupancyByPIN[pin]
-			if insideThisPIN == 0 {
-				delete(ctx.occupancyByPIN, pin)
-			}
-		} else {
+		v, ok := ctx.occupancyCounters.Load(pin)
+		if !ok {
 			mismatch = "exit_without_recorded_entry"
+			insideThisPIN = 0
+			break
+		}
+		ctr := v.(*atomic.Int32)
+		for {
+			cur := ctr.Load()
+			if cur <= 0 {
+				mismatch = "exit_without_recorded_entry"
+				insideThisPIN = 0
+				break
+			}
+			if ctr.CompareAndSwap(cur, cur-1) {
+				insideThisPIN = int(cur - 1)
+				break
+			}
 		}
 	default:
 		return 0, 0, ""
 	}
-	for _, n := range ctx.occupancyByPIN {
-		if n > 0 {
-			areaTotal += n
-		}
-	}
-	return areaTotal, insideThisPIN, mismatch
+	return ctx.sumOccupancyInMemory(), insideThisPIN, mismatch
 }
 
-// adjustDualKeypadOccupancyDBLocked updates dual_keypad_zone_occupancy in a single transaction. Caller must hold ctx.occupancyMu.
-func (ctx *AppContext) adjustDualKeypadOccupancyDBLocked(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string) {
+// adjustDualKeypadOccupancyDB updates dual_keypad_zone_occupancy in a single transaction.
+func (ctx *AppContext) adjustDualKeypadOccupancyDB(pin, keypadRole string) (areaTotal int, insideThisPIN int, mismatch string) {
 	pin = strings.TrimSpace(pin)
 	if pin == "" {
 		return 0, 0, ""
@@ -4586,8 +4608,6 @@ func keypadLogTag(keypadRole string) string {
 // dualKeypadExitWouldMismatch is true when exit would not decrement an existing inside count (no prior entry for this PIN).
 func (ctx *AppContext) dualKeypadExitWouldMismatch(pin string) bool {
 	pin = strings.TrimSpace(pin)
-	ctx.occupancyMu.Lock()
-	defer ctx.occupancyMu.Unlock()
 	if ctx.DB != nil {
 		var n int
 		err := ctx.DB.QueryRow(`SELECT inside_count FROM dual_keypad_zone_occupancy WHERE pin = ?`, pin).Scan(&n)
@@ -4600,10 +4620,11 @@ func (ctx *AppContext) dualKeypadExitWouldMismatch(pin string) bool {
 		}
 		return n <= 0
 	}
-	if ctx.occupancyByPIN == nil {
+	v, ok := ctx.occupancyCounters.Load(pin)
+	if !ok {
 		return true
 	}
-	return ctx.occupancyByPIN[pin] <= 0
+	return v.(*atomic.Int32).Load() <= 0
 }
 
 // maskPINForTechDisplay hides a credential for technician output (last two digits visible).
@@ -5433,6 +5454,9 @@ func monitorDoorSensors(ctx *AppContext) {
 // pinMaskLineWidth is the column where the rightmost asterisk is placed (right-aligned mask).
 const pinMaskLineWidth = 80
 
+// pinDisplayDigitsBuffer is the capacity of PinDisplayDigits; notifyPinDisplay drops updates when full (non-blocking send).
+const pinDisplayDigitsBuffer = 12
+
 func displayController(ctx *AppContext) {
 	// Manages DSI screen, displays greeting messages [cite: 3, 9]
 	// Displays random QR code for external mobile phone interaction
@@ -5529,7 +5553,12 @@ func notifyPinDisplay(ctx *AppContext, pin string) {
 	if ctx.PinDisplayDigits == nil {
 		return
 	}
-	ctx.PinDisplayDigits <- pinDigitCount(pin)
+	n := pinDigitCount(pin)
+	select {
+	case ctx.PinDisplayDigits <- n:
+	default:
+		// Channel full or consumer gone; never block keypad on the display path.
+	}
 }
 
 // Use evtest in linux to test the capabilities of the keypad.
@@ -6902,10 +6931,8 @@ func techMenuWriteOccupancy(w io.Writer, ctx *AppContext) {
 	var rows []occRow
 	total := 0
 	if ctx.DB != nil {
-		ctx.occupancyMu.Lock()
 		rq, err := ctx.DB.Query(`SELECT pin, inside_count FROM dual_keypad_zone_occupancy WHERE inside_count > 0 ORDER BY pin`)
 		if err != nil {
-			ctx.occupancyMu.Unlock()
 			fmt.Fprintf(w, "  (occupancy query failed: %v)\n\n", err)
 			return
 		}
@@ -6913,7 +6940,6 @@ func techMenuWriteOccupancy(w io.Writer, ctx *AppContext) {
 			var r occRow
 			if err := rq.Scan(&r.pin, &r.n); err != nil {
 				_ = rq.Close()
-				ctx.occupancyMu.Unlock()
 				fmt.Fprintf(w, "  (occupancy scan failed: %v)\n\n", err)
 				return
 			}
@@ -6921,17 +6947,16 @@ func techMenuWriteOccupancy(w io.Writer, ctx *AppContext) {
 			total += r.n
 		}
 		_ = rq.Close()
-		ctx.occupancyMu.Unlock()
 	} else {
-		ctx.occupancyMu.Lock()
-		for p, n := range ctx.occupancyByPIN {
+		ctx.occupancyCounters.Range(func(key, value any) bool {
+			n := int(value.(*atomic.Int32).Load())
 			if n <= 0 {
-				continue
+				return true
 			}
-			rows = append(rows, occRow{p, n})
+			rows = append(rows, occRow{key.(string), n})
 			total += n
-		}
-		ctx.occupancyMu.Unlock()
+			return true
+		})
 	}
 
 	sort.Slice(rows, func(i, j int) bool { return rows[i].pin < rows[j].pin })
