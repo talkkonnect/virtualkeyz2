@@ -32,7 +32,6 @@ import (
 	"unsafe"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/gin-gonic/gin"
 	evdev "github.com/gvalkov/golang-evdev"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
@@ -46,8 +45,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.12"
-	SoftwareReleaseUTC = "2026-04-19T02:41:41Z"
+	SoftwareVersion    = "0.13"
+	SoftwareReleaseUTC = "2026-04-19T02:55:40Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -313,6 +312,9 @@ type AppContext struct {
 	// Fire alarm interface (fail-safe unlock): when active, main door relay is held energized until the alarm input clears.
 	fireAlarmMu     sync.RWMutex
 	fireAlarmActive bool
+
+	// Outbound event/heartbeat webhook HTTP: concurrency cap + optional circuit breaker (failure-driven open state).
+	webhookOutbound webhookOutboundGuard
 }
 
 // logEmitMinSeverity: emit log lines whose severity is >= this (0=DEBUG all, 1=INFO+, 2=WARNING+, 3=ERROR+, 4=CRITICAL only).
@@ -459,6 +461,16 @@ type DeviceConfig struct {
 	WebhookHeartbeatURL          string
 	WebhookHeartbeatTokenEnabled bool
 	WebhookHeartbeatToken        string
+	// WebhookHTTPTimeout: per-request timeout for outbound webhook POSTs; zero defaults to 25s after normalizeWebhookOutboundHTTP.
+	WebhookHTTPTimeout time.Duration
+	// WebhookMaxConcurrent: max in-flight outbound webhook HTTP requests (all destinations); zero defaults to 16 after normalize.
+	WebhookMaxConcurrent int
+	// WebhookCircuitBreakerEnabled: when true, consecutive failures (network/timeout or HTTP 5xx) open the breaker for WebhookCircuitOpenDuration.
+	WebhookCircuitBreakerEnabled bool
+	// WebhookCircuitFailureThreshold: consecutive failures before open; zero defaults to 5 when the breaker is enabled.
+	WebhookCircuitFailureThreshold int
+	// WebhookCircuitOpenDuration: how long outbound webhooks are rejected after the breaker opens; zero defaults to 60s.
+	WebhookCircuitOpenDuration time.Duration
 
 	// KeypadOperationMode: ModeAccess* / ModeElevator* (see ModeElevatorWaitFloorButtons / ModeElevatorPredefinedFloor comments).
 	KeypadOperationMode string
@@ -578,6 +590,11 @@ type virtualkeyz2DeviceJSON struct {
 	WebhookHeartbeatURL                 *string                 `json:"webhook_heartbeat_url"`
 	WebhookHeartbeatTokenEnabled        *bool                   `json:"webhook_heartbeat_token_enabled"`
 	WebhookHeartbeatToken               *string                 `json:"webhook_heartbeat_token"`
+	WebhookHTTPTimeout                  *string                 `json:"webhook_http_timeout,omitempty"`
+	WebhookMaxConcurrent                *int                    `json:"webhook_max_concurrent,omitempty"`
+	WebhookCircuitBreakerEnabled        *bool                   `json:"webhook_circuit_breaker_enabled,omitempty"`
+	WebhookCircuitFailureThreshold      *int                    `json:"webhook_circuit_failure_threshold,omitempty"`
+	WebhookCircuitOpenDuration          *string                 `json:"webhook_circuit_open_duration,omitempty"`
 	KeypadOperationMode                 *string                 `json:"keypad_operation_mode"`
 	KeypadEvdevPath                     *string                 `json:"keypad_evdev_path"`
 	KeypadExitEvdevPath                 *string                 `json:"keypad_exit_evdev_path"`
@@ -1029,7 +1046,36 @@ func normalizeKeypadAndPinUX(c *DeviceConfig) {
 	} else if c.AutomaticDoorOperatorPulseDuration > 0 {
 		c.AutomaticDoorOperatorPulseDuration = clampDuration(c.AutomaticDoorOperatorPulseDuration, 50*time.Millisecond, 60*time.Second)
 	}
+	normalizeWebhookOutboundHTTP(c)
 	normalizeOperationModeConfig(c)
+}
+
+func normalizeWebhookOutboundHTTP(c *DeviceConfig) {
+	if c.WebhookHTTPTimeout <= 0 {
+		c.WebhookHTTPTimeout = 25 * time.Second
+	} else {
+		c.WebhookHTTPTimeout = clampDuration(c.WebhookHTTPTimeout, 5*time.Second, 120*time.Second)
+	}
+	if c.WebhookMaxConcurrent <= 0 {
+		c.WebhookMaxConcurrent = 16
+	} else if c.WebhookMaxConcurrent < 1 {
+		c.WebhookMaxConcurrent = 1
+	} else if c.WebhookMaxConcurrent > 256 {
+		c.WebhookMaxConcurrent = 256
+	}
+	if !c.WebhookCircuitBreakerEnabled {
+		return
+	}
+	if c.WebhookCircuitFailureThreshold <= 0 {
+		c.WebhookCircuitFailureThreshold = 5
+	} else if c.WebhookCircuitFailureThreshold > 100 {
+		c.WebhookCircuitFailureThreshold = 100
+	}
+	if c.WebhookCircuitOpenDuration <= 0 {
+		c.WebhookCircuitOpenDuration = 60 * time.Second
+	} else {
+		c.WebhookCircuitOpenDuration = clampDuration(c.WebhookCircuitOpenDuration, time.Second, time.Hour)
+	}
 }
 
 func normalizeOperationModeConfig(c *DeviceConfig) {
@@ -1256,6 +1302,21 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if d.WebhookHeartbeatToken != nil {
 		app.Config.WebhookHeartbeatToken = *d.WebhookHeartbeatToken
+	}
+	if err := applyJSONDuration(&app.Config.WebhookHTTPTimeout, "device", "webhook_http_timeout", d.WebhookHTTPTimeout); err != nil {
+		return err
+	}
+	if d.WebhookMaxConcurrent != nil {
+		app.Config.WebhookMaxConcurrent = *d.WebhookMaxConcurrent
+	}
+	if d.WebhookCircuitBreakerEnabled != nil {
+		app.Config.WebhookCircuitBreakerEnabled = *d.WebhookCircuitBreakerEnabled
+	}
+	if d.WebhookCircuitFailureThreshold != nil {
+		app.Config.WebhookCircuitFailureThreshold = *d.WebhookCircuitFailureThreshold
+	}
+	if err := applyJSONDuration(&app.Config.WebhookCircuitOpenDuration, "device", "webhook_circuit_open_duration", d.WebhookCircuitOpenDuration); err != nil {
+		return err
 	}
 	if err := applyJSONDuration(&app.Config.ElevatorFloorWaitTimeout, "device", "elevator_floor_wait_timeout", d.ElevatorFloorWaitTimeout); err != nil {
 		return err
@@ -1684,6 +1745,11 @@ type virtualkeyz2PersistDevice struct {
 	WebhookHeartbeatURL                 string                 `json:"webhook_heartbeat_url"`
 	WebhookHeartbeatTokenEnabled        bool                   `json:"webhook_heartbeat_token_enabled"`
 	WebhookHeartbeatToken               string                 `json:"webhook_heartbeat_token"`
+	WebhookHTTPTimeout                  string                 `json:"webhook_http_timeout"`
+	WebhookMaxConcurrent                int                    `json:"webhook_max_concurrent"`
+	WebhookCircuitBreakerEnabled        bool                   `json:"webhook_circuit_breaker_enabled"`
+	WebhookCircuitFailureThreshold      int                    `json:"webhook_circuit_failure_threshold"`
+	WebhookCircuitOpenDuration          string                 `json:"webhook_circuit_open_duration"`
 	KeypadOperationMode                 string                 `json:"keypad_operation_mode"`
 	KeypadEvdevPath                     string                 `json:"keypad_evdev_path"`
 	KeypadExitEvdevPath                 string                 `json:"keypad_exit_evdev_path"`
@@ -1823,6 +1889,11 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.WebhookHeartbeatURL = c.WebhookHeartbeatURL
 	out.Device.WebhookHeartbeatTokenEnabled = c.WebhookHeartbeatTokenEnabled
 	out.Device.WebhookHeartbeatToken = c.WebhookHeartbeatToken
+	out.Device.WebhookHTTPTimeout = c.WebhookHTTPTimeout.String()
+	out.Device.WebhookMaxConcurrent = c.WebhookMaxConcurrent
+	out.Device.WebhookCircuitBreakerEnabled = c.WebhookCircuitBreakerEnabled
+	out.Device.WebhookCircuitFailureThreshold = c.WebhookCircuitFailureThreshold
+	out.Device.WebhookCircuitOpenDuration = c.WebhookCircuitOpenDuration.String()
 	out.Device.KeypadOperationMode = c.KeypadOperationMode
 	out.Device.KeypadEvdevPath = c.KeypadEvdevPath
 	out.Device.KeypadExitEvdevPath = c.KeypadExitEvdevPath
@@ -2394,6 +2465,24 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.WebhookHeartbeatTokenEnabled, err = strconv.ParseBool(value)
 	case "webhook_heartbeat_token":
 		ctx.Config.WebhookHeartbeatToken = value
+	case "webhook_http_timeout":
+		err = applyJSONDuration(&ctx.Config.WebhookHTTPTimeout, "device", "webhook_http_timeout", &value)
+	case "webhook_max_concurrent":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.Config.WebhookMaxConcurrent = int(n)
+		}
+	case "webhook_circuit_breaker_enabled":
+		ctx.Config.WebhookCircuitBreakerEnabled, err = strconv.ParseBool(value)
+	case "webhook_circuit_failure_threshold":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.Config.WebhookCircuitFailureThreshold = int(n)
+		}
+	case "webhook_circuit_open_duration":
+		err = applyJSONDuration(&ctx.Config.WebhookCircuitOpenDuration, "device", "webhook_circuit_open_duration", &value)
 	case "keypad_operation_mode":
 		ctx.Config.KeypadOperationMode = value
 	case "keypad_evdev_path":
@@ -2695,6 +2784,11 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   webhook_heartbeat_url             URL for heartbeat callbacks
   webhook_heartbeat_token_enabled   true|false Bearer token on heartbeat POST
   webhook_heartbeat_token           secret when heartbeat token enabled
+  webhook_http_timeout              per outbound webhook POST (5s–120s, default 25s)
+  webhook_max_concurrent            max simultaneous outbound webhook requests (1–256, default 16)
+  webhook_circuit_breaker_enabled   true|false trip breaker on repeated failures (default true)
+  webhook_circuit_failure_threshold consecutive failures (network/timeout or HTTP 5xx) before open (1–100, default 5)
+  webhook_circuit_open_duration     how long POSTs are rejected after open (1s–1h, default 60s)
   keypad_operation_mode             access_* modes | elevator_wait_floor_buttons (see elevator_wait_floor_cab_sense) | elevator_predefined_floor (one relay pulse simulates floor call; cab buttons not used)
   keypad_evdev_path                 e.g. /dev/input/event1
   keypad_exit_evdev_path            second keypad for access_dual_usb_keypad
@@ -2849,6 +2943,11 @@ func main() {
 			WebhookEventTokenEnabled:         false,
 			WebhookHeartbeatEnabled:          false,
 			WebhookHeartbeatTokenEnabled:     false,
+			WebhookHTTPTimeout:               25 * time.Second,
+			WebhookMaxConcurrent:             16,
+			WebhookCircuitBreakerEnabled:   true,
+			WebhookCircuitFailureThreshold: 5,
+			WebhookCircuitOpenDuration:     60 * time.Second,
 			AccessScheduleEnforce:            true,
 			KeypadOperationMode:              ModeAccessEntry,
 			KeypadEvdevPath:                  "/dev/input/event1",
@@ -4745,8 +4844,165 @@ func mqttPublishRemoteAck(ctx *AppContext, ack mqttRemoteAck) {
 	}
 }
 
-// webhookHTTPClient is used for configurable event and heartbeat callback POSTs.
-var webhookHTTPClient = &http.Client{Timeout: 25 * time.Second}
+// webhookSharedTransport pools outbound webhook TCP/TLS connections (bounded idle per host).
+var webhookSharedTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          64,
+	MaxIdleConnsPerHost:   16,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+const (
+	webhookBreakerClosed = iota
+	webhookBreakerOpen
+	webhookBreakerHalfOpen
+)
+
+// webhookOutboundCfg is a snapshot of outbound webhook limits at enqueue time.
+type webhookOutboundCfg struct {
+	HTTPTimeout           time.Duration
+	MaxConcurrent         int
+	CircuitBreakerEnabled bool
+	FailureThreshold      int
+	OpenDuration          time.Duration
+}
+
+type webhookOutboundGuard struct {
+	mu sync.Mutex
+	// inFlight is webhook HTTP workers that passed acquire and have not yet called release.
+	inFlight int
+	state    int
+	failures int
+	openUntil time.Time
+
+	lastRejectLogMu sync.Mutex
+	lastRejectLog   time.Time
+}
+
+func (g *webhookOutboundGuard) logRejectThrottled(msg string) {
+	now := time.Now()
+	g.lastRejectLogMu.Lock()
+	ok := now.Sub(g.lastRejectLog) >= 30*time.Second
+	if ok {
+		g.lastRejectLog = now
+	}
+	g.lastRejectLogMu.Unlock()
+	if ok {
+		log.Printf("WARNING: %s", msg)
+	}
+}
+
+func (g *webhookOutboundGuard) acquire(app *AppContext) (webhookOutboundCfg, bool) {
+	app.configMu.RLock()
+	cfg := webhookOutboundCfg{
+		HTTPTimeout:           app.Config.WebhookHTTPTimeout,
+		MaxConcurrent:         app.Config.WebhookMaxConcurrent,
+		CircuitBreakerEnabled: app.Config.WebhookCircuitBreakerEnabled,
+		FailureThreshold:      app.Config.WebhookCircuitFailureThreshold,
+		OpenDuration:          app.Config.WebhookCircuitOpenDuration,
+	}
+	app.configMu.RUnlock()
+	if cfg.HTTPTimeout <= 0 {
+		cfg.HTTPTimeout = 25 * time.Second
+	}
+	if cfg.MaxConcurrent <= 0 {
+		cfg.MaxConcurrent = 16
+	}
+	if cfg.CircuitBreakerEnabled {
+		if cfg.FailureThreshold <= 0 {
+			cfg.FailureThreshold = 5
+		}
+		if cfg.OpenDuration <= 0 {
+			cfg.OpenDuration = 60 * time.Second
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	if cfg.MaxConcurrent > 0 && g.inFlight >= cfg.MaxConcurrent {
+		g.logRejectThrottled(fmt.Sprintf("webhook outbound: max concurrent (%d) reached, dropping POST", cfg.MaxConcurrent))
+		return webhookOutboundCfg{}, false
+	}
+	if cfg.CircuitBreakerEnabled {
+		switch g.state {
+		case webhookBreakerOpen:
+			if now.Before(g.openUntil) {
+				g.logRejectThrottled(fmt.Sprintf("webhook outbound: circuit open until %s, dropping POST", g.openUntil.UTC().Format(time.RFC3339)))
+				return webhookOutboundCfg{}, false
+			}
+			g.state = webhookBreakerHalfOpen
+			g.failures = 0
+		case webhookBreakerHalfOpen, webhookBreakerClosed:
+		}
+	}
+	g.inFlight++
+	return cfg, true
+}
+
+func webhookOutboundFailureForBreaker(okHTTP bool, statusCode int) bool {
+	if !okHTTP {
+		return true
+	}
+	return statusCode >= 500
+}
+
+func webhookOutboundSuccessForBreaker(okHTTP bool, statusCode int) bool {
+	if !okHTTP {
+		return false
+	}
+	return statusCode < 500
+}
+
+func (g *webhookOutboundGuard) release(cfg webhookOutboundCfg, okHTTP bool, statusCode int) {
+	thr := cfg.FailureThreshold
+	openDur := cfg.OpenDuration
+	if thr <= 0 {
+		thr = 5
+	}
+	if openDur <= 0 {
+		openDur = 60 * time.Second
+	}
+	now := time.Now()
+	succ := webhookOutboundSuccessForBreaker(okHTTP, statusCode)
+	fail := webhookOutboundFailureForBreaker(okHTTP, statusCode)
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.inFlight > 0 {
+		g.inFlight--
+	}
+	if !cfg.CircuitBreakerEnabled {
+		return
+	}
+	if succ {
+		g.failures = 0
+		g.state = webhookBreakerClosed
+		return
+	}
+	if !fail {
+		return
+	}
+	if g.state == webhookBreakerHalfOpen {
+		g.state = webhookBreakerOpen
+		g.openUntil = now.Add(openDur)
+		g.failures = 0
+		return
+	}
+	g.failures++
+	if g.failures >= thr {
+		g.state = webhookBreakerOpen
+		g.openUntil = now.Add(openDur)
+		g.failures = 0
+	}
+}
 
 // auditLogInsertMu serializes SQLite inserts into logs to reduce SQLITE_BUSY contention.
 var auditLogInsertMu sync.Mutex
@@ -4779,16 +5035,35 @@ func auditLogEvent(ctx *AppContext, event string, detail map[string]any) {
 	}
 }
 
-func webhookPostJSONAsync(url string, tokenEnabled bool, token string, payload map[string]any) {
+func webhookPostJSONAsync(app *AppContext, url string, tokenEnabled bool, token string, payload map[string]any) {
+	if app == nil {
+		return
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("WARNING: webhook JSON marshal: %v", err)
 		return
 	}
 	u := strings.TrimSpace(url)
+	if u == "" {
+		return
+	}
 	tok := strings.TrimSpace(token)
-	go func() {
-		reqCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	cfg, ok := app.webhookOutbound.acquire(app)
+	if !ok {
+		return
+	}
+	client := &http.Client{
+		Transport: webhookSharedTransport,
+		Timeout:   cfg.HTTPTimeout,
+	}
+	go func(cfg webhookOutboundCfg, u, tok string, body []byte) {
+		var okHTTP bool
+		var statusCode int
+		defer func() {
+			app.webhookOutbound.release(cfg, okHTTP, statusCode)
+		}()
+		reqCtx, cancel := context.WithTimeout(context.Background(), cfg.HTTPTimeout)
 		defer cancel()
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u, bytes.NewReader(body))
 		if err != nil {
@@ -4800,16 +5075,21 @@ func webhookPostJSONAsync(url string, tokenEnabled bool, token string, payload m
 		if tokenEnabled && tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-		resp, err := webhookHTTPClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("WARNING: webhook POST %q: %v", u, err)
 			return
 		}
+		okHTTP = true
+		statusCode = resp.StatusCode
 		defer resp.Body.Close()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			log.Printf("WARNING: webhook POST %q: read body: %v", u, err)
+		}
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
 			log.Printf("WARNING: webhook POST %q: HTTP %s", u, resp.Status)
 		}
-	}()
+	}(cfg, u, tok, body)
 }
 
 // fireEventWebhook POSTs JSON for door/PIN/MQTT events when webhook_event_enabled.
@@ -4861,14 +5141,14 @@ func fireEventWebhook(ctx *AppContext, event string, detail map[string]any) {
 			if !webhookEventTypesAllowlistPass(ep.EventTypes, event) {
 				continue
 			}
-			webhookPostJSONAsync(u, ep.TokenEnabled, ep.Token, pay)
+			webhookPostJSONAsync(ctx, u, ep.TokenEnabled, ep.Token, pay)
 		}
 		return
 	}
 	if legacyURL == "" {
 		return
 	}
-	webhookPostJSONAsync(legacyURL, tokEn, tok, pay)
+	webhookPostJSONAsync(ctx, legacyURL, tokEn, tok, pay)
 }
 
 // fireHeartbeatWebhook POSTs to webhook_heartbeat_url on each heartbeat tick when enabled.
@@ -4897,7 +5177,7 @@ func fireHeartbeatWebhook(ctx *AppContext) {
 		"device_client_id":   cid,
 		"heartbeat_interval": interval.String(),
 	}
-	webhookPostJSONAsync(url, tokEn, tok, pay)
+	webhookPostJSONAsync(ctx, url, tokEn, tok, pay)
 }
 
 func startHeartbeatAPI(ctx *AppContext) {
@@ -4915,27 +5195,44 @@ func startHeartbeatAPI(ctx *AppContext) {
 	}
 }
 
-func startWebServer(ctx *AppContext) *http.Server {
-	router := gin.Default()
-
-	// REST API with Token Support & ACL [cite: 7]
-	api := router.Group("/api")
-	api.Use(TokenAuthMiddleware())
-	{
-		api.POST("/remote-control", func(c *gin.Context) {
-			// Trigger GPIO based on remote REST command [cite: 7]
-			c.JSON(http.StatusOK, gin.H{"status": "door_opened"})
-		})
+func writeJSONResponse(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(true)
+	if err := enc.Encode(v); err != nil {
+		log.Printf("WARNING: HTTP JSON encode: %v", err)
 	}
+}
 
-	// Local Web Interface for Config and Monitoring
-	router.GET("/admin", func(c *gin.Context) {
-		c.String(http.StatusOK, "Local Configuration Interface")
+func tokenAuthAPI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Validates tokens for the REST HTTP API (placeholder — extend when an API token is configured).
+		next.ServeHTTP(w, r)
 	})
+}
+
+func handleAPIRemoteControl(w http.ResponseWriter, r *http.Request) {
+	_ = r
+	writeJSONResponse(w, http.StatusOK, map[string]string{"status": "door_opened"})
+}
+
+func handleAdminPage(w http.ResponseWriter, r *http.Request) {
+	_ = r
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "Local Configuration Interface")
+}
+
+func startWebServer(ctx *AppContext) *http.Server {
+	_ = ctx
+	mux := http.NewServeMux()
+	mux.Handle("POST /api/remote-control", tokenAuthAPI(http.HandlerFunc(handleAPIRemoteControl)))
+	mux.HandleFunc("GET /admin", handleAdminPage)
 
 	srv := &http.Server{
 		Addr:    ":8080",
-		Handler: router,
+		Handler: mux,
 	}
 	go func() {
 		log.Println("INFO: Starting Web Server on port 8080")
@@ -5233,13 +5530,6 @@ func notifyPinDisplay(ctx *AppContext, pin string) {
 		return
 	}
 	ctx.PinDisplayDigits <- pinDigitCount(pin)
-}
-
-func TokenAuthMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// Validates tokens for the REST HTTP API [cite: 7]
-		c.Next()
-	}
 }
 
 // Use evtest in linux to test the capabilities of the keypad.
@@ -5996,6 +6286,9 @@ var techMenuCfgKeysForCompletion = []string{
 	"tamper_switch_pin",
 	"tech_menu_history_max",
 	"tech_menu_prompt",
+	"webhook_circuit_breaker_enabled",
+	"webhook_circuit_failure_threshold",
+	"webhook_circuit_open_duration",
 	"webhook_event_enabled",
 	"webhook_event_token",
 	"webhook_event_token_enabled",
@@ -6004,6 +6297,8 @@ var techMenuCfgKeysForCompletion = []string{
 	"webhook_heartbeat_token",
 	"webhook_heartbeat_token_enabled",
 	"webhook_heartbeat_url",
+	"webhook_http_timeout",
+	"webhook_max_concurrent",
 	"xl9535_i2c_addr",
 	"xl9535_i2c_bus",
 }
@@ -6822,6 +7117,11 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 		hbTok = "(set)"
 	}
 	fmt.Fprintf(w, "  webhook_heartbeat_token: %s\n", hbTok)
+	fmt.Fprintf(w, "  webhook_http_timeout: %s\n", c.WebhookHTTPTimeout.String())
+	fmt.Fprintf(w, "  webhook_max_concurrent: %d\n", c.WebhookMaxConcurrent)
+	fmt.Fprintf(w, "  webhook_circuit_breaker_enabled: %v\n", c.WebhookCircuitBreakerEnabled)
+	fmt.Fprintf(w, "  webhook_circuit_failure_threshold: %d\n", c.WebhookCircuitFailureThreshold)
+	fmt.Fprintf(w, "  webhook_circuit_open_duration: %s\n", c.WebhookCircuitOpenDuration.String())
 	fmt.Fprintf(w, "\n--- GPIO ---\n")
 	fmt.Fprintf(w, "  relay_output_mode: %s\n", normalizeRelayOutputMode(g.RelayOutputMode))
 	fmt.Fprintf(w, "  mcp23017_i2c_bus: %d\n", g.MCP23017I2CBus)
