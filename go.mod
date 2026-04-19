@@ -8,7 +8,7 @@ require (
 	github.com/gvalkov/golang-evdev v0.0.0-20220815104727-7e27d6ce89b6
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/mattn/go-sqlite3 v1.14.42
-	github.com/stianeikeland/go-rpio/v4 v4.6.0
+	github.com/warthog618/go-gpiocdev v0.9.1
 	golang.org/x/sys v0.41.0
 	golang.org/x/term v0.40.0
 )

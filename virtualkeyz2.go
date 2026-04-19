@@ -36,7 +36,7 @@ import (
 	evdev "github.com/gvalkov/golang-evdev"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/stianeikeland/go-rpio/v4"
+	"github.com/warthog618/go-gpiocdev"
 	"golang.org/x/term"
 
 	"virtualkeyz2/internal/keypadlist"
@@ -46,8 +46,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.11"
-	SoftwareReleaseUTC = "2026-04-18T05:44:43Z"
+	SoftwareVersion    = "0.12"
+	SoftwareReleaseUTC = "2026-04-19T02:41:41Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -255,7 +255,7 @@ type AppContext struct {
 	mqttMu       sync.RWMutex // serializes reconnect vs publish/handler client reads
 	Config       DeviceConfig
 	configMu     sync.RWMutex // protects Config, GPIOSettings, TechMenuPrompt for reload/set/save
-	GPIO         *GPIOManager // nil if rpio failed to open (e.g. not on a Pi)
+	GPIO         *GPIOManager // nil if GPIO character device failed to open (e.g. not on a Pi)
 	GPIOSettings GPIOSettings
 	// TechMenuPrompt is the technician /dev/tty status-line label, shown as "{TechMenuPrompt}> " before input.
 	TechMenuPrompt string
@@ -2881,11 +2881,10 @@ func main() {
 	log.Printf("INFO: Relay output mode: %s", normalizeRelayOutputMode(appCtx.GPIOSettings.RelayOutputMode))
 
 	// 4. Initialize Hardware IO (GPIO, Relays, Heartbeat LED) [cite: 1, 3]
-	err := rpio.Open()
+	err := openGPIOController()
 	if err != nil {
 		log.Printf("WARNING: Cannot open GPIO (Not running on Pi?): %v", err)
 	} else {
-		defer rpio.Close()
 		go manageHardwareHeartbeat(appCtx.GPIOSettings.HeartbeatLEDPin)
 		gpio := NewGPIOManager()
 		relayI2CMode := isRelayOutputI2CExpander(appCtx.GPIOSettings.RelayOutputMode)
@@ -2969,7 +2968,6 @@ func main() {
 		setupTamperSwitchGPIOInput(appCtx, gpio)
 		setupMotionSensorGPIOInput(appCtx, gpio)
 		appCtx.GPIO = gpio
-		go gpio.StartListening()
 		go func() {
 			time.Sleep(200 * time.Millisecond)
 			appCtx.syncFiremansServiceFromHardwareReason("startup")
@@ -5195,10 +5193,18 @@ func playSoundAsync(cfg DeviceConfig, path string) {
 
 func manageHardwareHeartbeat(bcm uint8) {
 	// Blinks onboard heartbeat LED to indicate software is running
-	pin := rpio.Pin(bcm)
-	pin.Output()
+	ln, err := gpiocdev.RequestLine(gpioChipName, int(bcm), gpiocdev.AsOutput(0), gpiocdev.WithConsumer("virtualkeyz2-heartbeat"))
+	if err != nil {
+		log.Printf("WARNING: heartbeat GPIO BCM %d: %v", bcm, err)
+		return
+	}
+	defer ln.Close()
+	v := 0
 	for {
-		pin.Toggle()
+		v = 1 - v
+		if err := ln.SetValue(v); err != nil {
+			log.Printf("WARNING: heartbeat SetValue BCM %d: %v", bcm, err)
+		}
 		time.Sleep(500 * time.Millisecond)
 	}
 }
@@ -7350,6 +7356,56 @@ func techMenuWriteProcListenPorts(w io.Writer) {
 	fmt.Fprintln(w, "")
 }
 
+// gpioChipName is the kernel gpiochip device name (e.g. gpiochip0), set by openGPIOController.
+var gpioChipName string
+
+func openGPIOController() error {
+	var candidates []string
+	if v := strings.TrimSpace(os.Getenv("VIRTUALKEYZ2_GPIOCHIP")); v != "" {
+		candidates = append(candidates, v)
+	} else {
+		// Prefer the SoC header GPIO controller only; do not scan every gpiochip
+		// (e.g. gpiochip1 on Raspberry Pi is power/LED, not header BCM lines).
+		candidates = append(candidates, "gpiochip0", "gpiochip4")
+	}
+	var lastErr error
+	for _, name := range candidates {
+		c, err := gpiocdev.NewChip(name)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		_ = c.Close()
+		gpioChipName = name
+		log.Printf("INFO: GPIO chip: %s (set VIRTUALKEYZ2_GPIOCHIP to override)", name)
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("no accessible gpiochip device")
+}
+
+// gpioLogicalOutputValue maps relay energized ("on") to gpio-cdev line value (0 = inactive, 1 = active for default active-high mapping).
+func gpioLogicalOutputValue(activeLow, energized bool) int {
+	if energized == activeLow {
+		return 0
+	}
+	return 1
+}
+
+func gpioLineIsPhysicalLow(line *gpiocdev.Line) (bool, error) {
+	if line == nil {
+		return false, errors.New("nil gpio line")
+	}
+	v, err := line.Value()
+	if err != nil {
+		return false, err
+	}
+	// Default active-high: inactive (0) is physical low.
+	return v == 0, nil
+}
+
 // --- Structures ---
 
 // i2cRelayExpander drives relay outputs 0–15 on an MCP23017 or XL9535 (see gpio.relay_output_mode).
@@ -7361,7 +7417,7 @@ type i2cRelayExpander interface {
 type OutputConfig struct {
 	PinNumber uint8
 	ActiveLow bool // True if the relay triggers on ground/0V (common for opto-relays)
-	Pin       rpio.Pin
+	Line      *gpiocdev.Line // SoC line; nil when UseI2CRelay or request failed
 	// UseI2CRelay: when true, PinNumber is expander index 0-15 (MCP23017 or XL9535 per relay_output_mode).
 	UseI2CRelay bool
 	mu          sync.Mutex // Prevents overlapping pulse routines
@@ -7373,15 +7429,16 @@ type InputConfig struct {
 	PullUp       bool          // Enable internal pull-up resistor
 	DebounceTime time.Duration // Time to ignore subsequent triggers
 	AnyEdge      bool          // When true, both rising and falling edges are detected (maintained switches).
-	Pin          rpio.Pin
-	Action       func()    // The function to call when triggered
+	Line         *gpiocdev.Line
+	Action       func() // The function to call when triggered
+	debounceMu   sync.Mutex
 	lastTrigger  time.Time // Used for debouncing
 }
 
 // elevatorFloorPin holds a BCM input wired to a cab floor button (active low when pressed).
 type elevatorFloorPin struct {
-	Pin rpio.Pin
-	BCM uint8
+	Line *gpiocdev.Line
+	BCM  uint8
 }
 
 // GPIOManager holds the state of all physical IO
@@ -7395,7 +7452,7 @@ type GPIOManager struct {
 	// stays energized (fire alarm interface fail-unlock) instead of returning to off.
 	doorHoldWhile func() bool
 
-	doorSensorPin   rpio.Pin
+	doorSensorLine  *gpiocdev.Line
 	doorSensorReady bool
 
 	elevatorFloorPins []elevatorFloorPin
@@ -7420,13 +7477,18 @@ func (m *GPIOManager) SetI2CRelayExpander(d i2cRelayExpander) {
 	m.i2cRelay = d
 }
 
-// ConfigureDoorSensor sets up a BCM GPIO as digital input with pull-up for a door contact (call once after rpio.Open).
+// ConfigureDoorSensor sets up a BCM GPIO as digital input with pull-up for a door contact (call once after openGPIOController).
 // Typical for DoorSensorClosedIsLow wiring; if your "closed" state is active-high only, adjust hardware pull resistors as needed.
 func (m *GPIOManager) ConfigureDoorSensor(bcm uint8) {
-	p := rpio.Pin(bcm)
-	p.Input()
-	p.PullUp()
-	m.doorSensorPin = p
+	if bcm == 0 {
+		return
+	}
+	ln, err := gpiocdev.RequestLine(gpioChipName, int(bcm), gpiocdev.AsInput, gpiocdev.WithPullUp, gpiocdev.WithConsumer("virtualkeyz2-door-sensor"))
+	if err != nil {
+		log.Printf("WARNING: door sensor GPIO BCM %d: %v", bcm, err)
+		return
+	}
+	m.doorSensorLine = ln
 	m.doorSensorReady = true
 }
 
@@ -7440,7 +7502,10 @@ func (m *GPIOManager) DoorIsOpen(closedIsLow bool) bool {
 	if !m.doorSensorReady {
 		return false
 	}
-	isLow := m.doorSensorPin.Read() == rpio.Low
+	isLow, err := gpioLineIsPhysicalLow(m.doorSensorLine)
+	if err != nil {
+		return false
+	}
 	if closedIsLow {
 		return !isLow
 	}
@@ -7454,10 +7519,12 @@ func (m *GPIOManager) ConfigureElevatorFloorPins(bcms []uint8) {
 		if bcm == 0 {
 			continue
 		}
-		p := rpio.Pin(bcm)
-		p.Input()
-		p.PullUp()
-		m.elevatorFloorPins = append(m.elevatorFloorPins, elevatorFloorPin{Pin: p, BCM: bcm})
+		ln, err := gpiocdev.RequestLine(gpioChipName, int(bcm), gpiocdev.AsInput, gpiocdev.WithPullUp, gpiocdev.WithConsumer("virtualkeyz2-elev-floor"))
+		if err != nil {
+			log.Printf("WARNING: elevator floor sense BCM %d: %v", bcm, err)
+			continue
+		}
+		m.elevatorFloorPins = append(m.elevatorFloorPins, elevatorFloorPin{Line: ln, BCM: bcm})
 	}
 	if len(m.elevatorFloorPins) > 0 {
 		log.Printf("INFO: Elevator floor sense GPIOs: %v", bcms)
@@ -7478,7 +7545,8 @@ func (m *GPIOManager) AnyElevatorFloorPressed() bool {
 func (m *GPIOManager) ElevatorCabFloorsPressed() []int {
 	var r []int
 	for i, fp := range m.elevatorFloorPins {
-		if fp.Pin.Read() == rpio.Low {
+		low, err := gpioLineIsPhysicalLow(fp.Line)
+		if err == nil && low {
 			r = append(r, i)
 		}
 	}
@@ -7499,9 +7567,13 @@ func (m *GPIOManager) AddOutput(name string, pin uint8, activeLow bool, useI2CRe
 		UseI2CRelay: useI2CRelay,
 	}
 	if !useI2CRelay {
-		p := rpio.Pin(pin)
-		p.Output()
-		cfg.Pin = p
+		initV := gpioLogicalOutputValue(activeLow, false)
+		ln, err := gpiocdev.RequestLine(gpioChipName, int(pin), gpiocdev.AsOutput(initV), gpiocdev.WithConsumer("virtualkeyz2-out-"+name))
+		if err != nil {
+			log.Printf("WARNING: output %q BCM %d: %v", name, pin, err)
+		} else {
+			cfg.Line = ln
+		}
 	}
 	m.Outputs[name] = cfg
 
@@ -7519,32 +7591,62 @@ func (m *GPIOManager) AddInputAnyEdge(name string, pin uint8, pullUp bool, actio
 	m.addInputEdge(name, pin, pullUp, true, action)
 }
 
-func (m *GPIOManager) addInputEdge(name string, pin uint8, pullUp bool, anyEdge bool, action func()) {
-	p := rpio.Pin(pin)
-	p.Input()
+func (m *GPIOManager) inputEdgeFired(inputName string) {
+	in := m.Inputs[inputName]
+	if in == nil || in.Action == nil {
+		return
+	}
+	in.debounceMu.Lock()
+	if time.Since(in.lastTrigger) <= in.DebounceTime {
+		in.debounceMu.Unlock()
+		return
+	}
+	in.lastTrigger = time.Now()
+	in.debounceMu.Unlock()
+	log.Printf("DEBUG: GPIO Input '%s' triggered", inputName)
+	go in.Action()
+}
 
+func (m *GPIOManager) addInputEdge(name string, pin uint8, pullUp bool, anyEdge bool, action func()) {
+	if pin == 0 {
+		log.Printf("WARNING: GPIO input %q skipped (BCM 0)", name)
+		return
+	}
+	var edgeOpt gpiocdev.LineReqOption
 	if pullUp {
-		p.PullUp()
 		if anyEdge {
-			p.Detect(rpio.AnyEdge)
+			edgeOpt = gpiocdev.WithBothEdges
 		} else {
-			p.Detect(rpio.FallEdge) // Detect when pulled to ground
+			edgeOpt = gpiocdev.WithFallingEdge
 		}
 	} else {
-		p.PullDown()
 		if anyEdge {
-			p.Detect(rpio.AnyEdge)
+			edgeOpt = gpiocdev.WithBothEdges
 		} else {
-			p.Detect(rpio.RiseEdge) // Detect when voltage is applied
+			edgeOpt = gpiocdev.WithRisingEdge
 		}
 	}
-
+	var bias gpiocdev.LineReqOption = gpiocdev.WithPullUp
+	if !pullUp {
+		bias = gpiocdev.WithPullDown
+	}
+	inName := name
+	ln, err := gpiocdev.RequestLine(gpioChipName, int(pin),
+		bias,
+		edgeOpt,
+		gpiocdev.WithEventHandler(func(gpiocdev.LineEvent) { m.inputEdgeFired(inName) }),
+		gpiocdev.WithConsumer("virtualkeyz2-in-"+name),
+	)
+	if err != nil {
+		log.Printf("WARNING: input %q BCM %d: %v", name, pin, err)
+		return
+	}
 	m.Inputs[name] = &InputConfig{
 		PinNumber:    pin,
 		PullUp:       pullUp,
 		DebounceTime: 300 * time.Millisecond,
 		AnyEdge:      anyEdge,
-		Pin:          p,
+		Line:         ln,
 		Action:       action,
 		lastTrigger:  time.Now(),
 	}
@@ -7571,10 +7673,13 @@ func (m *GPIOManager) ActionOn(name string) {
 		}
 		return
 	}
-	if out.ActiveLow {
-		out.Pin.Low()
-	} else {
-		out.Pin.High()
+	if out.Line == nil {
+		log.Printf("ERROR: Output '%s' has no SoC GPIO line", name)
+		return
+	}
+	v := gpioLogicalOutputValue(out.ActiveLow, true)
+	if err := out.Line.SetValue(v); err != nil {
+		log.Printf("ERROR: output %q SetValue: %v", name, err)
 	}
 }
 
@@ -7592,11 +7697,11 @@ func (m *GPIOManager) ActionOff(name string) {
 		_ = m.i2cRelay.SetPin(out.PinNumber, logicHigh)
 		return
 	}
-	if out.ActiveLow {
-		out.Pin.High()
-	} else {
-		out.Pin.Low()
+	if out.Line == nil {
+		return
 	}
+	v := gpioLogicalOutputValue(out.ActiveLow, false)
+	_ = out.Line.SetValue(v)
 }
 
 // ActionPulse turns the output on for a duration, then off.
@@ -7620,31 +7725,6 @@ func (m *GPIOManager) ActionPulse(name string, duration time.Duration) {
 		}
 		m.ActionOff(name)
 	}()
-}
-
-// --- Input Listener ---
-
-// StartListening begins polling for edge detections on configured inputs
-func (m *GPIOManager) StartListening() {
-	log.Println("INFO: Starting GPIO Input Listener...")
-
-	for {
-		for name, in := range m.Inputs {
-			if in.Pin.EdgeDetected() {
-				// Software Debouncing logic
-				if time.Since(in.lastTrigger) > in.DebounceTime {
-					in.lastTrigger = time.Now()
-					log.Printf("DEBUG: GPIO Input '%s' triggered", name)
-
-					// Execute the defined action in a new goroutine
-					// so a slow callback doesn't block other inputs
-					go in.Action()
-				}
-			}
-		}
-		// A small sleep prevents the loop from consuming 100% CPU
-		time.Sleep(10 * time.Millisecond)
-	}
 }
 
 // parseBCMPinList parses comma-separated BCM numbers (e.g. "17,27,22") for elevator floor sense inputs.
@@ -7917,10 +7997,13 @@ func (ctx *AppContext) syncFireAlarmFromHardwareReason(reason string) {
 		return
 	}
 	inp, ok := ctx.GPIO.Inputs["fire_alarm_interface"]
-	if !ok {
+	if !ok || inp.Line == nil {
 		return
 	}
-	isLow := inp.Pin.Read() == rpio.Low
+	isLow, err := gpioLineIsPhysicalLow(inp.Line)
+	if err != nil {
+		return
+	}
 	want := isLow == activeLow
 	log.Printf("DEBUG: Fire alarm interface: GPIO sample BCM=%d read_low=%v active_low_wiring=%v => alarm_active=%v (%s).",
 		pin, isLow, activeLow, want, reason)
@@ -7964,10 +8047,13 @@ func setupTamperSwitchGPIOInput(ctx *AppContext, gpio *GPIOManager) {
 	}
 	gpio.AddInputAnyEdge("tamper_switch", pin, activeLow, func() {
 		inp, ok := gpio.Inputs["tamper_switch"]
-		if !ok {
+		if !ok || inp.Line == nil {
 			return
 		}
-		isLow := inp.Pin.Read() == rpio.Low
+		isLow, err := gpioLineIsPhysicalLow(inp.Line)
+		if err != nil {
+			return
+		}
 		secure := isLow == activeLow
 		log.Printf("DEBUG: Tamper switch: edge on BCM %d read_low=%v active_low_wiring=%v => enclosure_secure=%v.",
 			pin, isLow, activeLow, secure)
@@ -8061,10 +8147,13 @@ func (ctx *AppContext) syncFiremansServiceFromHardwareReason(reason string) {
 		return
 	}
 	inp, ok := ctx.GPIO.Inputs["firemans_service"]
-	if !ok {
+	if !ok || inp.Line == nil {
 		return
 	}
-	isLow := inp.Pin.Read() == rpio.Low
+	isLow, err := gpioLineIsPhysicalLow(inp.Line)
+	if err != nil {
+		return
+	}
 	want := isLow == activeLow
 	log.Printf("DEBUG: Fireman's service: GPIO sample BCM=%d read_low=%v active_low_wiring=%v => emergency_active=%v (%s).",
 		pin, isLow, activeLow, want, reason)

@@ -4,6 +4,7 @@
 #   ./tools/bump-version.sh "What you changed"
 #
 
+[0.12] 2026-04-19T02:41:41Z  replaced gpio library with go-gpiocdev
 [0.11] 2026-04-18T05:44:43Z  added various gpio functionality
 [0.10] 2026-04-18T05:23:23Z  added live restart from cli for gpio reinit
 [0.09] 2026-04-18T04:56:49Z  fixed lighting timer bug
