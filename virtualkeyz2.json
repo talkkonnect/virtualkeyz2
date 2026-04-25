@@ -30,6 +30,7 @@
     "sound_firemans_activated_enabled": false,
     "sound_firemans_deactivated_enabled": false,
     "firemans_service_enabled": false,
+    "intercom_camera_trigger_pulse_duration": "800ms",
     "log_level": "debug",
     "pin_length": 6,
     "relay_pulse_duration": "1s",
@@ -60,6 +61,11 @@
     "webhook_heartbeat_url": "",
     "webhook_heartbeat_token_enabled": false,
     "webhook_heartbeat_token": "",
+    "webhook_http_timeout": "25s",
+    "webhook_max_concurrent": 16,
+    "webhook_circuit_breaker_enabled": true,
+    "webhook_circuit_failure_threshold": 5,
+    "webhook_circuit_open_duration": "1m0s",
     "keypad_operation_mode": "access_entry_with_exit_button",
     "keypad_evdev_path": "/dev/input/by-id/usb-32c2_2.4G_Wireless_Keyboard___Mouse-event-kbd",
     "keypad_exit_evdev_path": "/dev/input/by-id/usb-413c_Dell_KB216_Wired_Keyboard-event-kbd",
@@ -71,12 +77,12 @@
     "elevator_predefined_floor": 0,
     "elevator_predefined_floors": "",
     "elevator_dispatch_pulse_duration": "400ms",
-    "elevator_floor_dispatch_pulse_durations": "400ms,400ms",
+    "elevator_floor_dispatch_pulse_durations": "",
     "elevator_enable_pulse_duration": "",
     "dual_keypad_reject_exit_without_entry": false,
     "access_schedule_enforce": true,
     "access_schedule_apply_to_fallback_pin": false,
-    "lighting_timeout": "1m0s"
+    "lighting_timeout": "10s"
   },
   "gpio": {
     "relay_output_mode": "gpio",
@@ -84,6 +90,7 @@
     "mcp23017_i2c_addr": 32,
     "xl9535_i2c_bus": 1,
     "xl9535_i2c_addr": 32,
+    "i2c_bus_recovery_scl_bcm": 0,
     "door_relay_pin": 5,
     "door_relay_active_low": false,
     "buzzer_relay_pin": 11,
@@ -98,9 +105,9 @@
     "elevator_dispatch_active_low": false,
     "elevator_enable_relay_pin": 0,
     "elevator_enable_active_low": false,
-    "elevator_floor_dispatch_pins": "6,12",
+    "elevator_floor_dispatch_pins": "",
     "elevator_predefined_enable_pins": "",
-    "elevator_wait_floor_enable_pins": "5,10",
+    "elevator_wait_floor_enable_pins": "",
     "lighting_button_pin": 25,
     "lighting_button_active_low": true,
     "lighting_relay_pin": 10,
@@ -118,7 +125,7 @@
     "motion_sensor_pin": 0,
     "motion_sensor_active_low": true
   },
-  "tech_menu_prompt": "Access-Control-Room-1",
+  "tech_menu_prompt": "Siam_5th_Floor_Right",
   "elevator_parameter_modes": {
     "_documentation": "This object is not used by the application logic — it is a label map so you can see which keys matter for elevator_wait_floor_buttons vs elevator_predefined_floor. It is preserved when you run cfg save from the technician menu.",
     "legend": {

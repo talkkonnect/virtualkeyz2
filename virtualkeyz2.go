@@ -45,8 +45,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.17"
-	SoftwareReleaseUTC = "2026-04-19T05:46:44Z"
+	SoftwareVersion    = "0.18"
+	SoftwareReleaseUTC = "2026-04-25T07:31:06Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -5513,6 +5513,116 @@ const pinMaskLineWidth = 80
 // pinDisplayDigitsBuffer is the capacity of PinDisplayDigits; notifyPinDisplay drops updates when full (non-blocking send).
 const pinDisplayDigitsBuffer = 12
 
+// Sound is serialized per ALSA -D device so concurrent aplay (e.g. door alarm + keypad feedback) does not
+// hit "Device or resource busy". Transient failures are retried with backoff; fatal ALSA/mime errors are not.
+const (
+	soundPerDeviceQueue = 64
+	soundAplayMaxTries  = 60
+	soundRetryBaseDelay = 100 * time.Millisecond
+	soundRetryMaxDelay  = 2 * time.Second
+)
+
+type soundQueueJob struct {
+	cfg  DeviceConfig
+	path string
+	// If non-nil, the worker sends nil or a terminal error (best-effort) when playback ends.
+	done chan error
+}
+
+var (
+	soundQueueMu  sync.Mutex
+	soundQueueChs = make(map[string]chan *soundQueueJob) // key = SoundCardName ("" = default aplay device)
+)
+
+func alsaDeviceKeyForSound(cfg DeviceConfig) string {
+	return cfg.SoundCardName
+}
+
+func aplayErrorProbablyFatal(hint string) bool {
+	s := strings.ToLower(hint)
+	if strings.Contains(s, "unknown pcm") {
+		return true
+	}
+	if strings.Contains(s, "no soundcards found") {
+		return true
+	}
+	if strings.Contains(s, "file format") && strings.Contains(s, "not recognized") {
+		return true
+	}
+	return false
+}
+
+func aplayOneAttempt(cfg DeviceConfig, path string) (outStr string, err error) {
+	args := []string{"-q"}
+	if cfg.SoundCardName != "" {
+		args = append(args, "-D", cfg.SoundCardName)
+	}
+	args = append(args, path)
+	cmd := exec.Command("aplay", args...)
+	out, e := cmd.CombinedOutput()
+	return string(out), e
+}
+
+func aplayWithRetriesToDevice(cfg DeviceConfig, path string) error {
+	var lastErr error
+	delay := soundRetryBaseDelay
+	for attempt := 1; attempt <= soundAplayMaxTries; attempt++ {
+		out, err := aplayOneAttempt(cfg, path)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		hint := out + " " + err.Error()
+		if aplayErrorProbablyFatal(hint) {
+			break
+		}
+		if attempt < soundAplayMaxTries {
+			if attempt == 1 {
+				dev := cfg.SoundCardName
+				if dev == "" {
+					dev = "default"
+				}
+				log.Printf("DEBUG: aplay output not ready (device %q), will retry for %s: %v", dev, path, err)
+			}
+			time.Sleep(delay)
+			nb := time.Duration(float64(delay) * 1.2)
+			if nb > soundRetryMaxDelay {
+				nb = soundRetryMaxDelay
+			}
+			delay = nb
+		}
+	}
+	if lastErr != nil {
+		log.Printf("WARNING: aplay failed for %s: %v", path, lastErr)
+	}
+	return lastErr
+}
+
+func soundQueueWorker(_ string, jobs <-chan *soundQueueJob) {
+	for j := range jobs {
+		if j == nil {
+			continue
+		}
+		err := aplayWithRetriesToDevice(j.cfg, j.path)
+		if j.done != nil {
+			j.done <- err
+		}
+	}
+}
+
+func getSoundQueueCh(cfg DeviceConfig) chan *soundQueueJob {
+	k := alsaDeviceKeyForSound(cfg)
+	soundQueueMu.Lock()
+	defer soundQueueMu.Unlock()
+	ch, ok := soundQueueChs[k]
+	if !ok {
+		ch = make(chan *soundQueueJob, soundPerDeviceQueue)
+		soundQueueChs[k] = ch
+		go soundQueueWorker(k, ch)
+	}
+	return ch
+}
+
 func displayController(ctx *AppContext) {
 	// Manages DSI screen, displays greeting messages [cite: 3, 9]
 	// Displays random QR code for external mobile phone interaction
@@ -5541,7 +5651,7 @@ func playSoundAsyncEnabled(cfg DeviceConfig, path string, enabled bool) {
 	playSoundAsync(cfg, path)
 }
 
-// playSoundSync plays a WAV via ALSA aplay; blocks until finished.
+// playSoundSync plays a WAV via ALSA aplay; blocks until finished (after queuing to the per-device player).
 func playSoundSync(cfg DeviceConfig, path string) {
 	if path == "" {
 		return
@@ -5550,22 +5660,21 @@ func playSoundSync(cfg DeviceConfig, path string) {
 		log.Printf("DEBUG: sound skipped (not found): %s", path)
 		return
 	}
-	args := []string{"-q"}
-	if cfg.SoundCardName != "" {
-		args = append(args, "-D", cfg.SoundCardName)
-	}
-	args = append(args, path)
-	cmd := exec.Command("aplay", args...)
-	if err := cmd.Run(); err != nil {
-		log.Printf("WARNING: aplay failed for %s: %v", path, err)
-	}
+	done := make(chan error, 1)
+	getSoundQueueCh(cfg) <- &soundQueueJob{cfg: cfg, path: path, done: done}
+	<-done
 }
 
 func playSoundAsync(cfg DeviceConfig, path string) {
 	if path == "" {
 		return
 	}
-	go playSoundSync(cfg, path)
+	if _, err := os.Stat(path); err != nil {
+		log.Printf("DEBUG: sound skipped (not found): %s", path)
+		return
+	}
+	// One goroutine: enqueue; worker serializes aplay and retries if the device is busy.
+	getSoundQueueCh(cfg) <- &soundQueueJob{cfg: cfg, path: path, done: nil}
 }
 
 func manageHardwareHeartbeat(bcm uint8) {

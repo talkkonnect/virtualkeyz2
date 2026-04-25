@@ -4,6 +4,7 @@
 #   ./tools/bump-version.sh "What you changed"
 #
 
+[0.18] 2026-04-25T07:31:06Z  sync sounds are serialized
 [0.17] 2026-04-19T05:46:44Z  implement i2c robustness
 [0.16] 2026-04-19T03:35:52Z  updated OPERATOR.md
 [0.15] 2026-04-19T03:27:17Z  fixed pinDisplayDigits to be non-blocking
