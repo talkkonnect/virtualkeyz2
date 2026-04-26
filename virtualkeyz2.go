@@ -45,8 +45,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.18"
-	SoftwareReleaseUTC = "2026-04-25T07:31:06Z"
+	SoftwareVersion    = "0.19"
+	SoftwareReleaseUTC = "2026-04-26T03:56:03Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -284,6 +284,8 @@ type AppContext struct {
 	elevatorCabFloorDebounceTick int       // consecutive 50ms polls with same held snapshot
 	elevatorGrantPIN             string    // credential used for current wait-floor grant (for DB floor ACL)
 	elevatorGrantViaFallback     bool
+	// elevatorStaticTestFloorACLBypass: set during static-test QR elevator grant so floor list ACL is skipped (cleared in clearElevatorGrantState).
+	elevatorStaticTestFloorACLBypass atomic.Bool
 
 	// Dual USB keypad: per-PIN / per–secure-zone "inside" counts (entry +1, exit −1). When DB is nil, each PIN uses an atomic counter in occupancyCounters. When DB is open, counts live in SQLite dual_keypad_zone_occupancy.
 	occupancyCounters sync.Map // string (PIN) -> *atomic.Int32; used only when ctx.DB == nil
@@ -480,6 +482,18 @@ type DeviceConfig struct {
 	KeypadEvdevPath string
 	// KeypadExitEvdevPath: second keypad for access_dual_usb_keypad (must differ from KeypadEvdevPath).
 	KeypadExitEvdevPath string
+	// ScannerDevicePath: dedicated USB HID QR scanner evdev node (opened with EVIOCGRAB via evdev.Grab()).
+	ScannerDevicePath string
+	// MaxDevicesPerUser: maximum device UUIDs that can be associated with one access PIN.
+	MaxDevicesPerUser int
+	// QRTimeWindowSeconds: acceptable absolute drift between system time and QR datetime_stamp.
+	QRTimeWindowSeconds int
+	// StaticTestQRCode: payload that must match the scanned string when StaticTestQRCodeEnabled is true.
+	StaticTestQRCode string
+	// StaticTestQRCodeEnabled: when true, QR auth only accepts scans equal to StaticTestQRCode (trimmed);
+	// matching scans grant access with no DB, schedule, or keypad-lockout checks. Any other QR is denied.
+	// When false, StaticTestQRCode is ignored and normal mobile-UUID QR rules apply.
+	StaticTestQRCodeEnabled bool
 	// PairPeerRole: none | entry | exit — used with access_paired_remote_exit and MQTTPairPeerTopic.
 	PairPeerRole string
 	// MQTTPairPeerTopic: entry unit publishes unlock hint; exit unit subscribes and pulses door.
@@ -600,6 +614,11 @@ type virtualkeyz2DeviceJSON struct {
 	KeypadOperationMode                 *string                 `json:"keypad_operation_mode"`
 	KeypadEvdevPath                     *string                 `json:"keypad_evdev_path"`
 	KeypadExitEvdevPath                 *string                 `json:"keypad_exit_evdev_path"`
+	ScannerDevicePath                   *string                 `json:"scanner_device_path,omitempty"`
+	MaxDevicesPerUser                   *int                    `json:"max_devices_per_user,omitempty"`
+	QRTimeWindowSeconds                 *int                    `json:"qr_time_window_seconds,omitempty"`
+	StaticTestQRCode                    *string                 `json:"static_test_qr_code,omitempty"`
+	StaticTestQRCodeEnabled             *bool                   `json:"static_test_qr_code_enabled,omitempty"`
 	PairPeerRole                        *string                 `json:"pair_peer_role"`
 	MQTTPairPeerTopic                   *string                 `json:"mqtt_pair_peer_topic"`
 	PairPeerToken                       *string                 `json:"pair_peer_token"`
@@ -1092,6 +1111,20 @@ func normalizeOperationModeConfig(c *DeviceConfig) {
 	if strings.TrimSpace(c.KeypadEvdevPath) == "" {
 		c.KeypadEvdevPath = "/dev/input/event1"
 	}
+	if strings.TrimSpace(c.ScannerDevicePath) == "" {
+		c.ScannerDevicePath = "/dev/input/by-id/usb-YUREN_Yuren_HID_FS_Keyboard_SN_20190000-event-kbd"
+	}
+	if c.MaxDevicesPerUser <= 0 {
+		c.MaxDevicesPerUser = 3
+	} else if c.MaxDevicesPerUser > 128 {
+		c.MaxDevicesPerUser = 128
+	}
+	if c.QRTimeWindowSeconds <= 0 {
+		c.QRTimeWindowSeconds = 30
+	} else if c.QRTimeWindowSeconds > 600 {
+		c.QRTimeWindowSeconds = 600
+	}
+	c.StaticTestQRCode = strings.TrimSpace(c.StaticTestQRCode)
 	if c.ElevatorFloorWaitTimeout <= 0 {
 		c.ElevatorFloorWaitTimeout = 60 * time.Second
 	} else {
@@ -1353,6 +1386,21 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if d.KeypadExitEvdevPath != nil {
 		app.Config.KeypadExitEvdevPath = *d.KeypadExitEvdevPath
+	}
+	if d.ScannerDevicePath != nil {
+		app.Config.ScannerDevicePath = *d.ScannerDevicePath
+	}
+	if d.MaxDevicesPerUser != nil {
+		app.Config.MaxDevicesPerUser = *d.MaxDevicesPerUser
+	}
+	if d.QRTimeWindowSeconds != nil {
+		app.Config.QRTimeWindowSeconds = *d.QRTimeWindowSeconds
+	}
+	if d.StaticTestQRCode != nil {
+		app.Config.StaticTestQRCode = *d.StaticTestQRCode
+	}
+	if d.StaticTestQRCodeEnabled != nil {
+		app.Config.StaticTestQRCodeEnabled = *d.StaticTestQRCodeEnabled
 	}
 	if d.PairPeerRole != nil {
 		app.Config.PairPeerRole = *d.PairPeerRole
@@ -1763,6 +1811,11 @@ type virtualkeyz2PersistDevice struct {
 	KeypadOperationMode                 string                 `json:"keypad_operation_mode"`
 	KeypadEvdevPath                     string                 `json:"keypad_evdev_path"`
 	KeypadExitEvdevPath                 string                 `json:"keypad_exit_evdev_path"`
+	ScannerDevicePath                   string                 `json:"scanner_device_path"`
+	MaxDevicesPerUser                   int                    `json:"max_devices_per_user"`
+	QRTimeWindowSeconds                 int                    `json:"qr_time_window_seconds"`
+	StaticTestQRCode                    string                 `json:"static_test_qr_code"`
+	StaticTestQRCodeEnabled             bool                   `json:"static_test_qr_code_enabled"`
 	PairPeerRole                        string                 `json:"pair_peer_role"`
 	MQTTPairPeerTopic                   string                 `json:"mqtt_pair_peer_topic"`
 	PairPeerToken                       string                 `json:"pair_peer_token"`
@@ -1908,6 +1961,11 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.KeypadOperationMode = c.KeypadOperationMode
 	out.Device.KeypadEvdevPath = c.KeypadEvdevPath
 	out.Device.KeypadExitEvdevPath = c.KeypadExitEvdevPath
+	out.Device.ScannerDevicePath = c.ScannerDevicePath
+	out.Device.MaxDevicesPerUser = c.MaxDevicesPerUser
+	out.Device.QRTimeWindowSeconds = c.QRTimeWindowSeconds
+	out.Device.StaticTestQRCode = c.StaticTestQRCode
+	out.Device.StaticTestQRCodeEnabled = c.StaticTestQRCodeEnabled
 	out.Device.PairPeerRole = c.PairPeerRole
 	out.Device.MQTTPairPeerTopic = c.MQTTPairPeerTopic
 	out.Device.PairPeerToken = c.PairPeerToken
@@ -2511,6 +2569,24 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.KeypadEvdevPath = value
 	case "keypad_exit_evdev_path":
 		ctx.Config.KeypadExitEvdevPath = value
+	case "scanner_device_path":
+		ctx.Config.ScannerDevicePath = value
+	case "max_devices_per_user":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.Config.MaxDevicesPerUser = int(n)
+		}
+	case "qr_time_window_seconds":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.Config.QRTimeWindowSeconds = int(n)
+		}
+	case "static_test_qr_code":
+		ctx.Config.StaticTestQRCode = value
+	case "static_test_qr_code_enabled":
+		ctx.Config.StaticTestQRCodeEnabled, err = strconv.ParseBool(value)
 	case "pair_peer_role":
 		ctx.Config.PairPeerRole = value
 	case "mqtt_pair_peer_topic":
@@ -2814,6 +2890,11 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   keypad_operation_mode             access_* modes | elevator_wait_floor_buttons (see elevator_wait_floor_cab_sense) | elevator_predefined_floor (one relay pulse simulates floor call; cab buttons not used)
   keypad_evdev_path                 e.g. /dev/input/event1
   keypad_exit_evdev_path            second keypad for access_dual_usb_keypad
+  scanner_device_path               dedicated HID scanner evdev path; opened with EVIOCGRAB (exclusive)
+  max_devices_per_user              max mobile UUIDs linked to one PIN (default 3)
+  qr_time_window_seconds            max clock drift for QR datetime_stamp (default 30)
+  static_test_qr_code               secret payload when static_test_qr_code_enabled is true
+  static_test_qr_code_enabled       true = only that exact QR grants (no other checks); any other QR denied; false = normal UUID QR
   pair_peer_role                    none|entry|exit (with access_paired_remote_exit + mqtt_pair_peer_topic)
   mqtt_pair_peer_topic              exit unit subscribes; entry unit publishes after PIN
   pair_peer_token                   optional shared secret in pair JSON
@@ -2968,12 +3049,16 @@ func main() {
 			WebhookHeartbeatTokenEnabled:     false,
 			WebhookHTTPTimeout:               25 * time.Second,
 			WebhookMaxConcurrent:             16,
-			WebhookCircuitBreakerEnabled:   true,
-			WebhookCircuitFailureThreshold: 5,
-			WebhookCircuitOpenDuration:     60 * time.Second,
+			WebhookCircuitBreakerEnabled:     true,
+			WebhookCircuitFailureThreshold:   5,
+			WebhookCircuitOpenDuration:       60 * time.Second,
 			AccessScheduleEnforce:            true,
 			KeypadOperationMode:              ModeAccessEntry,
 			KeypadEvdevPath:                  "/dev/input/event1",
+			ScannerDevicePath:                "/dev/input/by-id/usb-YUREN_Yuren_HID_FS_Keyboard_SN_20190000-event-kbd",
+			MaxDevicesPerUser:                3,
+			QRTimeWindowSeconds:              30,
+			StaticTestQRCodeEnabled:          false,
 		},
 		GPIOSettings: GPIOSettings{
 			RelayOutputMode:      RelayOutputGPIO,
@@ -3108,6 +3193,7 @@ func main() {
 	// 6. Start Concurrent Subsystems
 	go startHeartbeatAPI(appCtx) // Regular heartbeat via API [cite: 9]
 	go startKeypadListeners(appCtx)
+	go startQRScannerListener(appCtx)
 	go monitorElevatorFloorSelection(appCtx)
 	go monitorDoorSensors(appCtx) // Door open timers & warnings
 	go displayController(appCtx)  // Manage DSI Screen and random QR codes [cite: 3, 10, 11]
@@ -4226,6 +4312,9 @@ func (ctx *AppContext) elevatorFloorChannelAllowed(pin, elevatorID string, floor
 	if ctx.FiremansServiceActive() {
 		return true
 	}
+	if ctx.elevatorStaticTestFloorACLBypass.Load() {
+		return true
+	}
 	if ctx.DB == nil || elevatorID == "" || floorIndex < 0 {
 		return true
 	}
@@ -4349,7 +4438,135 @@ func initDatabase() *sqlx.DB {
 	} else {
 		log.Println("INFO: SQLite dual_keypad_zone_occupancy ready (dual USB keypad zone counts; survives restart).")
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS access_pin_mobile_devices (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		pin TEXT NOT NULL REFERENCES access_pins(pin) ON DELETE CASCADE,
+		device_uuid TEXT NOT NULL UNIQUE,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+		updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+	)`); err != nil {
+		log.Printf("WARNING: access_pin_mobile_devices table: %v", err)
+	} else {
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_access_pin_mobile_devices_pin ON access_pin_mobile_devices(pin)`); err != nil {
+			log.Printf("WARNING: access_pin_mobile_devices index: %v", err)
+		}
+		log.Println("INFO: SQLite access_pin_mobile_devices ready (1:N PIN->mobile UUID mappings).")
+	}
 	return db
+}
+
+func normalizeDeviceUUID(deviceUUID string) string {
+	return strings.ToLower(strings.TrimSpace(deviceUUID))
+}
+
+// upsertMobileDeviceForPIN inserts or reassigns a mobile UUID to a PIN while enforcing MaxDevicesPerUser.
+func (ctx *AppContext) upsertMobileDeviceForPIN(pin, deviceUUID string) error {
+	if ctx.DB == nil {
+		return errors.New("database unavailable")
+	}
+	pin = strings.TrimSpace(pin)
+	deviceUUID = normalizeDeviceUUID(deviceUUID)
+	if pin == "" {
+		return errors.New("pin is required")
+	}
+	if deviceUUID == "" {
+		return errors.New("device_uuid is required")
+	}
+	ctx.configMu.RLock()
+	maxDevices := ctx.Config.MaxDevicesPerUser
+	ctx.configMu.RUnlock()
+	if maxDevices <= 0 {
+		maxDevices = 1
+	}
+	tx, err := ctx.DB.Beginx()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var existingPIN string
+	err = tx.QueryRow(`SELECT pin FROM access_pin_mobile_devices WHERE device_uuid = ?`, deviceUUID).Scan(&existingPIN)
+	switch {
+	case err == nil:
+		if strings.TrimSpace(existingPIN) == pin {
+			_, err = tx.Exec(`UPDATE access_pin_mobile_devices SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE device_uuid = ?`, deviceUUID)
+		} else {
+			var n int
+			if err = tx.QueryRow(`SELECT COUNT(*) FROM access_pin_mobile_devices WHERE pin = ?`, pin).Scan(&n); err == nil && n >= maxDevices {
+				err = fmt.Errorf("pin %q already has max_devices_per_user=%d", maskPINForTechDisplay(pin), maxDevices)
+			}
+			if err == nil {
+				_, err = tx.Exec(`UPDATE access_pin_mobile_devices SET pin = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE device_uuid = ?`, pin, deviceUUID)
+			}
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		var n int
+		if err = tx.QueryRow(`SELECT COUNT(*) FROM access_pin_mobile_devices WHERE pin = ?`, pin).Scan(&n); err == nil && n >= maxDevices {
+			err = fmt.Errorf("pin %q already has max_devices_per_user=%d", maskPINForTechDisplay(pin), maxDevices)
+		}
+		if err == nil {
+			_, err = tx.Exec(`INSERT INTO access_pin_mobile_devices(pin, device_uuid) VALUES (?, ?)`, pin, deviceUUID)
+		}
+	default:
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// listMobileDeviceUUIDsByPIN fetches all UUIDs currently linked to a PIN.
+func (ctx *AppContext) listMobileDeviceUUIDsByPIN(pin string) ([]string, error) {
+	if ctx.DB == nil {
+		return nil, errors.New("database unavailable")
+	}
+	pin = strings.TrimSpace(pin)
+	if pin == "" {
+		return nil, errors.New("pin is required")
+	}
+	rows, err := ctx.DB.Query(`SELECT device_uuid FROM access_pin_mobile_devices WHERE pin = ? ORDER BY device_uuid`, pin)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0, 8)
+	for rows.Next() {
+		var uuid string
+		if err := rows.Scan(&uuid); err != nil {
+			return nil, err
+		}
+		out = append(out, strings.TrimSpace(uuid))
+	}
+	return out, rows.Err()
+}
+
+// resolvePINForMobileUUID returns a currently enabled PIN associated with device_uuid.
+func (ctx *AppContext) resolvePINForMobileUUID(deviceUUID string) (pin string, err error) {
+	if ctx.DB == nil {
+		return "", errors.New("database unavailable")
+	}
+	deviceUUID = normalizeDeviceUUID(deviceUUID)
+	if deviceUUID == "" {
+		return "", errors.New("device_uuid is required")
+	}
+	err = ctx.DB.QueryRow(`
+		SELECT ap.pin
+		FROM access_pin_mobile_devices md
+		INNER JOIN access_pins ap ON ap.pin = md.pin
+		WHERE md.device_uuid = ? AND ap.enabled = 1
+		LIMIT 1`, deviceUUID).Scan(&pin)
+	if err != nil {
+		return "", err
+	}
+	pin = strings.TrimSpace(pin)
+	cred := ctx.accessCredentialForPIN(pin)
+	if !cred.OK {
+		if cred.LifecycleReason == "" {
+			return "", sql.ErrNoRows
+		}
+		return "", fmt.Errorf("credential_lifecycle:%s", cred.LifecycleReason)
+	}
+	return pin, nil
 }
 
 // migrateAccessPinsLifecycle adds visitor/contractor lifecycle columns to access_pins on older databases.
@@ -4954,9 +5171,9 @@ type webhookOutboundCfg struct {
 type webhookOutboundGuard struct {
 	mu sync.Mutex
 	// inFlight is webhook HTTP workers that passed acquire and have not yet called release.
-	inFlight int
-	state    int
-	failures int
+	inFlight  int
+	state     int
+	failures  int
 	openUntil time.Time
 
 	lastRejectLogMu sync.Mutex
@@ -5928,6 +6145,364 @@ func runKeypadListener(ctx *AppContext, devicePath, keypadRole string) {
 	}
 }
 
+func evdevKeyToASCII(scancode uint16, shift bool) (string, bool) {
+	switch scancode {
+	case evdev.KEY_A:
+		if shift {
+			return "A", true
+		}
+		return "a", true
+	case evdev.KEY_B:
+		if shift {
+			return "B", true
+		}
+		return "b", true
+	case evdev.KEY_C:
+		if shift {
+			return "C", true
+		}
+		return "c", true
+	case evdev.KEY_D:
+		if shift {
+			return "D", true
+		}
+		return "d", true
+	case evdev.KEY_E:
+		if shift {
+			return "E", true
+		}
+		return "e", true
+	case evdev.KEY_F:
+		if shift {
+			return "F", true
+		}
+		return "f", true
+	case evdev.KEY_G:
+		if shift {
+			return "G", true
+		}
+		return "g", true
+	case evdev.KEY_H:
+		if shift {
+			return "H", true
+		}
+		return "h", true
+	case evdev.KEY_I:
+		if shift {
+			return "I", true
+		}
+		return "i", true
+	case evdev.KEY_J:
+		if shift {
+			return "J", true
+		}
+		return "j", true
+	case evdev.KEY_K:
+		if shift {
+			return "K", true
+		}
+		return "k", true
+	case evdev.KEY_L:
+		if shift {
+			return "L", true
+		}
+		return "l", true
+	case evdev.KEY_M:
+		if shift {
+			return "M", true
+		}
+		return "m", true
+	case evdev.KEY_N:
+		if shift {
+			return "N", true
+		}
+		return "n", true
+	case evdev.KEY_O:
+		if shift {
+			return "O", true
+		}
+		return "o", true
+	case evdev.KEY_P:
+		if shift {
+			return "P", true
+		}
+		return "p", true
+	case evdev.KEY_Q:
+		if shift {
+			return "Q", true
+		}
+		return "q", true
+	case evdev.KEY_R:
+		if shift {
+			return "R", true
+		}
+		return "r", true
+	case evdev.KEY_S:
+		if shift {
+			return "S", true
+		}
+		return "s", true
+	case evdev.KEY_T:
+		if shift {
+			return "T", true
+		}
+		return "t", true
+	case evdev.KEY_U:
+		if shift {
+			return "U", true
+		}
+		return "u", true
+	case evdev.KEY_V:
+		if shift {
+			return "V", true
+		}
+		return "v", true
+	case evdev.KEY_W:
+		if shift {
+			return "W", true
+		}
+		return "w", true
+	case evdev.KEY_X:
+		if shift {
+			return "X", true
+		}
+		return "x", true
+	case evdev.KEY_Y:
+		if shift {
+			return "Y", true
+		}
+		return "y", true
+	case evdev.KEY_Z:
+		if shift {
+			return "Z", true
+		}
+		return "z", true
+	case evdev.KEY_1:
+		if shift {
+			return "!", true
+		}
+		return "1", true
+	case evdev.KEY_2:
+		if shift {
+			return "@", true
+		}
+		return "2", true
+	case evdev.KEY_3:
+		if shift {
+			return "#", true
+		}
+		return "3", true
+	case evdev.KEY_4:
+		if shift {
+			return "$", true
+		}
+		return "4", true
+	case evdev.KEY_5:
+		if shift {
+			return "%", true
+		}
+		return "5", true
+	case evdev.KEY_6:
+		if shift {
+			return "^", true
+		}
+		return "6", true
+	case evdev.KEY_7:
+		if shift {
+			return "&", true
+		}
+		return "7", true
+	case evdev.KEY_8:
+		if shift {
+			return "*", true
+		}
+		return "8", true
+	case evdev.KEY_9:
+		if shift {
+			return "(", true
+		}
+		return "9", true
+	case evdev.KEY_0:
+		if shift {
+			return ")", true
+		}
+		return "0", true
+	case evdev.KEY_MINUS:
+		if shift {
+			return "_", true
+		}
+		return "-", true
+	case evdev.KEY_EQUAL:
+		if shift {
+			return "+", true
+		}
+		return "=", true
+	case evdev.KEY_LEFTBRACE:
+		if shift {
+			return "{", true
+		}
+		return "[", true
+	case evdev.KEY_RIGHTBRACE:
+		if shift {
+			return "}", true
+		}
+		return "]", true
+	case evdev.KEY_BACKSLASH:
+		if shift {
+			return "|", true
+		}
+		return "\\", true
+	case evdev.KEY_SEMICOLON:
+		if shift {
+			return ":", true
+		}
+		return ";", true
+	case evdev.KEY_APOSTROPHE:
+		if shift {
+			return "\"", true
+		}
+		return "'", true
+	case evdev.KEY_GRAVE:
+		if shift {
+			return "~", true
+		}
+		return "`", true
+	case evdev.KEY_COMMA:
+		if shift {
+			return "<", true
+		}
+		return ",", true
+	case evdev.KEY_DOT:
+		if shift {
+			return ">", true
+		}
+		return ".", true
+	case evdev.KEY_SLASH:
+		if shift {
+			return "?", true
+		}
+		return "/", true
+	case evdev.KEY_SPACE:
+		return " ", true
+	case evdev.KEY_KP0:
+		return "0", true
+	case evdev.KEY_KP1:
+		return "1", true
+	case evdev.KEY_KP2:
+		return "2", true
+	case evdev.KEY_KP3:
+		return "3", true
+	case evdev.KEY_KP4:
+		return "4", true
+	case evdev.KEY_KP5:
+		return "5", true
+	case evdev.KEY_KP6:
+		return "6", true
+	case evdev.KEY_KP7:
+		return "7", true
+	case evdev.KEY_KP8:
+		return "8", true
+	case evdev.KEY_KP9:
+		return "9", true
+	case evdev.KEY_KPDOT:
+		return ".", true
+	case evdev.KEY_KPPLUS:
+		return "+", true
+	case evdev.KEY_KPMINUS:
+		return "-", true
+	case evdev.KEY_KPSLASH:
+		return "/", true
+	case evdev.KEY_KPASTERISK:
+		return "*", true
+	default:
+		return "", false
+	}
+}
+
+func runQRScannerListener(ctx *AppContext, devicePath string) {
+	dev, err := evdev.Open(devicePath)
+	if err != nil {
+		log.Printf("WARNING: Failed to open QR scanner at %s: %v", devicePath, err)
+		return
+	}
+	defer dev.File.Close()
+	// Grab() issues EVIOCGRAB so this HID device is consumed exclusively by this process.
+	// That prevents QR keystrokes from leaking into local shells/TTY as normal keyboard input.
+	if err := dev.Grab(); err != nil {
+		log.Printf("WARNING: QR scanner open but EVIOCGRAB failed on %s: %v", devicePath, err)
+	} else {
+		defer func() { _ = dev.Release() }()
+		log.Printf("INFO: QR scanner EVIOCGRAB active: %s @ %s", dev.Name, devicePath)
+	}
+	var buf strings.Builder
+	buf.Grow(256)
+	shiftPressed := false
+	for {
+		ev, rerr := dev.ReadOne()
+		if rerr != nil {
+			log.Printf("ERROR: QR scanner read error (%s): %v", devicePath, rerr)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if ev == nil || ev.Type != evdev.EV_KEY {
+			continue
+		}
+		ke := evdev.NewKeyEvent(ev)
+		switch ke.Scancode {
+		case evdev.KEY_LEFTSHIFT, evdev.KEY_RIGHTSHIFT:
+			if ev.Value == 0 {
+				shiftPressed = false
+			} else if ev.Value == 1 || ev.Value == 2 {
+				shiftPressed = true
+			}
+			continue
+		}
+		if ev.Value != 1 {
+			continue
+		}
+		switch ke.Scancode {
+		case evdev.KEY_ENTER, evdev.KEY_KPENTER:
+			payload := strings.TrimSpace(buf.String())
+			buf.Reset()
+			if payload != "" {
+				ctx.processScannedQRCode(payload)
+			}
+			continue
+		case evdev.KEY_BACKSPACE:
+			s := buf.String()
+			if len(s) > 0 {
+				buf.Reset()
+				buf.WriteString(s[:len(s)-1])
+			}
+			continue
+		case evdev.KEY_ESC:
+			buf.Reset()
+			continue
+		}
+		if ch, ok := evdevKeyToASCII(ke.Scancode, shiftPressed); ok {
+			_, _ = buf.WriteString(ch)
+			if buf.Len() > 2048 {
+				log.Printf("WARNING: QR payload exceeded 2048 chars; resetting scanner buffer.")
+				buf.Reset()
+			}
+		}
+	}
+}
+
+func startQRScannerListener(ctx *AppContext) {
+	for {
+		ctx.configMu.RLock()
+		path := strings.TrimSpace(ctx.Config.ScannerDevicePath)
+		ctx.configMu.RUnlock()
+		if path == "" {
+			path = "/dev/input/by-id/usb-YUREN_Yuren_HID_FS_Keyboard_SN_20190000-event-kbd"
+		}
+		runQRScannerListener(ctx, path)
+		log.Printf("WARNING: QR scanner listener stopped for %s; retrying in 2s.", path)
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // pinRejectWithStreak plays reject sound, increments wrong-PIN streak, fires webhook, optional buzzer/lockout.
 func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, buzzerBCM uint8, feedbackDelay time.Duration, webhookReason string, extra map[string]any) {
 	playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
@@ -6257,6 +6832,247 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 func triggerCallForHelp(ctx *AppContext) {
 	// Signal the centralized operations center via API/MQTT
 	// to call the user on the IP-based intercom
+}
+
+type scannedQRCodePayload struct {
+	// device_uuid identifies the phone/device pre-registered for a PIN.
+	DeviceUUID string `json:"device_uuid"`
+	// datetime_stamp is RFC3339/RFC3339Nano timestamp generated by the app.
+	DatetimeStamp string `json:"datetime_stamp"`
+	// timestamp_unix is optional (seconds since Unix epoch) fallback for app variants.
+	TimestampUnix int64 `json:"timestamp_unix,omitempty"`
+}
+
+// parseScannedQRCodePayload accepts JSON payloads like:
+// {"device_uuid":"<uuid>","datetime_stamp":"2026-04-26T03:12:45Z"}
+// and fallback text "<device_uuid>|<RFC3339 timestamp>".
+func parseScannedQRCodePayload(raw string) (deviceUUID string, stamp time.Time, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", time.Time{}, errors.New("empty QR payload")
+	}
+	var p scannedQRCodePayload
+	if jerr := json.Unmarshal([]byte(raw), &p); jerr == nil {
+		deviceUUID = normalizeDeviceUUID(p.DeviceUUID)
+		if deviceUUID == "" {
+			return "", time.Time{}, errors.New("missing device_uuid")
+		}
+		ts := strings.TrimSpace(p.DatetimeStamp)
+		if ts != "" {
+			t, terr := time.Parse(time.RFC3339Nano, ts)
+			if terr != nil {
+				return "", time.Time{}, fmt.Errorf("invalid datetime_stamp: %w", terr)
+			}
+			return deviceUUID, t, nil
+		}
+		if p.TimestampUnix > 0 {
+			return deviceUUID, time.Unix(p.TimestampUnix, 0).UTC(), nil
+		}
+		return "", time.Time{}, errors.New("missing datetime_stamp")
+	}
+	parts := strings.SplitN(raw, "|", 2)
+	if len(parts) != 2 {
+		return "", time.Time{}, errors.New("unsupported QR payload format")
+	}
+	deviceUUID = normalizeDeviceUUID(parts[0])
+	if deviceUUID == "" {
+		return "", time.Time{}, errors.New("missing device_uuid")
+	}
+	t, terr := time.Parse(time.RFC3339Nano, strings.TrimSpace(parts[1]))
+	if terr != nil {
+		return "", time.Time{}, fmt.Errorf("invalid datetime_stamp: %w", terr)
+	}
+	return deviceUUID, t, nil
+}
+
+func (ctx *AppContext) qrRejectWithAccessDenied(cfg DeviceConfig, reason string, extra map[string]any) {
+	buzzerBCM := ctx.GPIOSettings.BuzzerRelayPin
+	feedbackDelay := cfg.PinEntryFeedbackDelay
+	wh := map[string]any{"auth_method": "qr"}
+	for k, v := range extra {
+		wh[k] = v
+	}
+	ctx.pinRejectWithStreak(cfg, "qr", buzzerBCM, feedbackDelay, reason, wh)
+}
+
+// grantStaticTestQRAccess performs the same door/elevator side effects as a successful credential without
+// consulting access_pins, schedules, or keypad lockout. Fireman's service still suppresses relays per existing paths.
+func (ctx *AppContext) grantStaticTestQRAccess(cfg DeviceConfig) {
+	ctx.configMu.RLock()
+	doorBCM := ctx.GPIOSettings.DoorRelayPin
+	ctx.configMu.RUnlock()
+	feedbackDelay := cfg.PinEntryFeedbackDelay
+	mode := NormalizeKeypadOperationMode(cfg.KeypadOperationMode)
+	keypadRole := "qr"
+	credLabel := "static_test_qr"
+	kTag := keypadLogTag(keypadRole)
+	credTag := credLabel
+	whStatic := map[string]any{"auth_method": "qr", "static_test_qr": true}
+
+	ctx.pinFailMu.Lock()
+	ctx.pinFailSeq = 0
+	ctx.pinFailMu.Unlock()
+	ctx.keypadClearLockout()
+
+	switch mode {
+	case ModeElevatorWaitFloorButtons:
+		cabSense := normalizeElevatorWaitFloorCabSense(cfg.ElevatorWaitFloorCabSense)
+		if ctx.FiremansServiceActive() {
+			log.Printf("INFO: Static test QR accepted (elevator wait-floor; fireman's service; %s; credential=%s); software relays not used (cab_sense=%s).", kTag, credTag, cabSense)
+			log.Printf("DEBUG: Fireman's service: elevator_wait_floor_buttons — skipping enable relay window (static test QR).")
+			playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+			wh := map[string]any{
+				"operation_mode":                mode,
+				"keypad_role":                   keypadRole,
+				"credential_label":              credLabel,
+				"elevator_phase":                "firemans_bypass_no_relay",
+				"elevator_wait_floor_cab_sense": cabSense,
+				"door_relay_gpio":               int(doorBCM),
+				"firemans_service":              true,
+			}
+			for k, v := range whStatic {
+				wh[k] = v
+			}
+			fireEventWebhook(ctx, "pin_accepted", wh)
+			time.Sleep(feedbackDelay)
+			return
+		}
+		ctx.elevatorStaticTestFloorACLBypass.Store(true)
+		ctx.elevatorMu.Lock()
+		ctx.elevatorGrantPIN = "static_test_qr"
+		ctx.elevatorGrantViaFallback = false
+		ctx.elevatorMu.Unlock()
+		log.Printf("INFO: Static test QR accepted (elevator wait-floor; %s; credential=%s); enable window started (cab_sense=%s).", kTag, credTag, cabSense)
+		playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+		startElevatorFloorWaitGrant(ctx, cfg)
+		wh := map[string]any{
+			"operation_mode":                mode,
+			"keypad_role":                   keypadRole,
+			"credential_label":              credLabel,
+			"elevator_phase":                "wait_floor_input",
+			"elevator_wait_floor_cab_sense": cabSense,
+			"door_relay_gpio":               int(doorBCM),
+			"floor_wait_until":              cfg.ElevatorFloorWaitTimeout.String(),
+		}
+		for k, v := range whStatic {
+			wh[k] = v
+		}
+		fireEventWebhook(ctx, "pin_accepted", wh)
+		time.Sleep(feedbackDelay)
+		return
+
+	case ModeElevatorPredefinedFloor:
+		ctx.elevatorStaticTestFloorACLBypass.Store(true)
+		ex, okElev := activateElevatorPredefinedFloor(ctx, cfg, kTag, credTag, "static_test_qr", false)
+		ctx.elevatorStaticTestFloorACLBypass.Store(false)
+		if !okElev {
+			aclIdx := ctx.elevatorPredefinedDispatchIndexForACL(cfg)
+			elevDenyID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
+			denyEx := map[string]any{
+				"keypad_role":                keypadRole,
+				"elevator_floor_index":       aclIdx,
+				"access_control_elevator_id": elevDenyID,
+				"credential_label":           credLabel,
+			}
+			for k, v := range whStatic {
+				denyEx[k] = v
+			}
+			if ctx.DB != nil && elevDenyID != "" {
+				denyEx["elevator_floor_label"] = elevatorFloorLogLabel(ctx.DB, elevDenyID, aclIdx)
+			}
+			playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+			fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
+			time.Sleep(feedbackDelay)
+			return
+		}
+		playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+		wh := map[string]any{
+			"operation_mode":   mode,
+			"keypad_role":      keypadRole,
+			"credential_label": credLabel,
+			"door_relay_gpio":  int(doorBCM),
+		}
+		for k, v := range ex {
+			wh[k] = v
+		}
+		for k, v := range whStatic {
+			wh[k] = v
+		}
+		fireEventWebhook(ctx, "pin_accepted", wh)
+		time.Sleep(feedbackDelay)
+		return
+
+	default:
+		log.Printf("INFO: Static test QR accepted (mode=%s %s; credential=%s); door relay GPIO %d.", mode, kTag, credTag, doorBCM)
+		ctx.grantDefaultModeDoorUnlockLikePIN("", cfg, mode, keypadRole, credLabel, doorBCM, feedbackDelay, 0, whStatic, false)
+	}
+}
+
+func (ctx *AppContext) processScannedQRCode(raw string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	// "DEBUG:" lines are filtered to log_level=debug|all|"" by shouldEmitLogLine.
+	log.Printf("DEBUG: QR code read: %q (len=%d)", raw, len(raw))
+	ctx.configMu.RLock()
+	cfg := ctx.Config
+	ctx.configMu.RUnlock()
+
+	if cfg.StaticTestQRCodeEnabled {
+		want := strings.TrimSpace(cfg.StaticTestQRCode)
+		if want == "" {
+			log.Println("WARNING: static_test_qr_code_enabled is true but static_test_qr_code is empty; rejecting QR.")
+			ctx.qrRejectWithAccessDenied(cfg, "qr_static_test_not_configured", map[string]any{"qr_payload_len": len(raw)})
+			return
+		}
+		if raw == want {
+			log.Printf("INFO: Static test QR matched; granting without credential, schedule, or keypad-lockout checks.")
+			ctx.grantStaticTestQRAccess(cfg)
+			return
+		}
+		log.Printf("INFO: QR rejected (static_test_qr_code_enabled: payload does not match static_test_qr_code).")
+		ctx.qrRejectWithAccessDenied(cfg, "qr_static_test_mismatch", map[string]any{"qr_payload_len": len(raw)})
+		return
+	}
+
+	if ctx.keypadLockoutActive() && !ctx.FiremansServiceActive() {
+		ctx.qrRejectWithAccessDenied(cfg, "keypad_lockout", map[string]any{"qr_payload_len": len(raw)})
+		return
+	}
+	deviceUUID, stamp, err := parseScannedQRCodePayload(raw)
+	if err != nil {
+		log.Printf("INFO: QR rejected (payload parse failed): %v", err)
+		ctx.qrRejectWithAccessDenied(cfg, "qr_parse_failed", map[string]any{"error": err.Error()})
+		return
+	}
+	pin, err := ctx.resolvePINForMobileUUID(deviceUUID)
+	if err != nil {
+		reason := "qr_unknown_device_uuid"
+		if strings.HasPrefix(err.Error(), "credential_lifecycle:") {
+			reason = "credential_lifecycle"
+		}
+		log.Printf("INFO: QR rejected (uuid=%s): %v", deviceUUID, err)
+		ctx.qrRejectWithAccessDenied(cfg, reason, map[string]any{"device_uuid": deviceUUID})
+		return
+	}
+	window := time.Duration(cfg.QRTimeWindowSeconds) * time.Second
+	drift := time.Since(stamp)
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > window {
+		log.Printf("INFO: QR rejected (uuid=%s; drift=%s > window=%s).", deviceUUID, drift, window)
+		ctx.qrRejectWithAccessDenied(cfg, "qr_timestamp_outside_window", map[string]any{
+			"device_uuid":  deviceUUID,
+			"drift":        drift.String(),
+			"max_drift":    window.String(),
+			"datetime_utc": stamp.UTC().Format(time.RFC3339Nano),
+		})
+		return
+	}
+	log.Printf("INFO: QR accepted (uuid=%s); routing to PIN grant path.", deviceUUID)
+	processPIN(ctx, pin, "qr")
 }
 
 func (ctx *AppContext) keypadLockoutActive() bool {
@@ -7208,6 +8024,15 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  keypad_operation_mode: %s\n", NormalizeKeypadOperationMode(c.KeypadOperationMode))
 	fmt.Fprintf(w, "  keypad_evdev_path: %q\n", c.KeypadEvdevPath)
 	fmt.Fprintf(w, "  keypad_exit_evdev_path: %q\n", c.KeypadExitEvdevPath)
+	fmt.Fprintf(w, "  scanner_device_path: %q\n", c.ScannerDevicePath)
+	fmt.Fprintf(w, "  max_devices_per_user: %d\n", c.MaxDevicesPerUser)
+	fmt.Fprintf(w, "  qr_time_window_seconds: %d\n", c.QRTimeWindowSeconds)
+	if strings.TrimSpace(c.StaticTestQRCode) != "" {
+		fmt.Fprintln(w, "  static_test_qr_code: (set)")
+	} else {
+		fmt.Fprintln(w, "  static_test_qr_code: \"\"")
+	}
+	fmt.Fprintf(w, "  static_test_qr_code_enabled: %v\n", c.StaticTestQRCodeEnabled)
 	fmt.Fprintf(w, "  pair_peer_role: %s\n", normalizePairPeerRole(c.PairPeerRole))
 	fmt.Fprintf(w, "  mqtt_pair_peer_topic: %q\n", c.MQTTPairPeerTopic)
 	pptok := `""`
@@ -7968,7 +8793,7 @@ type i2cRelayExpander interface {
 // OutputConfig defines an output pin, like a door relay or buzzer
 type OutputConfig struct {
 	PinNumber uint8
-	ActiveLow bool // True if the relay triggers on ground/0V (common for opto-relays)
+	ActiveLow bool           // True if the relay triggers on ground/0V (common for opto-relays)
 	Line      *gpiocdev.Line // SoC line; nil when UseI2CRelay or request failed
 	// UseI2CRelay: when true, PinNumber is expander index 0-15 (MCP23017 or XL9535 per relay_output_mode).
 	UseI2CRelay bool
@@ -7998,10 +8823,10 @@ type GPIOManager struct {
 	Outputs map[string]*OutputConfig
 	Inputs  map[string]*InputConfig
 
-	i2cRelay       i2cRelayExpander
-	i2cRelayCloser io.Closer
-	i2cOpsMu       sync.Mutex // serializes expander I/O, bus recovery, and adapter reinit
-	i2cReopenFn    func() (i2cRelayExpander, error)
+	i2cRelay             i2cRelayExpander
+	i2cRelayCloser       io.Closer
+	i2cOpsMu             sync.Mutex // serializes expander I/O, bus recovery, and adapter reinit
+	i2cReopenFn          func() (i2cRelayExpander, error)
 	i2cBusRecoverySCLBCM uint8
 
 	// doorHoldWhile, if set, is consulted at the end of ActionPulse("door", ...): when true the door relay
@@ -8610,6 +9435,7 @@ func clearElevatorGrantState(ctx *AppContext) {
 	ctx.elevatorCabFloorDebounceTick = 0
 	ctx.elevatorGrantPIN = ""
 	ctx.elevatorGrantViaFallback = false
+	ctx.elevatorStaticTestFloorACLBypass.Store(false)
 	ctx.elevatorMu.Unlock()
 	if ctx.GPIO == nil {
 		return

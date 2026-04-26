@@ -4,6 +4,7 @@
 #   ./tools/bump-version.sh "What you changed"
 #
 
+[0.19] 2026-04-26T03:56:03Z  added qr usb code reader
 [0.18] 2026-04-25T07:31:06Z  sync sounds are serialized
 [0.17] 2026-04-19T05:46:44Z  implement i2c robustness
 [0.16] 2026-04-19T03:35:52Z  updated OPERATOR.md
