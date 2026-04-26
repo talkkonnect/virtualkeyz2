@@ -1,8 +1,8 @@
 {
   "device": {
     "heartbeat_interval": "1m0s",
-    "door_open_warning_after": "30s",
-    "door_open_alarm_interval": "1m0s",
+    "door_open_warning_after": "60s",
+    "door_open_alarm_interval": "2m0s",
     "door_open_alarm_max_count": 0,
     "door_forced_after_warnings": 0,
     "door_sensor_closed_is_low": true,
@@ -25,6 +25,13 @@
     "sound_lighting_timer_set_enabled": true,
     "sound_lighting_timer_expired_enabled": true,
     "sound_door_open_enabled": true,
+    "lcd_display": {
+      "enabled": true,
+      "i2c_bus": 1,
+      "i2c_address": 63,
+      "backlight_timeout_seconds": 60,
+      "i2c_debug_enabled": false
+    },
     "sound_firemans_activated": "",
     "sound_firemans_deactivated": "",
     "sound_firemans_activated_enabled": false,
@@ -130,7 +137,7 @@
     "motion_sensor_pin": 0,
     "motion_sensor_active_low": true
   },
-  "tech_menu_prompt": "Siam_5th_Floor_Right",
+  "tech_menu_prompt": "MeSpace Access Control",
   "elevator_parameter_modes": {
     "_documentation": "This object is not used by the application logic — it is a label map so you can see which keys matter for elevator_wait_floor_buttons vs elevator_predefined_floor. It is preserved when you run cfg save from the technician menu.",
     "legend": {

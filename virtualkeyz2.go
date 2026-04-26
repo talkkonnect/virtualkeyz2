@@ -45,8 +45,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.19"
-	SoftwareReleaseUTC = "2026-04-26T03:56:03Z"
+	SoftwareVersion    = "0.20"
+	SoftwareReleaseUTC = "2026-04-26T05:27:56Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
@@ -265,6 +265,8 @@ type AppContext struct {
 	// PinDisplayDigits receives how many PIN digits are entered; displayController prints that many asterisks.
 	// Buffered (see pinDisplayDigitsBuffer); notifyPinDisplay uses a non-blocking send so a stuck display goroutine cannot block keypad input.
 	PinDisplayDigits chan int
+	// lcdUI carries full-screen LCD updates; non-blocking enqueue from lcdEnqueueFull (same buffer policy as PinDisplayDigits).
+	lcdUI chan lcdCmd
 
 	pinFailMu  sync.Mutex
 	pinFailSeq int // consecutive rejected PIN submissions (reset on success or after buzzer fires)
@@ -531,6 +533,9 @@ type DeviceConfig struct {
 	// LightingTimeout: lighting relay hold after manual button or accepted PIN; each new press or PIN restarts the full timer without toggling the relay off until expiry. Clamped in normalizeKeypadAndPinUX.
 	LightingTimeout time.Duration
 
+	// LCDDisplay: optional I2C HD44780 20×4 UI (device.lcd_display); updates run in displayController only.
+	LCDDisplay LCDDisplaySettings
+
 	// FiremansServiceEnabled: when true, fireman's service (emergency bypass) may be triggered by GPIO, MQTT, or technician menu.
 	FiremansServiceEnabled bool
 	// SoundFiremansActivated / SoundFiremansDeactivated: optional WAV announcements when emergency bypass is turned on or off.
@@ -538,6 +543,15 @@ type DeviceConfig struct {
 	SoundFiremansDeactivated        string
 	SoundFiremansActivatedEnabled   bool
 	SoundFiremansDeactivatedEnabled bool
+}
+
+// virtualkeyz2LCDDisplayJSON is the device.lcd_display object in virtualkeyz2.json.
+type virtualkeyz2LCDDisplayJSON struct {
+	Enabled                 *bool `json:"enabled,omitempty"`
+	I2CBus                  *int  `json:"i2c_bus,omitempty"`
+	I2CAddress              *int  `json:"i2c_address,omitempty"`
+	BacklightTimeoutSeconds *int  `json:"backlight_timeout_seconds,omitempty"`
+	I2CDebugEnabled         *bool `json:"i2c_debug_enabled,omitempty"`
 }
 
 // virtualkeyz2JSON is the on-disk shape of virtualkeyz2.json (see default file in repo).
@@ -643,7 +657,8 @@ type virtualkeyz2DeviceJSON struct {
 	SoundFiremansActivatedEnabled       *bool                   `json:"sound_firemans_activated_enabled,omitempty"`
 	SoundFiremansDeactivatedEnabled     *bool                   `json:"sound_firemans_deactivated_enabled,omitempty"`
 	AutomaticDoorOperatorPulseDuration  *string                 `json:"automatic_door_operator_pulse_duration,omitempty"`
-	IntercomCameraTriggerPulseDuration  *string                 `json:"intercom_camera_trigger_pulse_duration,omitempty"`
+	IntercomCameraTriggerPulseDuration  *string                    `json:"intercom_camera_trigger_pulse_duration,omitempty"`
+	LCDDisplay                          *virtualkeyz2LCDDisplayJSON `json:"lcd_display,omitempty"`
 }
 
 type virtualkeyz2GPIOJSON struct {
@@ -1070,6 +1085,7 @@ func normalizeKeypadAndPinUX(c *DeviceConfig) {
 	}
 	normalizeWebhookOutboundHTTP(c)
 	normalizeOperationModeConfig(c)
+	normalizeLCDDisplaySettings(&c.LCDDisplay)
 }
 
 func normalizeWebhookOutboundHTTP(c *DeviceConfig) {
@@ -1460,6 +1476,28 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.SoundFiremansDeactivatedEnabled != nil {
 		app.Config.SoundFiremansDeactivatedEnabled = *d.SoundFiremansDeactivatedEnabled
 	}
+	if d.LCDDisplay != nil {
+		ld := d.LCDDisplay
+		if ld.Enabled != nil {
+			app.Config.LCDDisplay.Enabled = *ld.Enabled
+		}
+		if ld.I2CBus != nil {
+			app.Config.LCDDisplay.I2CBus = *ld.I2CBus
+		}
+		if ld.I2CAddress != nil {
+			a := *ld.I2CAddress
+			if a < 0 || a > 255 {
+				return fmt.Errorf("device.lcd_display.i2c_address: %d out of range 0-255", a)
+			}
+			app.Config.LCDDisplay.I2CAddr = uint8(a)
+		}
+		if ld.BacklightTimeoutSeconds != nil {
+			app.Config.LCDDisplay.BacklightTimeout = time.Duration(*ld.BacklightTimeoutSeconds) * time.Second
+		}
+		if ld.I2CDebugEnabled != nil {
+			app.Config.LCDDisplay.I2CDebugEnabled = *ld.I2CDebugEnabled
+		}
+	}
 	g := &raw.GPIO
 	if g.RelayOutputMode != nil {
 		app.GPIOSettings.RelayOutputMode = strings.TrimSpace(*g.RelayOutputMode)
@@ -1834,6 +1872,16 @@ type virtualkeyz2PersistDevice struct {
 	AccessScheduleApplyToFallbackPin    bool                   `json:"access_schedule_apply_to_fallback_pin"`
 	AccessExceptionSiteTimezone         string                 `json:"access_exception_site_timezone,omitempty"`
 	LightingTimeout                     string                 `json:"lighting_timeout"`
+	LCDDisplay                          virtualkeyz2LCDPersist `json:"lcd_display,omitempty"`
+}
+
+// virtualkeyz2LCDPersist is written under device.lcd_display by cfg save.
+type virtualkeyz2LCDPersist struct {
+	Enabled                 bool `json:"enabled"`
+	I2CBus                  int  `json:"i2c_bus"`
+	I2CAddress              int  `json:"i2c_address"`
+	BacklightTimeoutSeconds int  `json:"backlight_timeout_seconds"`
+	I2CDebugEnabled         bool `json:"i2c_debug_enabled"`
 }
 
 type virtualkeyz2PersistGPIO struct {
@@ -1994,6 +2042,17 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.AccessScheduleApplyToFallbackPin = c.AccessScheduleApplyToFallbackPin
 	out.Device.AccessExceptionSiteTimezone = c.AccessExceptionSiteTimezone
 	out.Device.LightingTimeout = c.LightingTimeout.String()
+	blSec := int(c.LCDDisplay.BacklightTimeout / time.Second)
+	if c.LCDDisplay.BacklightTimeout > 0 && blSec < 1 {
+		blSec = 1
+	}
+	out.Device.LCDDisplay = virtualkeyz2LCDPersist{
+		Enabled:                 c.LCDDisplay.Enabled,
+		I2CBus:                  c.LCDDisplay.I2CBus,
+		I2CAddress:              int(c.LCDDisplay.I2CAddr),
+		BacklightTimeoutSeconds: blSec,
+		I2CDebugEnabled:         c.LCDDisplay.I2CDebugEnabled,
+	}
 	out.GPIO.RelayOutputMode = normalizeRelayOutputMode(g.RelayOutputMode)
 	out.GPIO.MCP23017I2CBus = g.MCP23017I2CBus
 	out.GPIO.MCP23017I2CAddr = int(g.MCP23017I2CAddr)
@@ -2147,6 +2206,7 @@ func reloadVirtualKeyz2ConfigLive(ctx *AppContext) error {
 	registerTechMenuPrompt(prompt)
 	syncLogFilterFromConfigLevel(lvl)
 	log.Println("INFO: Configuration reloaded from disk (MQTT reconnecting; GPIO / relay_output_mode changes need a full restart).")
+	lcdShowConfigReload(ctx)
 	ctx.reconnectMQTT()
 	ctx.techHistoryTrimToMax()
 	ctx.syncFiremansServiceAfterConfigReload()
@@ -2171,6 +2231,7 @@ func applyInMemoryConfigLive(ctx *AppContext) {
 	registerTechMenuPrompt(prompt)
 	syncLogFilterFromConfigLevel(lvl)
 	log.Println("INFO: In-memory configuration applied live (MQTT reconnect; GPIO pin map unchanged until reboot).")
+	lcdShowConfigReload(ctx)
 	ctx.reconnectMQTT()
 	ctx.syncFiremansServiceAfterConfigReload()
 	ctx.syncFireAlarmAfterConfigReload()
@@ -2513,6 +2574,41 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		err = applyJSONDuration(&ctx.Config.KeypadSessionTimeout, "device", "keypad_session_timeout", &value)
 	case "lighting_timeout":
 		err = applyJSONDuration(&ctx.Config.LightingTimeout, "device", "lighting_timeout", &value)
+	case "lcd_backlight_timeout_seconds":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.Config.LCDDisplay.BacklightTimeout = time.Duration(n) * time.Second
+			normalizeLCDDisplaySettings(&ctx.Config.LCDDisplay)
+		}
+	case "lcd_display_enabled":
+		ctx.Config.LCDDisplay.Enabled, err = strconv.ParseBool(value)
+		if err == nil {
+			normalizeLCDDisplaySettings(&ctx.Config.LCDDisplay)
+		}
+	case "lcd_i2c_address":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			if n < 0 || n > 255 {
+				err = fmt.Errorf("lcd_i2c_address %d out of range 0-255", n)
+			} else {
+				ctx.Config.LCDDisplay.I2CAddr = uint8(n)
+				normalizeLCDDisplaySettings(&ctx.Config.LCDDisplay)
+			}
+		}
+	case "lcd_i2c_bus":
+		var n int64
+		n, err = strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			ctx.Config.LCDDisplay.I2CBus = int(n)
+			normalizeLCDDisplaySettings(&ctx.Config.LCDDisplay)
+		}
+	case "lcd_i2c_debug_enabled":
+		ctx.Config.LCDDisplay.I2CDebugEnabled, err = strconv.ParseBool(value)
+		if err == nil {
+			syncLCDTransportLibraryDebug(ctx.Config.LCDDisplay.I2CDebugEnabled)
+		}
 	case "pin_entry_feedback_delay":
 		err = applyJSONDuration(&ctx.Config.PinEntryFeedbackDelay, "device", "pin_entry_feedback_delay", &value)
 	case "pin_lockout_enabled":
@@ -2868,6 +2964,11 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   keypad_inter_digit_timeout        3s–10s, default 5s
   keypad_session_timeout            10s–60s from first digit, default 30s
   lighting_timeout                  lighting relay hold after manual button or accepted PIN (default 30m; each resets full duration; relay off only when timer expires)
+  lcd_display_enabled               true|false enable I2C HD44780 20x4 (see device.lcd_display JSON block)
+  lcd_i2c_bus                       Linux I2C bus number (default 1 → /dev/i2c-1)
+  lcd_i2c_address                   decimal device address (default 39 = 0x27)
+  lcd_backlight_timeout_seconds     0=always on after activity; else min 5s auto backlight off
+  lcd_i2c_debug_enabled             true|false verbose I2C/LCD library logs (default false; not tied to log_level)
   pin_entry_feedback_delay          2s–10s after PIN sound, default 3s
   pin_lockout_enabled               true|false (false disables keypad lockout entirely)
   pin_lockout_after_attempts        0=off, else 3–5 failed PINs, default 5
@@ -3059,6 +3160,13 @@ func main() {
 			MaxDevicesPerUser:                3,
 			QRTimeWindowSeconds:              30,
 			StaticTestQRCodeEnabled:          false,
+			LCDDisplay: LCDDisplaySettings{
+				Enabled:           false,
+				I2CBus:            1,
+				I2CAddr:           0x27,
+				BacklightTimeout:  60 * time.Second,
+				I2CDebugEnabled:   false,
+			},
 		},
 		GPIOSettings: GPIOSettings{
 			RelayOutputMode:      RelayOutputGPIO,
@@ -3074,6 +3182,7 @@ func main() {
 			HeartbeatLEDPin:      26,
 		},
 		PinDisplayDigits: make(chan int, pinDisplayDigitsBuffer),
+		lcdUI:            make(chan lcdCmd, lcdCmdBuffer),
 		TechMenuPrompt:   "MeSpace-Siam-5th-Floor-Right-Door",
 	}
 	if err := loadVirtualKeyz2Config(*configPath, appCtx); err != nil {
@@ -3196,7 +3305,8 @@ func main() {
 	go startQRScannerListener(appCtx)
 	go monitorElevatorFloorSelection(appCtx)
 	go monitorDoorSensors(appCtx) // Door open timers & warnings
-	go displayController(appCtx)  // Manage DSI Screen and random QR codes [cite: 3, 10, 11]
+	go displayController(appCtx)  // I2C HD44780 LCD + PIN mask (non-blocking vs keypad)
+	lcdShowIdle(appCtx)           // Initial welcome screen when lcd_display.enabled is true
 
 	// 7. Start Web Server (Web UI & REST HTTP API with token support) [cite: 6, 7]
 	srv := startWebServer(appCtx)
@@ -4704,6 +4814,7 @@ func (ctx *AppContext) credentialRecordSuccessfulUse(pin, mode, keypadRole strin
 
 // pinRejectCredentialLifecycle plays reject feedback for lifecycle denial without counting toward wrong-PIN lockout streak.
 func (ctx *AppContext) pinRejectCredentialLifecycle(cfg DeviceConfig, keypadRole string, buzzerBCM uint8, feedbackDelay time.Duration, reason string, extra map[string]any) {
+	lcdShowInvalidCard(ctx)
 	playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 	wh := map[string]any{"reason": reason, "keypad_role": keypadRole}
 	for k, v := range extra {
@@ -4932,13 +5043,28 @@ func initMQTT(ctx *AppContext) mqtt.Client {
 		opts.SetPassword(cfg.MQTTPassword)
 	}
 
+	opts.SetConnectionLostHandler(func(_ mqtt.Client, err error) {
+		ctx.configMu.RLock()
+		en := ctx.Config.MQTTEnabled
+		br := strings.TrimSpace(ctx.Config.MQTTBroker)
+		ctx.configMu.RUnlock()
+		if en && br != "" {
+			log.Printf("WARNING: MQTT connection lost: %v", err)
+			lcdShowMQTTOffline(ctx)
+		}
+	})
 	opts.SetOnConnectHandler(func(c mqtt.Client) {
 		ctx.configMu.RLock()
 		topic := strings.TrimSpace(ctx.Config.MQTTCommandTopic)
 		pairTopic := strings.TrimSpace(ctx.Config.MQTTPairPeerTopic)
 		mode := NormalizeKeypadOperationMode(ctx.Config.KeypadOperationMode)
 		role := normalizePairPeerRole(ctx.Config.PairPeerRole)
+		mqEn := ctx.Config.MQTTEnabled
+		br := strings.TrimSpace(ctx.Config.MQTTBroker)
 		ctx.configMu.RUnlock()
+		if mqEn && br != "" {
+			lcdShowMQTTRecovered(ctx)
+		}
 		if topic != "" {
 			h := mqttRemoteMessageHandler(ctx)
 			if t := c.Subscribe(topic, 1, h); t.Wait() && t.Error() != nil {
@@ -5637,6 +5763,7 @@ func monitorDoorSensors(ctx *AppContext) {
 				}
 				ctx.clearDoorHoldExtraGrace()
 				fireEventWebhook(ctx, "door_closed", map[string]any{"door_sensor_gpio": sensorGPIO})
+				lcdShowDoorSecured(ctx)
 			}
 			continue
 		}
@@ -5685,6 +5812,9 @@ func monitorDoorSensors(ctx *AppContext) {
 					"forced_after_warnings": forcedAfter,
 				})
 				doorForcedLatched = true
+				lcdShowDoorForced(ctx)
+			} else {
+				lcdShowDoorHeld(ctx)
 			}
 			continue
 		}
@@ -5720,6 +5850,9 @@ func monitorDoorSensors(ctx *AppContext) {
 				"forced_after_warnings": forcedAfter,
 			})
 			doorForcedLatched = true
+			lcdShowDoorForced(ctx)
+		} else {
+			lcdShowDoorHeld(ctx)
 		}
 	}
 }
@@ -5838,18 +5971,6 @@ func getSoundQueueCh(cfg DeviceConfig) chan *soundQueueJob {
 		go soundQueueWorker(k, ch)
 	}
 	return ch
-}
-
-func displayController(ctx *AppContext) {
-	// Manages DSI screen, displays greeting messages [cite: 3, 9]
-	// Displays random QR code for external mobile phone interaction
-	for n := range ctx.PinDisplayDigits {
-		if n <= 0 {
-			continue
-		}
-		mask := strings.Repeat("*", n)
-		log.Printf("DEBUG: Pin Digits Count %s", mask)
-	}
 }
 
 // playSoundSyncEnabled plays path when enabled is true (same rules as playSoundSync).
@@ -6505,6 +6626,7 @@ func startQRScannerListener(ctx *AppContext) {
 
 // pinRejectWithStreak plays reject sound, increments wrong-PIN streak, fires webhook, optional buzzer/lockout.
 func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, buzzerBCM uint8, feedbackDelay time.Duration, webhookReason string, extra map[string]any) {
+	lcdRejectFromWebhookReason(ctx, webhookReason, keypadRole)
 	playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 	ctx.pinFailMu.Lock()
 	ctx.pinFailSeq++
@@ -6588,6 +6710,7 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 			}
 			fireEventWebhook(ctx, "hardware_actuation_failed", failWh)
 			log.Printf("ERROR: Door relay actuation failed (hardware_actuation_failed): %v", err)
+			lcdShowCommFail(ctx)
 			playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 			time.Sleep(feedbackDelay)
 			return false
@@ -6597,6 +6720,7 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 	} else {
 		log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
 	}
+	lcdShowGranted(ctx, credLabel)
 	playSoundSyncEnabled(cfg, okSound, okEn)
 	if strings.TrimSpace(pin) != "" && !ctx.FiremansServiceActive() {
 		ctx.lightingEnergizeAndArmTimer(fmt.Sprintf("pin_accepted_%s", strings.TrimSpace(keypadRole)))
@@ -6631,6 +6755,10 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 	if pin == "" {
 		return
 	}
+	if keypadRole != "qr" {
+		// QR path already showed "Scan Card / Then Enter PIN" just before we entered processPIN.
+		lcdShowProcessing(ctx)
+	}
 	log.Printf("DEBUG: Processing PIN from %s keypad (length %d).", keypadLogTag(keypadRole), len(pin))
 	ctx.configMu.RLock()
 	cfg := ctx.Config
@@ -6647,6 +6775,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		ctx.pinFailMu.Unlock()
 		log.Printf("INFO: Keypad lockout cleared by override PIN (%s keypad).", keypadLogTag(keypadRole))
 		fireEventWebhook(ctx, "keypad_lockout_override", map[string]any{"keypad_role": keypadRole})
+		lcdEnqueueFullSync(ctx, lcdLinesIdle(), 0)
 		playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 		time.Sleep(feedbackDelay)
 		return
@@ -6654,6 +6783,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 
 	if ctx.keypadLockoutActive() && !ctx.FiremansServiceActive() {
 		log.Printf("INFO: PIN rejected (keypad lockout; %s keypad).", keypadLogTag(keypadRole))
+		lcdShowKeypadLockout(ctx)
 		fireEventWebhook(ctx, "pin_rejected", map[string]any{"reason": "keypad_lockout", "keypad_role": keypadRole})
 		playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 		time.Sleep(feedbackDelay)
@@ -6725,6 +6855,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			if ctx.FiremansServiceActive() {
 				log.Printf("INFO: PIN accepted (elevator wait-floor; fireman's service; %s keypad; credential=%s); software enable/dispatch relays not used (cab_sense=%s).", kTag, credTag, cabSense)
 				log.Printf("DEBUG: Fireman's service: elevator_wait_floor_buttons — skipping enable relay window and floor selection handler state.")
+				lcdShowGranted(ctx, credTag)
 				playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 				fireEventWebhook(ctx, "pin_accepted", map[string]any{
 					"operation_mode":                mode,
@@ -6743,6 +6874,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			ctx.elevatorGrantViaFallback = cred.ViaFallback
 			ctx.elevatorMu.Unlock()
 			log.Printf("INFO: PIN accepted (elevator wait-floor; %s keypad; credential=%s); enable window started (cab_sense=%s).", kTag, credTag, cabSense)
+			lcdShowGranted(ctx, credTag)
 			playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 			startElevatorFloorWaitGrant(ctx, cfg)
 			fireEventWebhook(ctx, "pin_accepted", map[string]any{
@@ -6773,11 +6905,13 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 				if ctx.DB != nil && elevDenyID != "" {
 					denyEx["elevator_floor_label"] = elevatorFloorLogLabel(ctx.DB, elevDenyID, aclIdx)
 				}
+				lcdShowElevatorFloorDeny(ctx)
 				playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 				fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
 				time.Sleep(feedbackDelay)
 				return
 			}
+			lcdShowGranted(ctx, credTag)
 			playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 			wh := map[string]any{
 				"operation_mode":   mode,
@@ -6920,6 +7054,7 @@ func (ctx *AppContext) grantStaticTestQRAccess(cfg DeviceConfig) {
 		if ctx.FiremansServiceActive() {
 			log.Printf("INFO: Static test QR accepted (elevator wait-floor; fireman's service; %s; credential=%s); software relays not used (cab_sense=%s).", kTag, credTag, cabSense)
 			log.Printf("DEBUG: Fireman's service: elevator_wait_floor_buttons — skipping enable relay window (static test QR).")
+			lcdShowGranted(ctx, credTag)
 			playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 			wh := map[string]any{
 				"operation_mode":                mode,
@@ -6943,6 +7078,7 @@ func (ctx *AppContext) grantStaticTestQRAccess(cfg DeviceConfig) {
 		ctx.elevatorGrantViaFallback = false
 		ctx.elevatorMu.Unlock()
 		log.Printf("INFO: Static test QR accepted (elevator wait-floor; %s; credential=%s); enable window started (cab_sense=%s).", kTag, credTag, cabSense)
+		lcdShowGranted(ctx, credTag)
 		playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 		startElevatorFloorWaitGrant(ctx, cfg)
 		wh := map[string]any{
@@ -6980,11 +7116,13 @@ func (ctx *AppContext) grantStaticTestQRAccess(cfg DeviceConfig) {
 			if ctx.DB != nil && elevDenyID != "" {
 				denyEx["elevator_floor_label"] = elevatorFloorLogLabel(ctx.DB, elevDenyID, aclIdx)
 			}
+			lcdShowElevatorFloorDeny(ctx)
 			playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 			fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
 			time.Sleep(feedbackDelay)
 			return
 		}
+		lcdShowGranted(ctx, credTag)
 		playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
 		wh := map[string]any{
 			"operation_mode":   mode,
@@ -7072,6 +7210,7 @@ func (ctx *AppContext) processScannedQRCode(raw string) {
 		return
 	}
 	log.Printf("INFO: QR accepted (uuid=%s); routing to PIN grant path.", deviceUUID)
+	lcdEnqueueFull(ctx, lcdLinesCardPINPrompt(), 0)
 	processPIN(ctx, pin, "qr")
 }
 
@@ -7264,6 +7403,11 @@ var techMenuCfgKeysForCompletion = []string{
 	"keypad_inter_digit_timeout",
 	"keypad_operation_mode",
 	"keypad_session_timeout",
+	"lcd_backlight_timeout_seconds",
+	"lcd_display_enabled",
+	"lcd_i2c_address",
+	"lcd_i2c_bus",
+	"lcd_i2c_debug_enabled",
 	"lighting_button_active_low",
 	"lighting_button_pin",
 	"lighting_relay_active_low",
@@ -8016,6 +8160,9 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	}
 	fmt.Fprintf(w, "  intercom_camera_trigger_pulse_duration: %s\n", c.IntercomCameraTriggerPulseDuration)
 	fmt.Fprintf(w, "  lighting_timeout: %s (manual button or accepted PIN; default 30m; full reset each trigger; relay off only at expiry)\n", c.LightingTimeout)
+	lcd := c.LCDDisplay
+	fmt.Fprintf(w, "  lcd_display: enabled=%v bus=%d addr=0x%02x backlight_idle_off=%s i2c_debug=%v\n",
+		lcd.Enabled, lcd.I2CBus, lcd.I2CAddr, lcd.BacklightTimeout.String(), lcd.I2CDebugEnabled)
 	fmt.Fprintf(w, "  pin_reject_buzzer_after_attempts: %d\n", c.PinRejectBuzzerAfterAttempts)
 	fmt.Fprintf(w, "  keypad_inter_digit_timeout: %s\n", c.KeypadInterDigitTimeout)
 	fmt.Fprintf(w, "  keypad_session_timeout: %s\n", c.KeypadSessionTimeout)
@@ -9478,6 +9625,7 @@ func (ctx *AppContext) applyFireAlarmInterfaceTransition(wantActive bool, reason
 	if wantActive {
 		log.Printf("INFO: Fire alarm interface ACTIVE (fail-unlock; reason=%q): holding door relay energized.", reason)
 		log.Printf("DEBUG: Fire alarm interface: GPIO latched active — door strike / operator held open until input clears.")
+		lcdShowFireAlarm(ctx, true)
 		if ctx.GPIO != nil && ctx.GPIO.HasOutput("door") {
 			ctx.GPIO.ActionOn("door")
 		} else if ctx.GPIO == nil {
@@ -9487,6 +9635,7 @@ func (ctx *AppContext) applyFireAlarmInterfaceTransition(wantActive bool, reason
 	}
 	log.Printf("INFO: Fire alarm interface CLEARED (reason=%q): releasing door relay hold.", reason)
 	log.Printf("DEBUG: Fire alarm interface: GPIO inactive — returning door relay to software control.")
+	lcdShowFireAlarm(ctx, false)
 	if ctx.GPIO != nil && ctx.GPIO.HasOutput("door") {
 		ctx.GPIO.ActionOff("door")
 	}
@@ -9562,6 +9711,11 @@ func setupTamperSwitchGPIOInput(ctx *AppContext, gpio *GPIOManager) {
 		secure := isLow == activeLow
 		log.Printf("DEBUG: Tamper switch: edge on BCM %d read_low=%v active_low_wiring=%v => enclosure_secure=%v.",
 			pin, isLow, activeLow, secure)
+		if secure {
+			lcdShowIdle(ctx)
+		} else {
+			lcdShowTamperAlert(ctx)
+		}
 	})
 	log.Printf("INFO: Tamper switch input: BCM %d (active_low_wiring=%v, pull_up=%v).", pin, activeLow, activeLow)
 }
@@ -9717,6 +9871,7 @@ func (ctx *AppContext) runFiremansServiceEnter(reason string) {
 	ctx.configMu.RUnlock()
 	playSoundAsyncEnabled(cfg, cfg.SoundFiremansActivated, cfg.SoundFiremansActivatedEnabled)
 	fireEventWebhook(ctx, "firemans_service_activated", map[string]any{"reason": reason})
+	lcdShowFiremans(ctx, true)
 }
 
 func (ctx *AppContext) runFiremansServiceExit(reason string) {
@@ -9734,6 +9889,7 @@ func (ctx *AppContext) runFiremansServiceExit(reason string) {
 	ctx.configMu.RUnlock()
 	playSoundAsyncEnabled(cfg, cfg.SoundFiremansDeactivated, cfg.SoundFiremansDeactivatedEnabled)
 	fireEventWebhook(ctx, "firemans_service_deactivated", map[string]any{"reason": reason})
+	lcdShowFiremans(ctx, false)
 }
 
 func setupFiremansServiceGPIOInput(ctx *AppContext, gpio *GPIOManager) {
@@ -10070,6 +10226,7 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 			} else {
 				log.Printf("INFO: Elevator cab floor input(s) rejected (not permitted for credential or schedule): %v", deniedIndices)
 			}
+			lcdShowElevatorFloorDeny(ctx)
 			playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 			elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
 			denyEx := map[string]any{
