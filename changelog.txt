@@ -4,6 +4,7 @@
 #   ./tools/bump-version.sh "What you changed"
 #
 
+[0.21] 2026-04-27T04:36:25Z  added sounds
 [0.20] 2026-04-26T05:27:56Z  added lcd display
 [0.19] 2026-04-26T03:56:03Z  added qr usb code reader
 [0.18] 2026-04-25T07:31:06Z  sync sounds are serialized

@@ -45,8 +45,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.20"
-	SoftwareReleaseUTC = "2026-04-26T05:27:56Z"
+	SoftwareVersion    = "0.21"
+	SoftwareReleaseUTC = "2026-04-27T04:36:25Z"
 )
 
 // Keypad / access operation modes (device.keypad_operation_mode in JSON).
