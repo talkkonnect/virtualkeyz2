@@ -1,0 +1,28 @@
+[Unit]
+Description=VirtualKeyz2 Access Control Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+SupplementaryGroups=gpio i2c input audio
+WorkingDirectory=/home/talkkonnect/gocode/src/github.com/virtualkeyz2
+ExecStart=/home/talkkonnect/bin/virtualkeyz2 -daemon -config /home/talkkonnect/gocode/src/github.com/virtualkeyz2/virtualkeyz2.json
+Restart=on-failure
+RestartSec=3
+
+# Keep logs in journalctl
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening (compatible with local DB/config in WorkingDirectory)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/home/talkkonnect/gocode/src/github.com/virtualkeyz2
+
+[Install]
+WantedBy=multi-user.target
