@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"bufio"
@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -40,6 +41,10 @@ import (
 
 	"virtualkeyz2/internal/keypadlist"
 	"virtualkeyz2/internal/mcp23017"
+	"virtualkeyz2/internal/config"
+	"virtualkeyz2/internal/outputnames"
+	"virtualkeyz2/internal/remotemqtt"
+	"virtualkeyz2/internal/store"
 	"virtualkeyz2/internal/xl9535"
 )
 
@@ -49,118 +54,63 @@ const (
 	SoftwareReleaseUTC = "2026-04-27T04:36:25Z"
 )
 
-// Keypad / access operation modes (device.keypad_operation_mode in JSON).
-const (
-	ModeAccessEntry               = "access_entry"
-	ModeAccessExit                = "access_exit"
-	ModeAccessEntryWithExitButton = "access_entry_with_exit_button"
-	ModeAccessExitWithEntryButton = "access_exit_with_entry_button"
-	ModeAccessDualUSBKeypad       = "access_dual_usb_keypad"
-	ModeAccessPairedRemoteExit    = "access_paired_remote_exit"
-	// ModeElevatorWaitFloorButtons: cab floor buttons are isolated from ground until allowed; after a valid PIN, enable relays hold for elevator_floor_wait_timeout. Sub-mode device.elevator_wait_floor_cab_sense: sense (default) reads elevator_floor_input_pins, logs floor, pulses matching dispatch; ignore skips cab GPIO entirely (leave elevator_floor_input_pins empty).
-	ModeElevatorWaitFloorButtons = "elevator_wait_floor_buttons"
-	// ModeElevatorPredefinedFloor: in-cab floor buttons are not used; one relay output pulses to complete the call circuit for a single predefined floor (no cab wait). At most one floor in elevator_predefined_floors / one predefined enable pin.
-	ModeElevatorPredefinedFloor = "elevator_predefined_floor"
+// Config types and mode constants (see internal/config).
+type (
+	DeviceConfig         = config.DeviceConfig
+	GPIOSettings         = config.GPIOSettings
+	WebhookEventEndpoint = config.WebhookEventEndpoint
+	LCDDisplaySettings   = config.LCDDisplaySettings
 )
 
-// Relay output backend (gpio.relay_output_mode). Sensor, buttons, and LED pins stay on SoC BCM GPIO.
 const (
-	RelayOutputGPIO     = "gpio"
-	RelayOutputMCP23017 = "mcp23017"
-	RelayOutputXL9535   = "xl9535"
+	ModeAccessEntry                 = config.ModeAccessEntry
+	ModeAccessExit                  = config.ModeAccessExit
+	ModeAccessEntryWithExitButton   = config.ModeAccessEntryWithExitButton
+	ModeAccessExitWithEntryButton   = config.ModeAccessExitWithEntryButton
+	ModeAccessDualUSBKeypad         = config.ModeAccessDualUSBKeypad
+	ModeAccessPairedRemoteExit      = config.ModeAccessPairedRemoteExit
+	ModeElevatorWaitFloorButtons    = config.ModeElevatorWaitFloorButtons
+	ModeElevatorPredefinedFloor     = config.ModeElevatorPredefinedFloor
+	RelayOutputGPIO                 = config.RelayOutputGPIO
+	RelayOutputMCP23017             = config.RelayOutputMCP23017
+	RelayOutputXL9535               = config.RelayOutputXL9535
+	PairPeerRoleNone                = config.PairPeerRoleNone
+	PairPeerRoleEntry               = config.PairPeerRoleEntry
+	PairPeerRoleExit                = config.PairPeerRoleExit
+	ElevatorWaitFloorCabSenseSense  = config.ElevatorWaitFloorCabSenseSense
+	ElevatorWaitFloorCabSenseIgnore = config.ElevatorWaitFloorCabSenseIgnore
 )
 
-// PairPeerRoleEntry / PairPeerExit used with ModeAccessPairedRemoteExit (MQTT to sibling controller).
-const (
-	PairPeerRoleNone  = "none"
-	PairPeerRoleEntry = "entry"
-	PairPeerRoleExit  = "exit"
-)
+func NormalizeKeypadOperationMode(s string) string { return config.NormalizeKeypadOperationMode(s) }
 
-// NormalizeKeypadOperationMode returns a canonical mode string or access_entry if unknown.
-func NormalizeKeypadOperationMode(s string) string {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", ModeAccessEntry:
-		return ModeAccessEntry
-	case ModeAccessExit:
-		return ModeAccessExit
-	case ModeAccessEntryWithExitButton:
-		return ModeAccessEntryWithExitButton
-	case ModeAccessExitWithEntryButton:
-		return ModeAccessExitWithEntryButton
-	case ModeAccessDualUSBKeypad:
-		return ModeAccessDualUSBKeypad
-	case ModeAccessPairedRemoteExit:
-		return ModeAccessPairedRemoteExit
-	case ModeElevatorWaitFloorButtons:
-		return ModeElevatorWaitFloorButtons
-	case ModeElevatorPredefinedFloor:
-		return ModeElevatorPredefinedFloor
-	default:
-		return ModeAccessEntry
-	}
-}
+func normalizePairPeerRole(s string) string { return config.NormalizePairPeerRole(s) }
 
-func normalizePairPeerRole(s string) string {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case PairPeerRoleEntry:
-		return PairPeerRoleEntry
-	case PairPeerRoleExit:
-		return PairPeerRoleExit
-	default:
-		return PairPeerRoleNone
-	}
-}
+func isDualUSBKeypadMode(mode string) bool { return config.IsDualUSBKeypadMode(mode) }
 
-func isDualUSBKeypadMode(mode string) bool {
-	return mode == ModeAccessDualUSBKeypad
-}
+func modeUsesExitGPIOButton(mode string) bool { return config.ModeUsesExitGPIOButton(mode) }
 
-func modeUsesExitGPIOButton(mode string) bool {
-	return mode == ModeAccessEntryWithExitButton
-}
+func modeUsesEntryGPIOButton(mode string) bool { return config.ModeUsesEntryGPIOButton(mode) }
 
-func modeUsesEntryGPIOButton(mode string) bool {
-	return mode == ModeAccessExitWithEntryButton
-}
+func isElevatorWaitFloorMode(mode string) bool { return config.IsElevatorWaitFloorMode(mode) }
 
-func isElevatorWaitFloorMode(mode string) bool {
-	return mode == ModeElevatorWaitFloorButtons
-}
+func isElevatorPredefinedMode(mode string) bool { return config.IsElevatorPredefinedMode(mode) }
 
-func isElevatorPredefinedMode(mode string) bool {
-	return mode == ModeElevatorPredefinedFloor
-}
+func isElevatorKeypadMode(mode string) bool { return config.IsElevatorKeypadMode(mode) }
 
-func isElevatorKeypadMode(mode string) bool {
-	return isElevatorWaitFloorMode(mode) || isElevatorPredefinedMode(mode)
-}
-
-// Elevator wait-floor cab sense sub-modes (device.elevator_wait_floor_cab_sense).
-const (
-	ElevatorWaitFloorCabSenseSense  = "sense"
-	ElevatorWaitFloorCabSenseIgnore = "ignore"
-)
-
-// Cab sense after wait-floor PIN grant: ignore GPIO briefly so enable relays match "ignore" mode (hold
-// until timeout) while hardware energizes; then require a stable active-low window before dispatch.
-const (
-	elevatorCabSenseArmDelay    = 300 * time.Millisecond
-	elevatorCabSenseStableTicks = 3 // 50ms monitor tick → ~150ms same reading
-)
-
-// normalizeElevatorWaitFloorCabSense returns ElevatorWaitFloorCabSenseSense or ElevatorWaitFloorCabSenseIgnore.
 func normalizeElevatorWaitFloorCabSense(s string) string {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case ElevatorWaitFloorCabSenseIgnore, "off", "false", "no":
-		return ElevatorWaitFloorCabSenseIgnore
-	default:
-		return ElevatorWaitFloorCabSenseSense
-	}
+	return config.NormalizeElevatorWaitFloorCabSense(s)
 }
 
 func elevatorWaitFloorSenseCabInputs(cfg DeviceConfig) bool {
-	return normalizeElevatorWaitFloorCabSense(cfg.ElevatorWaitFloorCabSense) == ElevatorWaitFloorCabSenseSense
+	return config.ElevatorWaitFloorSenseCabInputs(cfg)
+}
+
+func pairedEntryPublishesToPeer(mode, pairRole string) bool {
+	return config.PairedEntryPublishesToPeer(mode, pairRole)
+}
+
+func pairedExitSubscribesToPeer(mode, pairRole string) bool {
+	return config.PairedExitSubscribesToPeer(mode, pairRole)
 }
 
 // elevatorWaitFloorEnableChannelCount is the number of independent enable outputs (per-floor list or one legacy relay).
@@ -174,84 +124,11 @@ func elevatorWaitFloorEnableChannelCount(app *AppContext) int {
 	return 0
 }
 
-func pairedEntryPublishesToPeer(mode, pairRole string) bool {
-	return mode == ModeAccessPairedRemoteExit && strings.EqualFold(pairRole, PairPeerRoleEntry)
-}
-
-func pairedExitSubscribesToPeer(mode, pairRole string) bool {
-	return mode == ModeAccessPairedRemoteExit && strings.EqualFold(pairRole, PairPeerRoleExit)
-}
-
-// GPIOSettings holds BCM pin numbers and relay polarity (wiring on the Pi).
-type GPIOSettings struct {
-	// RelayOutputMode: RelayOutputGPIO (BCM), RelayOutputMCP23017, or RelayOutputXL9535 (I2C expanders, relay pins 0–15).
-	RelayOutputMode string
-	// MCP23017I2CBus: Linux I2C adapter index (/dev/i2c-<n>), default 1 on Raspberry Pi (used when relay_output_mode=mcp23017).
-	MCP23017I2CBus int
-	// MCP23017I2CAddr: 7-bit MCP23017 address, default 0x20 (decimal 32).
-	MCP23017I2CAddr uint8
-	// XL9535I2CBus / XL9535I2CAddr: used when relay_output_mode=xl9535 (defaults match MCP23017).
-	XL9535I2CBus  int
-	XL9535I2CAddr uint8
-	// I2CBusRecoverySCLBCM: BCM GPIO wired to the I2C SCL line for stuck-bus recovery (9 clock pulses after closing /dev/i2c-*). 0 = skip bit-bang (adapter close+reopen only).
-	I2CBusRecoverySCLBCM uint8
-
-	DoorRelayPin         uint8
-	DoorRelayActiveLow   bool
-	BuzzerRelayPin       uint8
-	BuzzerRelayActiveLow bool
-	DoorSensorPin        uint8
-	HeartbeatLEDPin      uint8
-	// ExitButtonPin: free-egress input (mode access_entry_with_exit_button). 0 = disabled.
-	ExitButtonPin       uint8
-	ExitButtonActiveLow bool // true = contact pulls to ground when pressed
-	// EntryButtonPin: inside entry request (mode access_exit_with_entry_button). 0 = disabled.
-	EntryButtonPin       uint8
-	EntryButtonActiveLow bool
-	// ElevatorDispatchRelayPin: single shared dispatch relay when not using per-floor pins; 0 = use door relay in elevator modes.
-	ElevatorDispatchRelayPin  uint8
-	ElevatorDispatchActiveLow bool
-	// ElevatorEnableRelayPin: elevator_wait_floor_buttons legacy single relay when elevator_wait_floor_enable_pins is empty—restores ground (or common) for all allowed cab buttons together. 0 = skip.
-	ElevatorEnableRelayPin  uint8
-	ElevatorEnableActiveLow bool
-	// ElevatorFloorDispatchPins: per-floor dispatch outputs (pulse floor call). elevator_wait_floor_buttons + cab sense: one per elevator_floor_input_pins; + cab ignore: one per wait-floor enable channel. elevator_predefined_floor: at most one entry when no cab inputs; empty = use elevator_dispatch_relay_pin / door.
-	ElevatorFloorDispatchPins string
-	// ElevatorWaitFloorEnablePins: elevator_wait_floor_buttons only—comma relay pins that reconnect ground to each cab floor button; with cab sense count must match elevator_floor_input_pins; with cab ignore count is the number of enabled floors (no cab inputs). Empty = use ElevatorEnableRelayPin only.
-	ElevatorWaitFloorEnablePins string
-	// ElevatorPredefinedEnablePins: elevator_predefined_floor only—at most one relay that pulses to simulate the single floor call (buttons removed at panel). Not used in wait-floor mode.
-	ElevatorPredefinedEnablePins string
-	// LightingButtonPin: manual lighting push button (BCM). 0 = disabled.
-	LightingButtonPin       uint8
-	LightingButtonActiveLow bool
-	// LightingRelayPin: lighting controller relay (BCM or expander 0–15 per relay_output_mode). 0 = disabled.
-	LightingRelayPin       uint8
-	LightingRelayActiveLow bool
-	// FiremansServiceInputPin: BCM maintained input for fireman's / emergency bypass (0 = not used; use MQTT or technician menu only).
-	// When firemans_service_active_low is true, emergency is active while the contact reads low (typical pull-up to open, switch to GND when asserted).
-	FiremansServiceInputPin  uint8
-	FiremansServiceActiveLow bool
-
-	// AutomaticDoorOperatorRelayPin: optional relay (BCM or expander 0–15) pulsed alongside authorized door unlock — e.g. automatic door operator / gate opener. 0 = disabled.
-	AutomaticDoorOperatorRelayPin       uint8
-	AutomaticDoorOperatorRelayActiveLow bool
-	// IntercomCameraTriggerRelayPin: optional short pulse on authorized access — e.g. intercom / camera trigger. 0 = disabled.
-	IntercomCameraTriggerRelayPin       uint8
-	IntercomCameraTriggerRelayActiveLow bool
-
-	// FireAlarmInterfacePin: BCM opto input; when active, main door relay is held open for evacuation (independent of fireman's service). 0 = disabled.
-	FireAlarmInterfacePin       uint8
-	FireAlarmInterfaceActiveLow bool
-	// TamperSwitchPin: BCM opto input; enclosure tamper (both edges logged). 0 = disabled.
-	TamperSwitchPin       uint8
-	TamperSwitchActiveLow bool
-	// MotionSensorPin: BCM opto input; presence / PIR (active edge logged). 0 = disabled.
-	MotionSensorPin       uint8
-	MotionSensorActiveLow bool
-}
-
 // AppContext holds our global connections and configurations
 type AppContext struct {
-	DB           *sqlx.DB
+	// RootCtx is cancelled when the process begins shutdown (HTTP drain, etc.).
+	RootCtx context.Context
+	DB      *sqlx.DB
 	MQTTClient   mqtt.Client
 	mqttMu       sync.RWMutex // serializes reconnect vs publish/handler client reads
 	Config       DeviceConfig
@@ -326,18 +203,6 @@ type AppContext struct {
 // logEmitMinSeverity: emit log lines whose severity is >= this (0=DEBUG all, 1=INFO+, 2=WARNING+, 3=ERROR+, 4=CRITICAL only).
 var logEmitMinSeverity atomic.Int32
 
-// WebhookEventEndpoint is one HTTP destination for JSON event webhooks. Use webhook_event_endpoints in JSON; when the
-// slice is non-empty it replaces the legacy single webhook_event_url for event delivery (legacy URL is ignored until the list is cleared).
-// Each endpoint can be turned off with enabled:false. EventTypes is an optional allowlist: nil or empty = all events;
-// if non-empty, only event names with value true are POSTed to this endpoint.
-type WebhookEventEndpoint struct {
-	Enabled      bool            `json:"enabled"`
-	URL          string          `json:"url"`
-	TokenEnabled bool            `json:"token_enabled"`
-	Token        string          `json:"token"`
-	EventTypes   map[string]bool `json:"event_types,omitempty"`
-}
-
 func cloneStringBoolMap(m map[string]bool) map[string]bool {
 	if m == nil {
 		return nil
@@ -366,183 +231,6 @@ func webhookEventTypesAllowlistPass(m map[string]bool, event string) bool {
 		return true
 	}
 	return m[event]
-}
-
-// DeviceConfig represents configurable parameters (loaded from SQLite/Central Server)
-type DeviceConfig struct {
-	HeartbeatInterval time.Duration
-	// DoorOpenWarningAfter: base time the door may stay open before the first door_open_timeout webhook; access_pins.door_hold_extra_seconds adds to this for the last successful unlock.
-	DoorOpenWarningAfter time.Duration
-	// DoorOpenAlarmInterval: spacing between repeat door_open_timeout webhooks after the first (default 30s when unset/zero).
-	DoorOpenAlarmInterval time.Duration
-	// DoorOpenAlarmMaxCount: max door_open_timeout webhooks per continuous open period; 0 = unlimited.
-	DoorOpenAlarmMaxCount int
-	// DoorForcedAfterWarnings: after this many door_open_timeout events in one open period, emit door_forced once and stop further door alarms until the door has closed and opened again; 0 = never.
-	DoorForcedAfterWarnings int
-	// DoorSensorClosedIsLow: when true, a low GPIO level means the door is closed (e.g. switch to GND when closed, often with pull-up).
-	// When false, a high level means closed (open when the pin reads low).
-	DoorSensorClosedIsLow bool
-	SoundCardName         string // ALSA device passed to aplay -D (e.g. plughw:1,0); empty = default card
-	// WAV paths played via aplay; missing files are skipped with a debug log.
-	SoundStartup       string
-	SoundShutdown      string
-	SoundPinOK         string
-	SoundAccessGranted string // entry/exit GPIO button unlock (grantDefaultModeDoorUnlockLikePIN); PIN OK still uses SoundPinOK
-	SoundPinReject     string
-	SoundKeypress      string
-	// SoundLightingTimerSet: optional WAV when lighting auto-off timer is armed or reset (relay ON). Empty skips.
-	SoundLightingTimerSet string
-	// SoundLightingTimerExpired: optional WAV when that timer fires and relay turns OFF. Empty skips.
-	SoundLightingTimerExpired string
-	// SoundDoorOpen: WAV for first door_open_timeout and each repeat while door stays open. Empty skips.
-	SoundDoorOpen string
-
-	// Sound*Enabled: when false, the matching WAV is never played (path ignored). Defaults true when unset in JSON.
-	SoundStartupEnabled              bool
-	SoundShutdownEnabled             bool
-	SoundPinOKEnabled                bool
-	SoundAccessGrantedEnabled        bool
-	SoundPinRejectEnabled            bool
-	SoundKeypressEnabled             bool
-	SoundLightingTimerSetEnabled     bool
-	SoundLightingTimerExpiredEnabled bool
-	SoundDoorOpenEnabled             bool
-
-	LogLevel string
-	// PinLength is how many digit keys must be entered before the PIN is submitted automatically.
-	// If zero, the user must press Enter (or KPENTER) to submit.
-	PinLength int
-	// RelayPulseDuration is how long the door relay stays energized after a valid PIN.
-	RelayPulseDuration time.Duration
-	// AutomaticDoorOperatorPulseDuration: pulse length for gpio.automatic_door_operator_relay_pin on authorized access; zero uses RelayPulseDuration.
-	AutomaticDoorOperatorPulseDuration time.Duration
-	// IntercomCameraTriggerPulseDuration: pulse length for gpio.intercom_camera_trigger_relay_pin on authorized access; zero defaults to 800ms after normalizeKeypadAndPinUX.
-	IntercomCameraTriggerPulseDuration time.Duration
-	// PinRejectBuzzerAfterAttempts: after this many consecutive wrong PINs, pulse the buzzer relay (GPIO in GPIOSettings). Zero disables the buzzer.
-	PinRejectBuzzerAfterAttempts int
-	// BuzzerRelayPulseDuration is how long the buzzer relay stays on when the wrong-PIN threshold is reached.
-	BuzzerRelayPulseDuration time.Duration
-
-	// MQTT remote control (subscribe on MQTTCommandTopic). Set MQTTEnabled false or leave MQTTBroker empty to skip MQTT.
-	MQTTEnabled      bool
-	MQTTBroker       string
-	MQTTClientID     string
-	MQTTUsername     string
-	MQTTPassword     string
-	MQTTCommandTopic string
-	MQTTStatusTopic  string // publish JSON acks/status; empty to skip publish
-	MQTTCommandToken string // optional shared secret; JSON field "token" must match when set
-	// TechMenuHistoryMax caps remembered /dev/tty menu lines for Up/Down recall. Zero defaults to 100; max 10000.
-	TechMenuHistoryMax int
-
-	// KeypadInterDigitTimeout: max pause between keystrokes before PIN buffer clears (clamped 3s–10s, default 5s).
-	KeypadInterDigitTimeout time.Duration
-	// KeypadSessionTimeout: max time from first digit until submit/clear (clamped 10s–60s, default 30s).
-	KeypadSessionTimeout time.Duration
-	// PinEntryFeedbackDelay: wait after PIN OK/reject sound before accepting new keys (clamped 2s–10s, default 3s).
-	PinEntryFeedbackDelay time.Duration
-	// PinLockoutEnabled: when false, keypad lockout is never armed and any active lockout is cleared.
-	PinLockoutEnabled bool
-	// PinLockoutAfterAttempts: consecutive wrong PINs before keypad lockout (0=off, else clamped 3–5, default 5).
-	PinLockoutAfterAttempts int
-	// PinLockoutDuration: keypad ignores input for this long after lockout triggers (clamped 30s–300s, default 60s).
-	PinLockoutDuration time.Duration
-	// PinLockoutOverridePin: if non-empty, submitting this PIN clears keypad lockout and wrong-PIN streak without opening the door.
-	PinLockoutOverridePin string
-	// FallbackAccessPin: if non-empty, accepted when no matching enabled row exists in access_pins (legacy fallback).
-	FallbackAccessPin string
-
-	// WebhookEvent*: POST JSON on door/PIN/MQTT events when WebhookEventEnabled.
-	// WebhookEventTypes: optional global allowlist — nil or empty = all event names; if non-empty, event E is sent only when WebhookEventTypes[E] is true.
-	// WebhookEventEndpoints: optional list; when non-empty, each enabled entry receives POSTs (replacing WebhookEventURL for events). Each entry has its own URL, token, enabled flag, and optional EventTypes allowlist.
-	// Legacy: when WebhookEventEndpoints is empty, WebhookEventURL + WebhookEventToken* are used.
-	WebhookEventEnabled      bool
-	WebhookEventURL          string
-	WebhookEventTokenEnabled bool
-	WebhookEventToken        string
-	WebhookEventTypes        map[string]bool
-	WebhookEventEndpoints    []WebhookEventEndpoint
-	// WebhookHeartbeat*: POST JSON on each heartbeat tick (same interval as heartbeat_interval) when enabled and URL set.
-	WebhookHeartbeatEnabled      bool
-	WebhookHeartbeatURL          string
-	WebhookHeartbeatTokenEnabled bool
-	WebhookHeartbeatToken        string
-	// WebhookHTTPTimeout: per-request timeout for outbound webhook POSTs; zero defaults to 25s after normalizeWebhookOutboundHTTP.
-	WebhookHTTPTimeout time.Duration
-	// WebhookMaxConcurrent: max in-flight outbound webhook HTTP requests (all destinations); zero defaults to 16 after normalize.
-	WebhookMaxConcurrent int
-	// WebhookCircuitBreakerEnabled: when true, consecutive failures (network/timeout or HTTP 5xx) open the breaker for WebhookCircuitOpenDuration.
-	WebhookCircuitBreakerEnabled bool
-	// WebhookCircuitFailureThreshold: consecutive failures before open; zero defaults to 5 when the breaker is enabled.
-	WebhookCircuitFailureThreshold int
-	// WebhookCircuitOpenDuration: how long outbound webhooks are rejected after the breaker opens; zero defaults to 60s.
-	WebhookCircuitOpenDuration time.Duration
-
-	// KeypadOperationMode: ModeAccess* / ModeElevator* (see ModeElevatorWaitFloorButtons / ModeElevatorPredefinedFloor comments).
-	KeypadOperationMode string
-	// KeypadEvdevPath: Linux evdev device for primary USB keypad (default /dev/input/event1).
-	KeypadEvdevPath string
-	// KeypadExitEvdevPath: second keypad for access_dual_usb_keypad (must differ from KeypadEvdevPath).
-	KeypadExitEvdevPath string
-	// ScannerDevicePath: dedicated USB HID QR scanner evdev node (opened with EVIOCGRAB via evdev.Grab()).
-	ScannerDevicePath string
-	// MaxDevicesPerUser: maximum device UUIDs that can be associated with one access PIN.
-	MaxDevicesPerUser int
-	// QRTimeWindowSeconds: acceptable absolute drift between system time and QR datetime_stamp.
-	QRTimeWindowSeconds int
-	// StaticTestQRCode: payload that must match the scanned string when StaticTestQRCodeEnabled is true.
-	StaticTestQRCode string
-	// StaticTestQRCodeEnabled: when true, QR auth only accepts scans equal to StaticTestQRCode (trimmed);
-	// matching scans grant access with no DB, schedule, or keypad-lockout checks. Any other QR is denied.
-	// When false, StaticTestQRCode is ignored and normal mobile-UUID QR rules apply.
-	StaticTestQRCodeEnabled bool
-	// PairPeerRole: none | entry | exit — used with access_paired_remote_exit and MQTTPairPeerTopic.
-	PairPeerRole string
-	// MQTTPairPeerTopic: entry unit publishes unlock hint; exit unit subscribes and pulses door.
-	MQTTPairPeerTopic string
-	PairPeerToken     string
-	// ElevatorFloorWaitTimeout: elevator_wait_floor_buttons — after valid PIN, how long enable relays stay on; with cab sense, also the window to read elevator_floor_input_pins.
-	ElevatorFloorWaitTimeout time.Duration
-	// ElevatorWaitFloorCabSense: elevator_wait_floor_buttons — sense (default): configure and read elevator_floor_input_pins, log selection, pulse dispatch. ignore: leave elevator_floor_input_pins empty; no cab GPIO; timeout only clears enables.
-	ElevatorWaitFloorCabSense string
-	// ElevatorFloorInputPins: BCM inputs wired to in-cab floor buttons (active low when pressed); used when elevator_wait_floor_cab_sense is sense (default).
-	ElevatorFloorInputPins string
-	// ElevatorPredefinedFloor: in elevator_predefined_floor, index into ElevatorPredefinedFloors when that list has one entry (usually 0); else legacy logical floor label for logs only.
-	ElevatorPredefinedFloor int
-	// ElevatorPredefinedFloors: at most one logical floor label for elevator_predefined_floor; must match gpio.elevator_predefined_enable_pins when that list is set. Empty = legacy single-floor (dispatch index from ElevatorPredefinedFloor only).
-	ElevatorPredefinedFloors []int
-	// ElevatorDispatchPulseDuration: default pulse for elevator dispatch (single relay or per-floor pad).
-	ElevatorDispatchPulseDuration time.Duration
-	// ElevatorFloorDispatchPulseDurations: per-index pulse lengths when gpio.elevator_floor_dispatch_pins is set (order matches cab inputs in wait-floor mode, or predefined floors when no cab inputs); shorter lists pad with ElevatorDispatchPulseDuration.
-	ElevatorFloorDispatchPulseDurations []time.Duration
-	// ElevatorEnablePulseDuration: elevator_predefined_floor: pulse length for elevator_predefined_enable_0 when >0 (ignored for elevator_wait_floor_buttons; wait enables stay on until floor selected or elevator_floor_wait_timeout).
-	ElevatorEnablePulseDuration time.Duration
-	// DualKeypadRejectExitWithoutEntry: in access_dual_usb_keypad, valid PIN on exit with no matching entry count rejects (no door pulse); default false warns only.
-	DualKeypadRejectExitWithoutEntry bool
-
-	// AccessControlDoorID: logical door (access_doors.id). When set with access_schedule_enforce, PIN must match an enabled access level and time window for this door (direct or via door group).
-	AccessControlDoorID string
-	// AccessControlElevatorID: logical elevator (access_elevators.id). When set with access_schedule_enforce and keypad is in an elevator mode, PIN must match an enabled access level and time window for this elevator (direct or via elevator group).
-	AccessControlElevatorID string
-	// AccessScheduleEnforce: when true (default), apply SQLite access_levels/access_time_windows when the configured door or elevator has targets.
-	AccessScheduleEnforce bool
-	// AccessScheduleApplyToFallbackPin: when true, device.fallback_access_pin is subject to schedules; default false (emergency bypass).
-	AccessScheduleApplyToFallbackPin bool
-	// AccessExceptionSiteTimezone: IANA timezone for interpreting exception-calendar civil dates (holidays / early closures). Empty uses the system local timezone.
-	AccessExceptionSiteTimezone string
-	// LightingTimeout: lighting relay hold after manual button or accepted PIN; each new press or PIN restarts the full timer without toggling the relay off until expiry. Clamped in normalizeKeypadAndPinUX.
-	LightingTimeout time.Duration
-
-	// LCDDisplay: optional I2C HD44780 20×4 UI (device.lcd_display); updates run in displayController only.
-	LCDDisplay LCDDisplaySettings
-
-	// FiremansServiceEnabled: when true, fireman's service (emergency bypass) may be triggered by GPIO, MQTT, or technician menu.
-	FiremansServiceEnabled bool
-	// SoundFiremansActivated / SoundFiremansDeactivated: optional WAV announcements when emergency bypass is turned on or off.
-	SoundFiremansActivated          string
-	SoundFiremansDeactivated        string
-	SoundFiremansActivatedEnabled   bool
-	SoundFiremansDeactivatedEnabled bool
 }
 
 // virtualkeyz2LCDDisplayJSON is the device.lcd_display object in virtualkeyz2.json.
@@ -812,18 +500,6 @@ func parseCommaDurationList(section, field, s string) ([]time.Duration, error) {
 		out = append(out, d)
 	}
 	return out, nil
-}
-
-func elevatorFloorDispatchOutputName(i int) string {
-	return fmt.Sprintf("elevator_floor_dispatch_%d", i)
-}
-
-func elevatorPredefinedEnableOutputName(i int) string {
-	return fmt.Sprintf("elevator_predefined_enable_%d", i)
-}
-
-func elevatorWaitFloorEnableOutputName(i int) string {
-	return fmt.Sprintf("elevator_wait_floor_enable_%d", i)
 }
 
 func parseCommaIntList(section, field, s string) ([]int, error) {
@@ -3080,12 +2756,16 @@ func (ctx *AppContext) ResetWrongPINCount() {
 	ctx.pinFailSeq = 0
 }
 
-func main() {
+// Main is the application entrypoint (called from cmd/virtualkeyz2).
+func Main() int {
 	// 1. Run Mode Configuration (Foreground vs Daemon) [cite: 8]
 	daemonMode := flag.Bool("daemon", false, "Run system as a background daemon")
 	noTechMenu := flag.Bool("notechmenu", false, "Disable interactive technician debug menu on /dev/tty")
 	configPath := flag.String("config", "virtualkeyz2.json", "Path to JSON configuration file (optional; defaults used if missing)")
 	flag.Parse()
+
+	rootCtx, rootStop := context.WithCancel(context.Background())
+	defer rootStop()
 
 	if *daemonMode {
 		fmt.Println("Starting in Daemon Mode...")
@@ -3094,6 +2774,7 @@ func main() {
 
 	// 2. Initialize Logging Levels (Info, Debug, Warning, Critical) [cite: 9]
 	initLogger()
+	slog.Info("VirtualKeyz2 starting", "version", SoftwareVersion, "release", SoftwareReleaseUTC)
 	log.Printf("INFO: VirtualKeyz2 software build %s (release %s).", SoftwareVersion, SoftwareReleaseUTC)
 
 	// 3. Initialize Local SQLite Database
@@ -3101,7 +2782,8 @@ func main() {
 	defer db.Close()
 
 	appCtx := &AppContext{
-		DB: db,
+		RootCtx: rootCtx,
+		DB:      db,
 		Config: DeviceConfig{
 			HeartbeatInterval:                60 * time.Second,
 			DoorOpenWarningAfter:             10 * time.Second,
@@ -3249,19 +2931,19 @@ func main() {
 			}
 			if len(appCtx.elevatorFloorDispatchPins) > 0 {
 				for i, pin := range appCtx.elevatorFloorDispatchPins {
-					gpio.AddOutput(elevatorFloorDispatchOutputName(i), pin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useI2CExpander)
+					gpio.AddOutput(outputnames.ElevatorFloorDispatch(i), pin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useI2CExpander)
 				}
 			} else if appCtx.GPIOSettings.ElevatorDispatchRelayPin != 0 {
 				gpio.AddOutput("elevator_dispatch", appCtx.GPIOSettings.ElevatorDispatchRelayPin, appCtx.GPIOSettings.ElevatorDispatchActiveLow, useI2CExpander)
 			}
 			if len(appCtx.elevatorPredefinedEnablePins) > 0 {
 				for i, pin := range appCtx.elevatorPredefinedEnablePins {
-					gpio.AddOutput(elevatorPredefinedEnableOutputName(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
+					gpio.AddOutput(outputnames.ElevatorPredefinedEnable(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
 				}
 			}
 			if len(appCtx.elevatorWaitFloorEnablePins) > 0 {
 				for i, pin := range appCtx.elevatorWaitFloorEnablePins {
-					gpio.AddOutput(elevatorWaitFloorEnableOutputName(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
+					gpio.AddOutput(outputnames.ElevatorWaitFloorEnable(i), pin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
 				}
 			} else if appCtx.GPIOSettings.ElevatorEnableRelayPin != 0 {
 				gpio.AddOutput("elevator_enable", appCtx.GPIOSettings.ElevatorEnableRelayPin, appCtx.GPIOSettings.ElevatorEnableActiveLow, useI2CExpander)
@@ -3328,6 +3010,7 @@ func main() {
 	case <-quit:
 	case <-shutdownFromMenu:
 	}
+	rootStop()
 	log.Println("INFO: Shutdown signal received.")
 	appCtx.configMu.RLock()
 	shutdownCfg := appCtx.Config
@@ -3338,6 +3021,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("WARNING: HTTP server shutdown: %v", err)
 	}
+	return 0
 }
 
 // --- Subsystem Implementations (Stubs) ---
@@ -4492,75 +4176,13 @@ func (ctx *AppContext) elevatorPredefinedDispatchIndexForACL(cfg DeviceConfig) i
 }
 
 func initDatabase() *sqlx.DB {
-	// Initialize SQLite for storing logs, configs, and access control lists [cite: 6, 7]
-	db, err := sqlx.Open("sqlite3", "file:./access_control.db?_fk=1&_busy_timeout=5000&_journal_mode=WAL")
+	db, err := store.OpenAccessDB(store.DefaultDSN)
 	if err != nil {
 		releaseStartupLogBuffer(os.Stdout)
 		log.Fatalf("CRITICAL: Failed to open database: %v", err)
 	}
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
-		log.Printf("WARNING: SQLite PRAGMA journal_mode=WAL: %v", err)
-	} else {
-		log.Println("INFO: SQLite journal_mode=WAL (readers no longer block writers; reduces SQLITE_BUSY vs rollback journal).")
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS access_pins (
-		pin TEXT PRIMARY KEY NOT NULL,
-		label TEXT,
-		enabled INTEGER NOT NULL DEFAULT 1,
-		temporary INTEGER NOT NULL DEFAULT 0,
-		expires_at TEXT,
-		max_uses INTEGER,
-		use_count INTEGER NOT NULL DEFAULT 0
-	)`); err != nil {
-		log.Printf("WARNING: access_pins table: %v", err)
-	} else {
-		log.Println("INFO: SQLite access_pins table ready (PINs optional; device.fallback_access_pin used when set and no row matches).")
-	}
-	if err := migrateAccessPinsLifecycle(db); err != nil {
-		log.Printf("WARNING: access_pins lifecycle migration: %v", err)
-	}
 	if err := initAccessScheduleSchema(db); err != nil {
 		log.Printf("WARNING: access schedule schema: %v", err)
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS logs (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		created_at TEXT NOT NULL,
-		event_type TEXT NOT NULL DEFAULT 'event',
-		event_name TEXT NOT NULL,
-		device_client_id TEXT,
-		detail_json TEXT NOT NULL DEFAULT '{}'
-	)`); err != nil {
-		log.Printf("WARNING: logs table: %v", err)
-	} else {
-		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at)`); err != nil {
-			log.Printf("WARNING: logs index idx_logs_created_at: %v", err)
-		}
-		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_event_name ON logs(event_name)`); err != nil {
-			log.Printf("WARNING: logs index idx_logs_event_name: %v", err)
-		}
-		log.Println("INFO: SQLite logs table ready (audit trail for event activities).")
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dual_keypad_zone_occupancy (
-		pin TEXT PRIMARY KEY NOT NULL,
-		inside_count INTEGER NOT NULL CHECK (inside_count > 0)
-	)`); err != nil {
-		log.Printf("WARNING: dual_keypad_zone_occupancy table: %v", err)
-	} else {
-		log.Println("INFO: SQLite dual_keypad_zone_occupancy ready (dual USB keypad zone counts; survives restart).")
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS access_pin_mobile_devices (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		pin TEXT NOT NULL REFERENCES access_pins(pin) ON DELETE CASCADE,
-		device_uuid TEXT NOT NULL UNIQUE,
-		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-		updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-	)`); err != nil {
-		log.Printf("WARNING: access_pin_mobile_devices table: %v", err)
-	} else {
-		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_access_pin_mobile_devices_pin ON access_pin_mobile_devices(pin)`); err != nil {
-			log.Printf("WARNING: access_pin_mobile_devices index: %v", err)
-		}
-		log.Println("INFO: SQLite access_pin_mobile_devices ready (1:N PIN->mobile UUID mappings).")
 	}
 	return db
 }
@@ -4677,47 +4299,6 @@ func (ctx *AppContext) resolvePINForMobileUUID(deviceUUID string) (pin string, e
 		return "", fmt.Errorf("credential_lifecycle:%s", cred.LifecycleReason)
 	}
 	return pin, nil
-}
-
-// migrateAccessPinsLifecycle adds visitor/contractor lifecycle columns to access_pins on older databases.
-func migrateAccessPinsLifecycle(db *sqlx.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(access_pins)`)
-	if err != nil {
-		return err
-	}
-	have := make(map[string]struct{})
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notnull, pk int
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
-			return err
-		}
-		have[name] = struct{}{}
-	}
-	rows.Close()
-	alters := []struct {
-		name string
-		ddl  string
-	}{
-		{"temporary", `ALTER TABLE access_pins ADD COLUMN temporary INTEGER NOT NULL DEFAULT 0`},
-		{"expires_at", `ALTER TABLE access_pins ADD COLUMN expires_at TEXT`},
-		{"max_uses", `ALTER TABLE access_pins ADD COLUMN max_uses INTEGER`},
-		{"use_count", `ALTER TABLE access_pins ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0`},
-		{"door_hold_extra_seconds", `ALTER TABLE access_pins ADD COLUMN door_hold_extra_seconds INTEGER`},
-	}
-	for _, a := range alters {
-		if _, ok := have[a.name]; ok {
-			continue
-		}
-		if _, err := db.Exec(a.ddl); err != nil {
-			return fmt.Errorf("%s: %w", a.name, err)
-		}
-		log.Printf("INFO: access_pins migrated: added column %s", a.name)
-	}
-	return nil
 }
 
 // accessPinLookupResult is the outcome of validating a PIN against access_pins and optional fallback.
@@ -5099,22 +4680,6 @@ func initMQTT(ctx *AppContext) mqtt.Client {
 	return client
 }
 
-// mqttRemoteCmd is the expected JSON body on MQTTCommandTopic.
-type mqttRemoteCmd struct {
-	Cmd   string `json:"cmd"`
-	Token string `json:"token,omitempty"`
-}
-
-// mqttRemoteAck is published to MQTTStatusTopic when that topic is configured.
-type mqttRemoteAck struct {
-	OK     bool   `json:"ok"`
-	Cmd    string `json:"cmd"`
-	Error  string `json:"error,omitempty"`
-	Detail string `json:"detail,omitempty"`
-	// DoorOpen is set for cmd door_status when GPIO is available.
-	DoorOpen *bool `json:"door_open,omitempty"`
-}
-
 var mqttRemoteMu sync.Mutex
 
 func mqttRemoteMessageHandler(ctx *AppContext) mqtt.MessageHandler {
@@ -5136,7 +4701,7 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 	}
 
 	p := bytes.TrimSpace(payload)
-	var req mqttRemoteCmd
+	var req remotemqtt.RemoteCommand
 	jsonOK := json.Unmarshal(p, &req) == nil && strings.TrimSpace(req.Cmd) != ""
 	cmd := ""
 	if jsonOK {
@@ -5153,14 +4718,14 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 
 	if token != "" {
 		if !jsonOK || req.Token != token {
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "invalid or missing token (JSON + token required)"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "invalid or missing token (JSON + token required)"})
 			log.Println("WARNING: MQTT remote command rejected (bad token or non-JSON payload).")
 			return
 		}
 	}
 
 	if cmdLower == "" {
-		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Error: "empty_command"})
+		mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Error: "empty_command"})
 		return
 	}
 
@@ -5169,13 +4734,13 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 		log.Printf("INFO: MQTT remote: open door (topic=%s)", topic)
 		if ctx.FiremansServiceActive() {
 			log.Printf("DEBUG: Fireman's service: MQTT door open ignored (all access relays held off).")
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_active", Detail: "door relay not pulsed during emergency bypass"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_active", Detail: "door relay not pulsed during emergency bypass"})
 			fireEventWebhook(ctx, "mqtt_remote_door_open_denied", map[string]any{"mqtt_topic": topic, "reason": "firemans_service_active"})
 			return
 		}
 		if ctx.GPIO != nil {
 			if err := ctx.GPIO.ActionPulseBlocking("door", cfg.RelayPulseDuration); err != nil {
-				mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "hardware_actuation_failed", Detail: err.Error()})
+				mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "hardware_actuation_failed", Detail: err.Error()})
 				fireEventWebhook(ctx, "hardware_actuation_failed", map[string]any{"mqtt_topic": topic, "source": "mqtt_remote_door_open", "error": err.Error()})
 				playSoundAsyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 				log.Printf("ERROR: MQTT open_door: door relay actuation failed: %v", err)
@@ -5183,66 +4748,66 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 			}
 			ctx.pulseAuthorizedAccessAuxRelays(cfg)
 			playSoundAsyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "door relay pulsed"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: true, Cmd: cmdLower, Detail: "door relay pulsed"})
 			fireEventWebhook(ctx, "mqtt_remote_door_open", map[string]any{"mqtt_topic": topic})
 		} else {
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "gpio_unavailable"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "gpio_unavailable"})
 			log.Println("WARNING: MQTT open_door: GPIO unavailable.")
 		}
 
 	case "firemans_service_on", "firemans_on", "emergency_bypass_on":
 		if !cfg.FiremansServiceEnabled {
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_disabled_in_config"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_disabled_in_config"})
 			return
 		}
 		log.Printf("INFO: MQTT remote: fireman's service ON (topic=%s)", topic)
 		ctx.applyFiremansServiceTransition(true, "mqtt:"+cmdLower)
-		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "firemans_service_activated"})
+		mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: true, Cmd: cmdLower, Detail: "firemans_service_activated"})
 	case "firemans_service_off", "firemans_off", "emergency_bypass_off":
 		if !cfg.FiremansServiceEnabled {
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_disabled_in_config"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_disabled_in_config"})
 			return
 		}
 		log.Printf("INFO: MQTT remote: fireman's service OFF (topic=%s)", topic)
 		ctx.applyFiremansServiceTransition(false, "mqtt:"+cmdLower)
-		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "firemans_service_deactivated"})
+		mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: true, Cmd: cmdLower, Detail: "firemans_service_deactivated"})
 	case "firemans_service_status", "firemans_status":
 		active := ctx.FiremansServiceActive()
-		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: fmt.Sprintf("firemans_service_active=%v", active)})
+		mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: true, Cmd: cmdLower, Detail: fmt.Sprintf("firemans_service_active=%v", active)})
 
 	case "buzzer", "buzz", "alarm":
 		log.Printf("INFO: MQTT remote: buzzer (topic=%s)", topic)
 		if ctx.FiremansServiceActive() {
 			log.Printf("DEBUG: Fireman's service: MQTT buzzer ignored (buzzer relay held off).")
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_active"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "firemans_service_active"})
 			return
 		}
 		if ctx.GPIO != nil {
 			ctx.GPIO.ActionPulse("buzzer", cfg.BuzzerRelayPulseDuration)
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "buzzer relay pulsed"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: true, Cmd: cmdLower, Detail: "buzzer relay pulsed"})
 			fireEventWebhook(ctx, "mqtt_remote_buzzer", map[string]any{"mqtt_topic": topic})
 		} else {
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "gpio_unavailable"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "gpio_unavailable"})
 		}
 
 	case "door_status", "status_door":
 		if ctx.GPIO == nil || !ctx.GPIO.DoorSensorConfigured() {
-			mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "door_sensor_unavailable"})
+			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "door_sensor_unavailable"})
 			return
 		}
 		open := ctx.GPIO.DoorIsOpen(cfg.DoorSensorClosedIsLow)
-		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, DoorOpen: &open})
+		mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: true, Cmd: cmdLower, DoorOpen: &open})
 
 	case "ping", "hello":
-		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: true, Cmd: cmdLower, Detail: "pong"})
+		mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: true, Cmd: cmdLower, Detail: "pong"})
 
 	default:
-		mqttPublishRemoteAck(ctx, mqttRemoteAck{OK: false, Cmd: cmdLower, Error: "unknown_command"})
+		mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "unknown_command"})
 		log.Printf("WARNING: MQTT remote unknown cmd %q", cmd)
 	}
 }
 
-func mqttPublishRemoteAck(ctx *AppContext, ack mqttRemoteAck) {
+func mqttPublishRemoteAck(ctx *AppContext, ack remotemqtt.RemoteAck) {
 	ctx.mqttMu.RLock()
 	client := ctx.MQTTClient
 	ctx.mqttMu.RUnlock()
@@ -9588,7 +9153,7 @@ func clearElevatorGrantState(ctx *AppContext) {
 		return
 	}
 	for i := range ctx.elevatorWaitFloorEnablePins {
-		name := elevatorWaitFloorEnableOutputName(i)
+		name := outputnames.ElevatorWaitFloorEnable(i)
 		if ctx.GPIO.HasOutput(name) {
 			ctx.GPIO.ActionOff(name)
 		}
@@ -9937,7 +9502,7 @@ func startElevatorFloorWaitGrant(ctx *AppContext, cfg DeviceConfig) {
 			if !ctx.elevatorFloorChannelAllowed(pin, elevID, i, via, now) {
 				continue
 			}
-			name := elevatorWaitFloorEnableOutputName(i)
+			name := outputnames.ElevatorWaitFloorEnable(i)
 			if ctx.GPIO.HasOutput(name) {
 				ctx.GPIO.ActionOn(name)
 			}
@@ -9970,7 +9535,7 @@ func pulseElevatorFloorSelections(ctx *AppContext, cfg DeviceConfig, floorIndice
 	}
 	perFloor := false
 	for _, idx := range floorIndices {
-		if ctx.GPIO.HasOutput(elevatorFloorDispatchOutputName(idx)) {
+		if ctx.GPIO.HasOutput(outputnames.ElevatorFloorDispatch(idx)) {
 			perFloor = true
 			break
 		}
@@ -9979,7 +9544,7 @@ func pulseElevatorFloorSelections(ctx *AppContext, cfg DeviceConfig, floorIndice
 		return pulseElevatorOrDoorOutput(ctx, cfg)
 	}
 	for _, idx := range floorIndices {
-		name := elevatorFloorDispatchOutputName(idx)
+		name := outputnames.ElevatorFloorDispatch(idx)
 		if ctx.GPIO.HasOutput(name) {
 			ctx.GPIO.ActionPulse(name, dispatchPulseDurationForFloor(cfg, idx))
 		}
@@ -10005,7 +9570,7 @@ func pulseElevatorPredefinedDispatchAtIndex(ctx *AppContext, cfg DeviceConfig, i
 	if idx >= n {
 		idx = n - 1
 	}
-	name := elevatorFloorDispatchOutputName(idx)
+	name := outputnames.ElevatorFloorDispatch(idx)
 	if ctx.GPIO.HasOutput(name) {
 		ctx.GPIO.ActionPulse(name, dispatchPulseDurationForFloor(cfg, idx))
 		return name, int(ctx.elevatorFloorDispatchPins[idx]), true
@@ -10076,7 +9641,7 @@ func activateElevatorPredefinedFloor(ctx *AppContext, cfg DeviceConfig, kTag, cr
 	}
 	logical := cfg.ElevatorPredefinedFloors[idx]
 	enOut, enPin := "", 0
-	enName := elevatorPredefinedEnableOutputName(idx)
+	enName := outputnames.ElevatorPredefinedEnable(idx)
 	if ctx.GPIO.HasOutput(enName) {
 		enOut = enName
 		if idx < len(ctx.elevatorPredefinedEnablePins) {
@@ -10156,7 +9721,7 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 			ctx.elevatorMu.Unlock()
 			continue
 		}
-		if ctx.elevatorGrantStartedAt.IsZero() || time.Since(ctx.elevatorGrantStartedAt) < elevatorCabSenseArmDelay {
+		if ctx.elevatorGrantStartedAt.IsZero() || time.Since(ctx.elevatorGrantStartedAt) < config.ElevatorCabSenseArmDelay {
 			ctx.elevatorMu.Unlock()
 			continue
 		}
@@ -10186,7 +9751,7 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 		floorDenied := false
 		var deniedIndices []int
 		var denyElevLifecycle string
-		if ctx.elevatorCabFloorDebounceTick >= elevatorCabSenseStableTicks {
+		if ctx.elevatorCabFloorDebounceTick >= config.ElevatorCabSenseStableTicks {
 			held := slices.Clone(ctx.elevatorCabFloorDebounceHeld)
 			pin := strings.TrimSpace(ctx.elevatorGrantPIN)
 			via := ctx.elevatorGrantViaFallback
@@ -10258,11 +9823,6 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 	}
 }
 
-type mqttPairPeerMsg struct {
-	Cmd   string `json:"cmd"`
-	Token string `json:"token,omitempty"`
-}
-
 var mqttPairPeerMu sync.Mutex
 
 func mqttPairPeerMessageHandler(ctx *AppContext) mqtt.MessageHandler {
@@ -10283,7 +9843,7 @@ func handleMQTTPairPeerPayload(ctx *AppContext, payload []byte) {
 	if !pairedExitSubscribesToPeer(mode, role) {
 		return
 	}
-	var msg mqttPairPeerMsg
+	var msg remotemqtt.PairPeerMessage
 	if json.Unmarshal(bytes.TrimSpace(payload), &msg) != nil || strings.TrimSpace(msg.Cmd) == "" {
 		log.Println("WARNING: pair-peer MQTT: invalid JSON payload")
 		return
@@ -10316,7 +9876,7 @@ func publishMQTTPairPeerPulse(ctx *AppContext, cfg DeviceConfig) {
 	if topic == "" {
 		return
 	}
-	body, err := json.Marshal(mqttPairPeerMsg{Cmd: "pulse_paired_exit", Token: cfg.PairPeerToken})
+	body, err := json.Marshal(remotemqtt.PairPeerMessage{Cmd: "pulse_paired_exit", Token: cfg.PairPeerToken})
 	if err != nil {
 		return
 	}

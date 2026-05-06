@@ -24,14 +24,14 @@ This document is for installers and operators who configure and run the service 
 
 **Database:** the service opens SQLite **`access_control.db`** in the **current working directory** (PINs, schedules, exception calendars, elevator floor rules, dual-keypad zone occupancy when used, and the **`logs`** audit table). Ensure the service user can read/write this file.
 
-**Building:** build the **package directory**, not a single source file:
+**Building:** build the **`cmd/virtualkeyz2`** main package:
 
 ```bash
 cd /path/to/virtualkeyz2
-go build -o virtualkeyz2 .
+go build -o virtualkeyz2 ./cmd/virtualkeyz2
 ```
 
-Using only `go build virtualkeyz2.go` omits other **`.go`** files in the package and will fail or miss code paths.
+The application code lives under **`internal/app`** (not the repo root package).
 
 ---
 
@@ -575,7 +575,7 @@ Prefer **`/dev/input/by-id/`** or **`/dev/input/by-path/`**. Tool: **`go run ./t
 | **`acl` fails** | **`acl help`**; create entities in dependency order. |
 | Lighting stuck / never off | **`lighting_timeout`**; fireman's service hold; relay pin mapping. |
 | GPIO “stuck” after JSON edit | **`cfg restart`** or service restart after **`gpio`** / I2C changes. |
-| Build errors | **`go build -o virtualkeyz2 .`** from package directory. |
+| Build errors | **`go build -o virtualkeyz2 ./cmd/virtualkeyz2`** from repo root. |
 
 ---
 
@@ -584,8 +584,8 @@ Prefer **`/dev/input/by-id/`** or **`/dev/input/by-path/`**. Tool: **`go run ./t
 | File | Purpose |
 |------|---------|
 | **`virtualkeyz2.json`** | Main configuration |
-| **`virtualkeyz2.go`** | Main application (menu, **`acl`**, MQTT, GPIO, door monitor, lighting, fireman's service) |
-| **`exception_calendar.go`** | Exception calendar resolution |
+| **`internal/app/`** | Main application (menu, **`acl`**, MQTT, GPIO, door monitor, lighting, fireman's service) |
+| **`internal/access/`** | Exception calendar resolution and schedule helpers |
 | **`access_control.db`** | SQLite (PINs, ACL, exceptions, **`logs`**) |
 | **`changelog.txt`** | Release history |
 | **`tools/bump-version.sh`** | Version bump |

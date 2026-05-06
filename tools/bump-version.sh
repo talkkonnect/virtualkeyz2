@@ -19,11 +19,11 @@ import os, pathlib, re, datetime
 root = pathlib.Path(os.environ["BUMP_ROOT"])
 msg = os.environ["BUMP_MSG"].replace("\n", " ").strip()
 
-ver_go = root / "virtualkeyz2.go"
+ver_go = root / "internal" / "app" / "virtualkeyz2.go"
 text = ver_go.read_text(encoding="utf-8")
 m = re.search(r'SoftwareVersion\s*=\s*"([0-9.]+)"', text)
 if not m:
-    raise SystemExit("Could not find SoftwareVersion in virtualkeyz2.go")
+    raise SystemExit("Could not find SoftwareVersion in internal/app/virtualkeyz2.go")
 old = m.group(1)
 try:
     v = round(float(old) + 0.01, 2)

@@ -1,0 +1,34 @@
+# GitHub Actions (do not upload workflows)
+.github/workflows/
+
+# Binaries
+/virtualkeyz2
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test / build output
+*.test
+*.out
+coverage.out
+*.coverprofile
+
+# Go workspace / module cache (local)
+vendor/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local / backup artifacts (optional local copies)
+*.backup
+*.log

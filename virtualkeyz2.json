@@ -1,7 +1,7 @@
 {
   "device": {
     "heartbeat_interval": "1m0s",
-    "door_open_warning_after": "60s",
+    "door_open_warning_after": "1m0s",
     "door_open_alarm_interval": "2m0s",
     "door_open_alarm_max_count": 0,
     "door_forced_after_warnings": 0,
@@ -25,13 +25,6 @@
     "sound_lighting_timer_set_enabled": true,
     "sound_lighting_timer_expired_enabled": true,
     "sound_door_open_enabled": true,
-    "lcd_display": {
-      "enabled": true,
-      "i2c_bus": 1,
-      "i2c_address": 63,
-      "backlight_timeout_seconds": 60,
-      "i2c_debug_enabled": false
-    },
     "sound_firemans_activated": "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/fire_alarm.wav",
     "sound_firemans_deactivated": "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/fire_alarm_deactivated.wav",
     "sound_firemans_activated_enabled": true,
@@ -94,7 +87,14 @@
     "dual_keypad_reject_exit_without_entry": false,
     "access_schedule_enforce": true,
     "access_schedule_apply_to_fallback_pin": false,
-    "lighting_timeout": "10s"
+    "lighting_timeout": "10s",
+    "lcd_display": {
+      "enabled": true,
+      "i2c_bus": 1,
+      "i2c_address": 63,
+      "backlight_timeout_seconds": 60,
+      "i2c_debug_enabled": false
+    }
   },
   "gpio": {
     "relay_output_mode": "gpio",

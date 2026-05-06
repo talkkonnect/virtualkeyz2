@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS access_pins (
+	pin TEXT PRIMARY KEY NOT NULL,
+	label TEXT,
+	enabled INTEGER NOT NULL DEFAULT 1,
+	temporary INTEGER NOT NULL DEFAULT 0,
+	expires_at TEXT,
+	max_uses INTEGER,
+	use_count INTEGER NOT NULL DEFAULT 0
+);

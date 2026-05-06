@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"log"
@@ -11,17 +11,6 @@ import (
 	d2logger "github.com/d2r2/go-logger"
 	logging "github.com/op/go-logging"
 )
-
-// LCDDisplaySettings configures the optional I2C HD44780 20×4 module (device.lcd_display in JSON).
-// BacklightTimeout 0 means the backlight stays on after the last UI update (no idle dimming).
-// I2CDebugEnabled toggles verbose logs from the LCD/I2C transport libraries only (not device.log_level).
-type LCDDisplaySettings struct {
-	Enabled           bool
-	I2CBus            int
-	I2CAddr           uint8
-	BacklightTimeout  time.Duration
-	I2CDebugEnabled   bool
-}
 
 func init() {
 	// go-i2c defaults its package logger to Debug; keep I2C chatter off until JSON sets i2c_debug_enabled.
