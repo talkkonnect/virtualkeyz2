@@ -39,9 +39,9 @@ import (
 	"github.com/warthog618/go-gpiocdev"
 	"golang.org/x/term"
 
+	"virtualkeyz2/internal/config"
 	"virtualkeyz2/internal/keypadlist"
 	"virtualkeyz2/internal/mcp23017"
-	"virtualkeyz2/internal/config"
 	"virtualkeyz2/internal/outputnames"
 	"virtualkeyz2/internal/remotemqtt"
 	"virtualkeyz2/internal/store"
@@ -127,8 +127,8 @@ func elevatorWaitFloorEnableChannelCount(app *AppContext) int {
 // AppContext holds our global connections and configurations
 type AppContext struct {
 	// RootCtx is cancelled when the process begins shutdown (HTTP drain, etc.).
-	RootCtx context.Context
-	DB      *sqlx.DB
+	RootCtx      context.Context
+	DB           *sqlx.DB
 	MQTTClient   mqtt.Client
 	mqttMu       sync.RWMutex // serializes reconnect vs publish/handler client reads
 	Config       DeviceConfig
@@ -251,101 +251,113 @@ type virtualkeyz2JSON struct {
 }
 
 type virtualkeyz2DeviceJSON struct {
-	HeartbeatInterval                   *string                 `json:"heartbeat_interval"`
-	DoorOpenWarningAfter                *string                 `json:"door_open_warning_after"`
-	DoorOpenAlarmInterval               *string                 `json:"door_open_alarm_interval"`
-	DoorOpenAlarmMaxCount               *int                    `json:"door_open_alarm_max_count"`
-	DoorForcedAfterWarnings             *int                    `json:"door_forced_after_warnings"`
-	DoorSensorClosedIsLow               *bool                   `json:"door_sensor_closed_is_low"`
-	SoundCardName                       *string                 `json:"sound_card_name"`
-	SoundStartup                        *string                 `json:"sound_startup"`
-	SoundShutdown                       *string                 `json:"sound_shutdown"`
-	SoundPinOK                          *string                 `json:"sound_pin_ok"`
-	SoundAccessGranted                  *string                 `json:"sound_access_granted,omitempty"`
-	SoundPinReject                      *string                 `json:"sound_pin_reject"`
-	SoundKeypress                       *string                 `json:"sound_keypress"`
-	SoundLightingTimerSet               *string                 `json:"sound_lighting_timer_set,omitempty"`
-	SoundLightingTimerExpired           *string                 `json:"sound_lighting_timer_expired,omitempty"`
-	SoundDoorOpen                       *string                 `json:"sound_door_open,omitempty"`
-	SoundStartupEnabled                 *bool                   `json:"sound_startup_enabled,omitempty"`
-	SoundShutdownEnabled                *bool                   `json:"sound_shutdown_enabled,omitempty"`
-	SoundPinOKEnabled                   *bool                   `json:"sound_pin_ok_enabled,omitempty"`
-	SoundAccessGrantedEnabled           *bool                   `json:"sound_access_granted_enabled,omitempty"`
-	SoundPinRejectEnabled               *bool                   `json:"sound_pin_reject_enabled,omitempty"`
-	SoundKeypressEnabled                *bool                   `json:"sound_keypress_enabled,omitempty"`
-	SoundLightingTimerSetEnabled        *bool                   `json:"sound_lighting_timer_set_enabled,omitempty"`
-	SoundLightingTimerExpiredEnabled    *bool                   `json:"sound_lighting_timer_expired_enabled,omitempty"`
-	SoundDoorOpenEnabled                *bool                   `json:"sound_door_open_enabled,omitempty"`
-	LogLevel                            *string                 `json:"log_level"`
-	PinLength                           *int                    `json:"pin_length"`
-	RelayPulseDuration                  *string                 `json:"relay_pulse_duration"`
-	PinRejectBuzzerAfterAttempts        *int                    `json:"pin_reject_buzzer_after_attempts"`
-	BuzzerRelayPulseDuration            *string                 `json:"buzzer_relay_pulse_duration"`
-	MQTTEnabled                         *bool                   `json:"mqtt_enabled"`
-	MQTTBroker                          *string                 `json:"mqtt_broker"`
-	MQTTClientID                        *string                 `json:"mqtt_client_id"`
-	MQTTUsername                        *string                 `json:"mqtt_username"`
-	MQTTPassword                        *string                 `json:"mqtt_password"`
-	MQTTCommandTopic                    *string                 `json:"mqtt_command_topic"`
-	MQTTStatusTopic                     *string                 `json:"mqtt_status_topic"`
-	MQTTCommandToken                    *string                 `json:"mqtt_command_token"`
-	TechMenuHistoryMax                  *int                    `json:"tech_menu_history_max"`
-	KeypadInterDigitTimeout             *string                 `json:"keypad_inter_digit_timeout"`
-	KeypadSessionTimeout                *string                 `json:"keypad_session_timeout"`
-	PinEntryFeedbackDelay               *string                 `json:"pin_entry_feedback_delay"`
-	PinLockoutEnabled                   *bool                   `json:"pin_lockout_enabled"`
-	PinLockoutAfterAttempts             *int                    `json:"pin_lockout_after_attempts"`
-	PinLockoutDuration                  *string                 `json:"pin_lockout_duration"`
-	PinLockoutOverridePin               *string                 `json:"pin_lockout_override_pin"`
-	FallbackAccessPin                   *string                 `json:"fallback_access_pin"`
-	WebhookEventEnabled                 *bool                   `json:"webhook_event_enabled"`
-	WebhookEventURL                     *string                 `json:"webhook_event_url"`
-	WebhookEventTokenEnabled            *bool                   `json:"webhook_event_token_enabled"`
-	WebhookEventToken                   *string                 `json:"webhook_event_token"`
-	WebhookEventTypes                   *map[string]bool        `json:"webhook_event_types,omitempty"`
-	WebhookEventEndpoints               *[]WebhookEventEndpoint `json:"webhook_event_endpoints,omitempty"`
-	WebhookHeartbeatEnabled             *bool                   `json:"webhook_heartbeat_enabled"`
-	WebhookHeartbeatURL                 *string                 `json:"webhook_heartbeat_url"`
-	WebhookHeartbeatTokenEnabled        *bool                   `json:"webhook_heartbeat_token_enabled"`
-	WebhookHeartbeatToken               *string                 `json:"webhook_heartbeat_token"`
-	WebhookHTTPTimeout                  *string                 `json:"webhook_http_timeout,omitempty"`
-	WebhookMaxConcurrent                *int                    `json:"webhook_max_concurrent,omitempty"`
-	WebhookCircuitBreakerEnabled        *bool                   `json:"webhook_circuit_breaker_enabled,omitempty"`
-	WebhookCircuitFailureThreshold      *int                    `json:"webhook_circuit_failure_threshold,omitempty"`
-	WebhookCircuitOpenDuration          *string                 `json:"webhook_circuit_open_duration,omitempty"`
-	KeypadOperationMode                 *string                 `json:"keypad_operation_mode"`
-	KeypadEvdevPath                     *string                 `json:"keypad_evdev_path"`
-	KeypadExitEvdevPath                 *string                 `json:"keypad_exit_evdev_path"`
-	ScannerDevicePath                   *string                 `json:"scanner_device_path,omitempty"`
-	MaxDevicesPerUser                   *int                    `json:"max_devices_per_user,omitempty"`
-	QRTimeWindowSeconds                 *int                    `json:"qr_time_window_seconds,omitempty"`
-	StaticTestQRCode                    *string                 `json:"static_test_qr_code,omitempty"`
-	StaticTestQRCodeEnabled             *bool                   `json:"static_test_qr_code_enabled,omitempty"`
-	PairPeerRole                        *string                 `json:"pair_peer_role"`
-	MQTTPairPeerTopic                   *string                 `json:"mqtt_pair_peer_topic"`
-	PairPeerToken                       *string                 `json:"pair_peer_token"`
-	ElevatorFloorWaitTimeout            *string                 `json:"elevator_floor_wait_timeout"`
-	ElevatorWaitFloorCabSense           *string                 `json:"elevator_wait_floor_cab_sense"`
-	ElevatorFloorInputPins              *string                 `json:"elevator_floor_input_pins"`
-	ElevatorPredefinedFloor             *int                    `json:"elevator_predefined_floor"`
-	ElevatorPredefinedFloors            *string                 `json:"elevator_predefined_floors"`
-	ElevatorDispatchPulseDuration       *string                 `json:"elevator_dispatch_pulse_duration"`
-	ElevatorFloorDispatchPulseDurations *string                 `json:"elevator_floor_dispatch_pulse_durations"`
-	ElevatorEnablePulseDuration         *string                 `json:"elevator_enable_pulse_duration"`
-	DualKeypadRejectExitWithoutEntry    *bool                   `json:"dual_keypad_reject_exit_without_entry"`
-	AccessControlDoorID                 *string                 `json:"access_control_door_id,omitempty"`
-	AccessControlElevatorID             *string                 `json:"access_control_elevator_id,omitempty"`
-	AccessScheduleEnforce               *bool                   `json:"access_schedule_enforce,omitempty"`
-	AccessScheduleApplyToFallbackPin    *bool                   `json:"access_schedule_apply_to_fallback_pin,omitempty"`
-	AccessExceptionSiteTimezone         *string                 `json:"access_exception_site_timezone,omitempty"`
-	LightingTimeout                     *string                 `json:"lighting_timeout,omitempty"`
-	FiremansServiceEnabled              *bool                   `json:"firemans_service_enabled,omitempty"`
-	SoundFiremansActivated              *string                 `json:"sound_firemans_activated,omitempty"`
-	SoundFiremansDeactivated            *string                 `json:"sound_firemans_deactivated,omitempty"`
-	SoundFiremansActivatedEnabled       *bool                   `json:"sound_firemans_activated_enabled,omitempty"`
-	SoundFiremansDeactivatedEnabled     *bool                   `json:"sound_firemans_deactivated_enabled,omitempty"`
-	AutomaticDoorOperatorPulseDuration  *string                 `json:"automatic_door_operator_pulse_duration,omitempty"`
-	IntercomCameraTriggerPulseDuration  *string                    `json:"intercom_camera_trigger_pulse_duration,omitempty"`
+	HeartbeatInterval                   *string                     `json:"heartbeat_interval"`
+	DoorOpenWarningAfter                *string                     `json:"door_open_warning_after"`
+	DoorOpenAlarmInterval               *string                     `json:"door_open_alarm_interval"`
+	DoorOpenAlarmMaxCount               *int                        `json:"door_open_alarm_max_count"`
+	DoorForcedAfterWarnings             *int                        `json:"door_forced_after_warnings"`
+	DoorSensorClosedIsLow               *bool                       `json:"door_sensor_closed_is_low"`
+	SoundCardName                       *string                     `json:"sound_card_name"`
+	SoundStartup                        *string                     `json:"sound_startup"`
+	SoundShutdown                       *string                     `json:"sound_shutdown"`
+	SoundPinOK                          *string                     `json:"sound_pin_ok"`
+	SoundAccessGranted                  *string                     `json:"sound_access_granted,omitempty"`
+	SoundPinReject                      *string                     `json:"sound_pin_reject"`
+	SoundKeypress                       *string                     `json:"sound_keypress"`
+	SoundLightingTimerSet               *string                     `json:"sound_lighting_timer_set,omitempty"`
+	SoundLightingTimerExpired           *string                     `json:"sound_lighting_timer_expired,omitempty"`
+	SoundDoorOpen                       *string                     `json:"sound_door_open,omitempty"`
+	SoundStartupEnabled                 *bool                       `json:"sound_startup_enabled,omitempty"`
+	SoundShutdownEnabled                *bool                       `json:"sound_shutdown_enabled,omitempty"`
+	SoundPinOKEnabled                   *bool                       `json:"sound_pin_ok_enabled,omitempty"`
+	SoundAccessGrantedEnabled           *bool                       `json:"sound_access_granted_enabled,omitempty"`
+	SoundPinRejectEnabled               *bool                       `json:"sound_pin_reject_enabled,omitempty"`
+	SoundKeypressEnabled                *bool                       `json:"sound_keypress_enabled,omitempty"`
+	SoundLightingTimerSetEnabled        *bool                       `json:"sound_lighting_timer_set_enabled,omitempty"`
+	SoundLightingTimerExpiredEnabled    *bool                       `json:"sound_lighting_timer_expired_enabled,omitempty"`
+	SoundDoorOpenEnabled                *bool                       `json:"sound_door_open_enabled,omitempty"`
+	SoundStartupBlocking                *bool                       `json:"sound_startup_blocking,omitempty"`
+	SoundShutdownBlocking               *bool                       `json:"sound_shutdown_blocking,omitempty"`
+	SoundPinOKBlocking                  *bool                       `json:"sound_pin_ok_blocking,omitempty"`
+	SoundAccessGrantedBlocking          *bool                       `json:"sound_access_granted_blocking,omitempty"`
+	SoundPinRejectBlocking              *bool                       `json:"sound_pin_reject_blocking,omitempty"`
+	SoundKeypressBlocking               *bool                       `json:"sound_keypress_blocking,omitempty"`
+	SoundLightingTimerSetBlocking       *bool                       `json:"sound_lighting_timer_set_blocking,omitempty"`
+	SoundLightingTimerExpiredBlocking   *bool                       `json:"sound_lighting_timer_expired_blocking,omitempty"`
+	SoundDoorOpenBlocking               *bool                       `json:"sound_door_open_blocking,omitempty"`
+	LogLevel                            *string                     `json:"log_level"`
+	PinLength                           *int                        `json:"pin_length"`
+	RelayPulseDuration                  *string                     `json:"relay_pulse_duration"`
+	PinRejectBuzzerAfterAttempts        *int                        `json:"pin_reject_buzzer_after_attempts"`
+	BuzzerRelayPulseDuration            *string                     `json:"buzzer_relay_pulse_duration"`
+	MQTTEnabled                         *bool                       `json:"mqtt_enabled"`
+	MQTTBroker                          *string                     `json:"mqtt_broker"`
+	MQTTClientID                        *string                     `json:"mqtt_client_id"`
+	MQTTUsername                        *string                     `json:"mqtt_username"`
+	MQTTPassword                        *string                     `json:"mqtt_password"`
+	MQTTCommandTopic                    *string                     `json:"mqtt_command_topic"`
+	MQTTStatusTopic                     *string                     `json:"mqtt_status_topic"`
+	MQTTCommandToken                    *string                     `json:"mqtt_command_token"`
+	TechMenuHistoryMax                  *int                        `json:"tech_menu_history_max"`
+	KeypadInterDigitTimeout             *string                     `json:"keypad_inter_digit_timeout"`
+	KeypadSessionTimeout                *string                     `json:"keypad_session_timeout"`
+	PinEntryFeedbackDelay               *string                     `json:"pin_entry_feedback_delay"`
+	PinLockoutEnabled                   *bool                       `json:"pin_lockout_enabled"`
+	PinLockoutAfterAttempts             *int                        `json:"pin_lockout_after_attempts"`
+	PinLockoutDuration                  *string                     `json:"pin_lockout_duration"`
+	PinLockoutOverridePin               *string                     `json:"pin_lockout_override_pin"`
+	FallbackAccessPin                   *string                     `json:"fallback_access_pin"`
+	WebhookEventEnabled                 *bool                       `json:"webhook_event_enabled"`
+	WebhookEventURL                     *string                     `json:"webhook_event_url"`
+	WebhookEventTokenEnabled            *bool                       `json:"webhook_event_token_enabled"`
+	WebhookEventToken                   *string                     `json:"webhook_event_token"`
+	WebhookEventTypes                   *map[string]bool            `json:"webhook_event_types,omitempty"`
+	WebhookEventEndpoints               *[]WebhookEventEndpoint     `json:"webhook_event_endpoints,omitempty"`
+	WebhookHeartbeatEnabled             *bool                       `json:"webhook_heartbeat_enabled"`
+	WebhookHeartbeatURL                 *string                     `json:"webhook_heartbeat_url"`
+	WebhookHeartbeatTokenEnabled        *bool                       `json:"webhook_heartbeat_token_enabled"`
+	WebhookHeartbeatToken               *string                     `json:"webhook_heartbeat_token"`
+	WebhookHTTPTimeout                  *string                     `json:"webhook_http_timeout,omitempty"`
+	WebhookMaxConcurrent                *int                        `json:"webhook_max_concurrent,omitempty"`
+	WebhookCircuitBreakerEnabled        *bool                       `json:"webhook_circuit_breaker_enabled,omitempty"`
+	WebhookCircuitFailureThreshold      *int                        `json:"webhook_circuit_failure_threshold,omitempty"`
+	WebhookCircuitOpenDuration          *string                     `json:"webhook_circuit_open_duration,omitempty"`
+	KeypadOperationMode                 *string                     `json:"keypad_operation_mode"`
+	KeypadEvdevPath                     *string                     `json:"keypad_evdev_path"`
+	KeypadExitEvdevPath                 *string                     `json:"keypad_exit_evdev_path"`
+	ScannerDevicePath                   *string                     `json:"scanner_device_path,omitempty"`
+	ScannerEnabled                      *bool                       `json:"scanner_enabled,omitempty"`
+	MaxDevicesPerUser                   *int                        `json:"max_devices_per_user,omitempty"`
+	QRTimeWindowSeconds                 *int                        `json:"qr_time_window_seconds,omitempty"`
+	StaticTestQRCode                    *string                     `json:"static_test_qr_code,omitempty"`
+	StaticTestQRCodeEnabled             *bool                       `json:"static_test_qr_code_enabled,omitempty"`
+	PairPeerRole                        *string                     `json:"pair_peer_role"`
+	MQTTPairPeerTopic                   *string                     `json:"mqtt_pair_peer_topic"`
+	PairPeerToken                       *string                     `json:"pair_peer_token"`
+	ElevatorFloorWaitTimeout            *string                     `json:"elevator_floor_wait_timeout"`
+	ElevatorWaitFloorCabSense           *string                     `json:"elevator_wait_floor_cab_sense"`
+	ElevatorFloorInputPins              *string                     `json:"elevator_floor_input_pins"`
+	ElevatorPredefinedFloor             *int                        `json:"elevator_predefined_floor"`
+	ElevatorPredefinedFloors            *string                     `json:"elevator_predefined_floors"`
+	ElevatorDispatchPulseDuration       *string                     `json:"elevator_dispatch_pulse_duration"`
+	ElevatorFloorDispatchPulseDurations *string                     `json:"elevator_floor_dispatch_pulse_durations"`
+	ElevatorEnablePulseDuration         *string                     `json:"elevator_enable_pulse_duration"`
+	DualKeypadRejectExitWithoutEntry    *bool                       `json:"dual_keypad_reject_exit_without_entry"`
+	AccessControlDoorID                 *string                     `json:"access_control_door_id,omitempty"`
+	AccessControlElevatorID             *string                     `json:"access_control_elevator_id,omitempty"`
+	AccessScheduleEnforce               *bool                       `json:"access_schedule_enforce,omitempty"`
+	AccessScheduleApplyToFallbackPin    *bool                       `json:"access_schedule_apply_to_fallback_pin,omitempty"`
+	AccessExceptionSiteTimezone         *string                     `json:"access_exception_site_timezone,omitempty"`
+	LightingTimeout                     *string                     `json:"lighting_timeout,omitempty"`
+	FiremansServiceEnabled              *bool                       `json:"firemans_service_enabled,omitempty"`
+	SoundFiremansActivated              *string                     `json:"sound_firemans_activated,omitempty"`
+	SoundFiremansDeactivated            *string                     `json:"sound_firemans_deactivated,omitempty"`
+	SoundFiremansActivatedEnabled       *bool                       `json:"sound_firemans_activated_enabled,omitempty"`
+	SoundFiremansDeactivatedEnabled     *bool                       `json:"sound_firemans_deactivated_enabled,omitempty"`
+	SoundFiremansActivatedBlocking      *bool                       `json:"sound_firemans_activated_blocking,omitempty"`
+	SoundFiremansDeactivatedBlocking    *bool                       `json:"sound_firemans_deactivated_blocking,omitempty"`
+	AutomaticDoorOperatorPulseDuration  *string                     `json:"automatic_door_operator_pulse_duration,omitempty"`
+	IntercomCameraTriggerPulseDuration  *string                     `json:"intercom_camera_trigger_pulse_duration,omitempty"`
 	LCDDisplay                          *virtualkeyz2LCDDisplayJSON `json:"lcd_display,omitempty"`
 }
 
@@ -956,6 +968,33 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.SoundDoorOpenEnabled != nil {
 		app.Config.SoundDoorOpenEnabled = *d.SoundDoorOpenEnabled
 	}
+	if d.SoundStartupBlocking != nil {
+		app.Config.SoundStartupBlocking = *d.SoundStartupBlocking
+	}
+	if d.SoundShutdownBlocking != nil {
+		app.Config.SoundShutdownBlocking = *d.SoundShutdownBlocking
+	}
+	if d.SoundPinOKBlocking != nil {
+		app.Config.SoundPinOKBlocking = *d.SoundPinOKBlocking
+	}
+	if d.SoundAccessGrantedBlocking != nil {
+		app.Config.SoundAccessGrantedBlocking = *d.SoundAccessGrantedBlocking
+	}
+	if d.SoundPinRejectBlocking != nil {
+		app.Config.SoundPinRejectBlocking = *d.SoundPinRejectBlocking
+	}
+	if d.SoundKeypressBlocking != nil {
+		app.Config.SoundKeypressBlocking = *d.SoundKeypressBlocking
+	}
+	if d.SoundLightingTimerSetBlocking != nil {
+		app.Config.SoundLightingTimerSetBlocking = *d.SoundLightingTimerSetBlocking
+	}
+	if d.SoundLightingTimerExpiredBlocking != nil {
+		app.Config.SoundLightingTimerExpiredBlocking = *d.SoundLightingTimerExpiredBlocking
+	}
+	if d.SoundDoorOpenBlocking != nil {
+		app.Config.SoundDoorOpenBlocking = *d.SoundDoorOpenBlocking
+	}
 	if d.LogLevel != nil {
 		app.Config.LogLevel = *d.LogLevel
 	}
@@ -1082,6 +1121,9 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.ScannerDevicePath != nil {
 		app.Config.ScannerDevicePath = *d.ScannerDevicePath
 	}
+	if d.ScannerEnabled != nil {
+		app.Config.ScannerEnabled = *d.ScannerEnabled
+	}
 	if d.MaxDevicesPerUser != nil {
 		app.Config.MaxDevicesPerUser = *d.MaxDevicesPerUser
 	}
@@ -1151,6 +1193,12 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if d.SoundFiremansDeactivatedEnabled != nil {
 		app.Config.SoundFiremansDeactivatedEnabled = *d.SoundFiremansDeactivatedEnabled
+	}
+	if d.SoundFiremansActivatedBlocking != nil {
+		app.Config.SoundFiremansActivatedBlocking = *d.SoundFiremansActivatedBlocking
+	}
+	if d.SoundFiremansDeactivatedBlocking != nil {
+		app.Config.SoundFiremansDeactivatedBlocking = *d.SoundFiremansDeactivatedBlocking
 	}
 	if d.LCDDisplay != nil {
 		ld := d.LCDDisplay
@@ -1478,10 +1526,21 @@ type virtualkeyz2PersistDevice struct {
 	SoundLightingTimerSetEnabled        bool                   `json:"sound_lighting_timer_set_enabled"`
 	SoundLightingTimerExpiredEnabled    bool                   `json:"sound_lighting_timer_expired_enabled"`
 	SoundDoorOpenEnabled                bool                   `json:"sound_door_open_enabled"`
+	SoundStartupBlocking                bool                   `json:"sound_startup_blocking"`
+	SoundShutdownBlocking               bool                   `json:"sound_shutdown_blocking"`
+	SoundPinOKBlocking                  bool                   `json:"sound_pin_ok_blocking"`
+	SoundAccessGrantedBlocking          bool                   `json:"sound_access_granted_blocking"`
+	SoundPinRejectBlocking              bool                   `json:"sound_pin_reject_blocking"`
+	SoundKeypressBlocking               bool                   `json:"sound_keypress_blocking"`
+	SoundLightingTimerSetBlocking       bool                   `json:"sound_lighting_timer_set_blocking"`
+	SoundLightingTimerExpiredBlocking   bool                   `json:"sound_lighting_timer_expired_blocking"`
+	SoundDoorOpenBlocking               bool                   `json:"sound_door_open_blocking"`
 	SoundFiremansActivated              string                 `json:"sound_firemans_activated"`
 	SoundFiremansDeactivated            string                 `json:"sound_firemans_deactivated"`
 	SoundFiremansActivatedEnabled       bool                   `json:"sound_firemans_activated_enabled"`
 	SoundFiremansDeactivatedEnabled     bool                   `json:"sound_firemans_deactivated_enabled"`
+	SoundFiremansActivatedBlocking      bool                   `json:"sound_firemans_activated_blocking"`
+	SoundFiremansDeactivatedBlocking    bool                   `json:"sound_firemans_deactivated_blocking"`
 	FiremansServiceEnabled              bool                   `json:"firemans_service_enabled"`
 	AutomaticDoorOperatorPulseDuration  string                 `json:"automatic_door_operator_pulse_duration,omitempty"`
 	IntercomCameraTriggerPulseDuration  string                 `json:"intercom_camera_trigger_pulse_duration,omitempty"`
@@ -1526,6 +1585,7 @@ type virtualkeyz2PersistDevice struct {
 	KeypadEvdevPath                     string                 `json:"keypad_evdev_path"`
 	KeypadExitEvdevPath                 string                 `json:"keypad_exit_evdev_path"`
 	ScannerDevicePath                   string                 `json:"scanner_device_path"`
+	ScannerEnabled                      bool                   `json:"scanner_enabled"`
 	MaxDevicesPerUser                   int                    `json:"max_devices_per_user"`
 	QRTimeWindowSeconds                 int                    `json:"qr_time_window_seconds"`
 	StaticTestQRCode                    string                 `json:"static_test_qr_code"`
@@ -1634,10 +1694,21 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.SoundLightingTimerSetEnabled = c.SoundLightingTimerSetEnabled
 	out.Device.SoundLightingTimerExpiredEnabled = c.SoundLightingTimerExpiredEnabled
 	out.Device.SoundDoorOpenEnabled = c.SoundDoorOpenEnabled
+	out.Device.SoundStartupBlocking = c.SoundStartupBlocking
+	out.Device.SoundShutdownBlocking = c.SoundShutdownBlocking
+	out.Device.SoundPinOKBlocking = c.SoundPinOKBlocking
+	out.Device.SoundAccessGrantedBlocking = c.SoundAccessGrantedBlocking
+	out.Device.SoundPinRejectBlocking = c.SoundPinRejectBlocking
+	out.Device.SoundKeypressBlocking = c.SoundKeypressBlocking
+	out.Device.SoundLightingTimerSetBlocking = c.SoundLightingTimerSetBlocking
+	out.Device.SoundLightingTimerExpiredBlocking = c.SoundLightingTimerExpiredBlocking
+	out.Device.SoundDoorOpenBlocking = c.SoundDoorOpenBlocking
 	out.Device.SoundFiremansActivated = c.SoundFiremansActivated
 	out.Device.SoundFiremansDeactivated = c.SoundFiremansDeactivated
 	out.Device.SoundFiremansActivatedEnabled = c.SoundFiremansActivatedEnabled
 	out.Device.SoundFiremansDeactivatedEnabled = c.SoundFiremansDeactivatedEnabled
+	out.Device.SoundFiremansActivatedBlocking = c.SoundFiremansActivatedBlocking
+	out.Device.SoundFiremansDeactivatedBlocking = c.SoundFiremansDeactivatedBlocking
 	out.Device.FiremansServiceEnabled = c.FiremansServiceEnabled
 	if c.AutomaticDoorOperatorPulseDuration > 0 {
 		out.Device.AutomaticDoorOperatorPulseDuration = c.AutomaticDoorOperatorPulseDuration.String()
@@ -1686,6 +1757,7 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.KeypadEvdevPath = c.KeypadEvdevPath
 	out.Device.KeypadExitEvdevPath = c.KeypadExitEvdevPath
 	out.Device.ScannerDevicePath = c.ScannerDevicePath
+	out.Device.ScannerEnabled = c.ScannerEnabled
 	out.Device.MaxDevicesPerUser = c.MaxDevicesPerUser
 	out.Device.QRTimeWindowSeconds = c.QRTimeWindowSeconds
 	out.Device.StaticTestQRCode = c.StaticTestQRCode
@@ -2126,6 +2198,24 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.SoundLightingTimerExpiredEnabled, err = strconv.ParseBool(value)
 	case "sound_door_open_enabled":
 		ctx.Config.SoundDoorOpenEnabled, err = strconv.ParseBool(value)
+	case "sound_startup_blocking":
+		ctx.Config.SoundStartupBlocking, err = strconv.ParseBool(value)
+	case "sound_shutdown_blocking":
+		ctx.Config.SoundShutdownBlocking, err = strconv.ParseBool(value)
+	case "sound_pin_ok_blocking":
+		ctx.Config.SoundPinOKBlocking, err = strconv.ParseBool(value)
+	case "sound_access_granted_blocking":
+		ctx.Config.SoundAccessGrantedBlocking, err = strconv.ParseBool(value)
+	case "sound_pin_reject_blocking":
+		ctx.Config.SoundPinRejectBlocking, err = strconv.ParseBool(value)
+	case "sound_keypress_blocking":
+		ctx.Config.SoundKeypressBlocking, err = strconv.ParseBool(value)
+	case "sound_lighting_timer_set_blocking":
+		ctx.Config.SoundLightingTimerSetBlocking, err = strconv.ParseBool(value)
+	case "sound_lighting_timer_expired_blocking":
+		ctx.Config.SoundLightingTimerExpiredBlocking, err = strconv.ParseBool(value)
+	case "sound_door_open_blocking":
+		ctx.Config.SoundDoorOpenBlocking, err = strconv.ParseBool(value)
 	case "log_level":
 		ctx.Config.LogLevel = value
 	case "pin_length":
@@ -2343,6 +2433,8 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.KeypadExitEvdevPath = value
 	case "scanner_device_path":
 		ctx.Config.ScannerDevicePath = value
+	case "scanner_enabled":
+		ctx.Config.ScannerEnabled, err = strconv.ParseBool(value)
 	case "max_devices_per_user":
 		var n int64
 		n, err = strconv.ParseInt(value, 10, 32)
@@ -2493,6 +2585,10 @@ func techMenuCfgSetValue(ctx *AppContext, key, value string) error {
 		ctx.Config.SoundFiremansActivated = value
 	case "sound_firemans_deactivated":
 		ctx.Config.SoundFiremansDeactivated = value
+	case "sound_firemans_activated_blocking":
+		ctx.Config.SoundFiremansActivatedBlocking, err = strconv.ParseBool(value)
+	case "sound_firemans_deactivated_blocking":
+		ctx.Config.SoundFiremansDeactivatedBlocking, err = strconv.ParseBool(value)
 	case "sound_firemans_activated_enabled":
 		ctx.Config.SoundFiremansActivatedEnabled, err = strconv.ParseBool(value)
 	case "sound_firemans_deactivated_enabled":
@@ -2812,42 +2908,50 @@ func Main() int {
 			SoundLightingTimerSetEnabled:     true,
 			SoundLightingTimerExpiredEnabled: true,
 			SoundDoorOpenEnabled:             true,
-			MQTTEnabled:                      true,
-			MQTTBroker:                       "tcp://central-mqtt-server:1883",
-			MQTTClientID:                     "virtualkeyz2-pi-001",
-			MQTTCommandTopic:                 "virtualkeyz2/commands",
-			MQTTStatusTopic:                  "virtualkeyz2/status",
-			TechMenuHistoryMax:               100,
-			KeypadInterDigitTimeout:          5 * time.Second,
-			KeypadSessionTimeout:             30 * time.Second,
-			PinEntryFeedbackDelay:            3 * time.Second,
-			PinLockoutEnabled:                true,
-			PinLockoutAfterAttempts:          5,
-			PinLockoutDuration:               60 * time.Second,
-			PinLockoutOverridePin:            "",
-			FallbackAccessPin:                "",
-			WebhookEventEnabled:              false,
-			WebhookEventTokenEnabled:         false,
-			WebhookHeartbeatEnabled:          false,
-			WebhookHeartbeatTokenEnabled:     false,
-			WebhookHTTPTimeout:               25 * time.Second,
-			WebhookMaxConcurrent:             16,
-			WebhookCircuitBreakerEnabled:     true,
-			WebhookCircuitFailureThreshold:   5,
-			WebhookCircuitOpenDuration:       60 * time.Second,
-			AccessScheduleEnforce:            true,
-			KeypadOperationMode:              ModeAccessEntry,
-			KeypadEvdevPath:                  "/dev/input/event1",
-			ScannerDevicePath:                "/dev/input/by-id/usb-YUREN_Yuren_HID_FS_Keyboard_SN_20190000-event-kbd",
-			MaxDevicesPerUser:                3,
-			QRTimeWindowSeconds:              30,
-			StaticTestQRCodeEnabled:          false,
+			// Blocking (sync) by default for user-facing PIN feedback so the tone
+			// finishes before the flow continues; other sounds default to
+			// non-blocking (async) via their zero value.
+			SoundShutdownBlocking:          true,
+			SoundPinOKBlocking:             true,
+			SoundAccessGrantedBlocking:     true,
+			SoundPinRejectBlocking:         true,
+			MQTTEnabled:                    true,
+			MQTTBroker:                     "tcp://central-mqtt-server:1883",
+			MQTTClientID:                   "virtualkeyz2-pi-001",
+			MQTTCommandTopic:               "virtualkeyz2/commands",
+			MQTTStatusTopic:                "virtualkeyz2/status",
+			TechMenuHistoryMax:             100,
+			KeypadInterDigitTimeout:        5 * time.Second,
+			KeypadSessionTimeout:           30 * time.Second,
+			PinEntryFeedbackDelay:          3 * time.Second,
+			PinLockoutEnabled:              true,
+			PinLockoutAfterAttempts:        5,
+			PinLockoutDuration:             60 * time.Second,
+			PinLockoutOverridePin:          "",
+			FallbackAccessPin:              "",
+			WebhookEventEnabled:            false,
+			WebhookEventTokenEnabled:       false,
+			WebhookHeartbeatEnabled:        false,
+			WebhookHeartbeatTokenEnabled:   false,
+			WebhookHTTPTimeout:             25 * time.Second,
+			WebhookMaxConcurrent:           16,
+			WebhookCircuitBreakerEnabled:   true,
+			WebhookCircuitFailureThreshold: 5,
+			WebhookCircuitOpenDuration:     60 * time.Second,
+			AccessScheduleEnforce:          true,
+			KeypadOperationMode:            ModeAccessEntry,
+			KeypadEvdevPath:                "/dev/input/event1",
+			ScannerDevicePath:              "/dev/input/by-id/usb-YUREN_Yuren_HID_FS_Keyboard_SN_20190000-event-kbd",
+			ScannerEnabled:                 true,
+			MaxDevicesPerUser:              3,
+			QRTimeWindowSeconds:            30,
+			StaticTestQRCodeEnabled:        false,
 			LCDDisplay: LCDDisplaySettings{
-				Enabled:           false,
-				I2CBus:            1,
-				I2CAddr:           0x27,
-				BacklightTimeout:  60 * time.Second,
-				I2CDebugEnabled:   false,
+				Enabled:          false,
+				I2CBus:           1,
+				I2CAddr:          0x27,
+				BacklightTimeout: 60 * time.Second,
+				I2CDebugEnabled:  false,
 			},
 		},
 		GPIOSettings: GPIOSettings{
@@ -2984,7 +3088,14 @@ func Main() int {
 	// 6. Start Concurrent Subsystems
 	go startHeartbeatAPI(appCtx) // Regular heartbeat via API [cite: 9]
 	go startKeypadListeners(appCtx)
-	go startQRScannerListener(appCtx)
+	appCtx.configMu.RLock()
+	scannerEnabled := appCtx.Config.ScannerEnabled
+	appCtx.configMu.RUnlock()
+	if scannerEnabled {
+		go startQRScannerListener(appCtx)
+	} else {
+		log.Printf("INFO: QR scanner disabled via config (scanner_enabled=false); listener not started.")
+	}
 	go monitorElevatorFloorSelection(appCtx)
 	go monitorDoorSensors(appCtx) // Door open timers & warnings
 	go displayController(appCtx)  // I2C HD44780 LCD + PIN mask (non-blocking vs keypad)
@@ -2995,7 +3106,7 @@ func Main() int {
 	appCtx.configMu.RLock()
 	startupCfg := appCtx.Config
 	appCtx.configMu.RUnlock()
-	playSoundAsyncEnabled(startupCfg, startupCfg.SoundStartup, startupCfg.SoundStartupEnabled)
+	playSoundEnabled(startupCfg, startupCfg.SoundStartup, startupCfg.SoundStartupEnabled, startupCfg.SoundStartupBlocking)
 
 	shutdownFromMenu := make(chan struct{}, 1)
 	if !*noTechMenu {
@@ -3015,7 +3126,7 @@ func Main() int {
 	appCtx.configMu.RLock()
 	shutdownCfg := appCtx.Config
 	appCtx.configMu.RUnlock()
-	playSoundSyncEnabled(shutdownCfg, shutdownCfg.SoundShutdown, shutdownCfg.SoundShutdownEnabled)
+	playSoundEnabled(shutdownCfg, shutdownCfg.SoundShutdown, shutdownCfg.SoundShutdownEnabled, shutdownCfg.SoundShutdownBlocking)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -4396,13 +4507,19 @@ func (ctx *AppContext) credentialRecordSuccessfulUse(pin, mode, keypadRole strin
 // pinRejectCredentialLifecycle plays reject feedback for lifecycle denial without counting toward wrong-PIN lockout streak.
 func (ctx *AppContext) pinRejectCredentialLifecycle(cfg DeviceConfig, keypadRole string, buzzerBCM uint8, feedbackDelay time.Duration, reason string, extra map[string]any) {
 	lcdShowInvalidCard(ctx)
-	playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 	wh := map[string]any{"reason": reason, "keypad_role": keypadRole}
 	for k, v := range extra {
 		wh[k] = v
 	}
+	// Fire the webhook BEFORE the (blocking) reject sound so remote displays
+	// (fb-virtualkeyz2) show ACCESS DENIED in sync with the LCD, not after the
+	// sound has finished playing.
 	fireEventWebhook(ctx, "pin_rejected", wh)
-	time.Sleep(feedbackDelay)
+	playSoundEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled, cfg.SoundPinRejectBlocking)
+	// No feedback-delay sleep: it would block the keypad listener and delay
+	// re-entry after a rejection. The displays hold ACCESS DENIED on their own
+	// (LCD auto-idle + fb result hold), so return immediately and stay responsive.
+	_ = feedbackDelay
 }
 
 // occupancyGetOrCreateAtomic returns the per-PIN counter for dual-keypad occupancy when DB is nil (secure zone = credential PIN).
@@ -4742,12 +4859,12 @@ func handleMQTTRemotePayload(ctx *AppContext, topic string, payload []byte) {
 			if err := ctx.GPIO.ActionPulseBlocking("door", cfg.RelayPulseDuration); err != nil {
 				mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: false, Cmd: cmdLower, Error: "hardware_actuation_failed", Detail: err.Error()})
 				fireEventWebhook(ctx, "hardware_actuation_failed", map[string]any{"mqtt_topic": topic, "source": "mqtt_remote_door_open", "error": err.Error()})
-				playSoundAsyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+				playSoundEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled, cfg.SoundPinRejectBlocking)
 				log.Printf("ERROR: MQTT open_door: door relay actuation failed: %v", err)
 				return
 			}
 			ctx.pulseAuthorizedAccessAuxRelays(cfg)
-			playSoundAsyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+			playSoundEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled, cfg.SoundPinOKBlocking)
 			mqttPublishRemoteAck(ctx, remotemqtt.RemoteAck{OK: true, Cmd: cmdLower, Detail: "door relay pulsed"})
 			fireEventWebhook(ctx, "mqtt_remote_door_open", map[string]any{"mqtt_topic": topic})
 		} else {
@@ -5083,6 +5200,14 @@ func webhookPostJSONAsync(app *AppContext, url string, tokenEnabled bool, token 
 // Payload never includes PINs or tokens. Optional Bearer token when token_enabled and token non-empty.
 func fireEventWebhook(ctx *AppContext, event string, detail map[string]any) {
 	auditLogEvent(ctx, event, detail)
+	postEventWebhook(ctx, event, detail)
+}
+
+// postEventWebhook POSTs an event to the configured webhook endpoint(s) WITHOUT
+// writing an audit-log row. Use it for high-frequency, transient UI events such
+// as pin_progress (masked digit count for remote displays) that must not bloat
+// the audit log. Security-relevant events keep using fireEventWebhook.
+func postEventWebhook(ctx *AppContext, event string, detail map[string]any) {
 	ctx.configMu.RLock()
 	if !ctx.Config.WebhookEventEnabled {
 		ctx.configMu.RUnlock()
@@ -5277,6 +5402,7 @@ func monitorDoorSensors(ctx *AppContext) {
 		closedLow := ctx.Config.DoorSensorClosedIsLow
 		doorOpenPath := strings.TrimSpace(ctx.Config.SoundDoorOpen)
 		doorOpenSoundEn := ctx.Config.SoundDoorOpenEnabled
+		doorOpenBlocking := ctx.Config.SoundDoorOpenBlocking
 		doorOpenCard := ctx.Config.SoundCardName
 		ctx.configMu.RUnlock()
 		if warnAfter <= 0 {
@@ -5369,7 +5495,7 @@ func monitorDoorSensors(ctx *AppContext) {
 				"door_open_alarm_interval": alarmInterval.String(),
 			}
 			fireEventWebhook(ctx, "door_open_timeout", detail)
-			playSoundAsyncEnabled(DeviceConfig{SoundCardName: doorOpenCard}, doorOpenPath, doorOpenSoundEn)
+			playSoundEnabled(DeviceConfig{SoundCardName: doorOpenCard}, doorOpenPath, doorOpenSoundEn, doorOpenBlocking)
 			if forcedAfter > 0 && warningCount >= forcedAfter {
 				fireEventWebhook(ctx, "door_forced", map[string]any{
 					"door_sensor_gpio":      sensorGPIO,
@@ -5407,7 +5533,7 @@ func monitorDoorSensors(ctx *AppContext) {
 			"door_open_alarm_interval": alarmInterval.String(),
 		}
 		fireEventWebhook(ctx, "door_open_timeout", detail)
-		playSoundAsyncEnabled(DeviceConfig{SoundCardName: doorOpenCard}, doorOpenPath, doorOpenSoundEn)
+		playSoundEnabled(DeviceConfig{SoundCardName: doorOpenCard}, doorOpenPath, doorOpenSoundEn, doorOpenBlocking)
 		if forcedAfter > 0 && warningCount >= forcedAfter && !doorForcedLatched {
 			fireEventWebhook(ctx, "door_forced", map[string]any{
 				"door_sensor_gpio":      sensorGPIO,
@@ -5554,6 +5680,21 @@ func playSoundAsyncEnabled(cfg DeviceConfig, path string, enabled bool) {
 	playSoundAsync(cfg, path)
 }
 
+// playSoundEnabled plays path when enabled is true, blocking until the sound
+// finishes when blocking is true (sync) or returning immediately when false
+// (async). This is the config-driven entry point: each sound's
+// sound_<name>_blocking setting selects its behaviour.
+func playSoundEnabled(cfg DeviceConfig, path string, enabled, blocking bool) {
+	if !enabled {
+		return
+	}
+	if blocking {
+		playSoundSync(cfg, path)
+		return
+	}
+	playSoundAsync(cfg, path)
+}
+
 // playSoundSync plays a WAV via ALSA aplay; blocks until finished (after queuing to the per-device player).
 func playSoundSync(cfg DeviceConfig, path string) {
 	if path == "" {
@@ -5618,14 +5759,35 @@ func pinDigitCount(pin string) int {
 }
 
 func notifyPinDisplay(ctx *AppContext, pin string) {
-	if ctx.PinDisplayDigits == nil {
-		return
-	}
 	n := pinDigitCount(pin)
-	select {
-	case ctx.PinDisplayDigits <- n:
-	default:
-		// Channel full or consumer gone; never block keypad on the display path.
+
+	// Local 20x4 LCD: non-blocking push of the masked digit count.
+	if ctx.PinDisplayDigits != nil {
+		select {
+		case ctx.PinDisplayDigits <- n:
+		default:
+			// Channel full or consumer gone; never block keypad on the display path.
+		}
+	}
+
+	// Remote framebuffer display (fb-virtualkeyz2): mirror the masked digit count
+	// so its PIN-entry screen fills in lockstep with the LCD. Async + allowlist-
+	// gated + no audit row, so this never blocks keypad input.
+	if n > 0 {
+		ctx.configMu.RLock()
+		pinLen := ctx.Config.PinLength
+		ctx.configMu.RUnlock()
+		if pinLen <= 0 {
+			pinLen = 6
+		}
+		postEventWebhook(ctx, "pin_progress", map[string]any{"entered": n, "length": pinLen})
+	} else {
+		// Buffer emptied — backspace-to-empty, clear, inter-digit/session timeout,
+		// or the post-submit reset. keypad_session_end returns the remote display
+		// to idle ONLY if it is currently on the PIN screen (the fb client guards
+		// this), so it clears a cleared entry but never repaints over an ACCESS
+		// GRANTED / DENIED result.
+		postEventWebhook(ctx, "keypad_session_end", map[string]any{})
 	}
 }
 
@@ -6178,8 +6340,13 @@ func runQRScannerListener(ctx *AppContext, devicePath string) {
 func startQRScannerListener(ctx *AppContext) {
 	for {
 		ctx.configMu.RLock()
+		enabled := ctx.Config.ScannerEnabled
 		path := strings.TrimSpace(ctx.Config.ScannerDevicePath)
 		ctx.configMu.RUnlock()
+		if !enabled {
+			log.Printf("INFO: QR scanner disabled via config (scanner_enabled=false); listener stopping.")
+			return
+		}
 		if path == "" {
 			path = "/dev/input/by-id/usb-YUREN_Yuren_HID_FS_Keyboard_SN_20190000-event-kbd"
 		}
@@ -6192,7 +6359,6 @@ func startQRScannerListener(ctx *AppContext) {
 // pinRejectWithStreak plays reject sound, increments wrong-PIN streak, fires webhook, optional buzzer/lockout.
 func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, buzzerBCM uint8, feedbackDelay time.Duration, webhookReason string, extra map[string]any) {
 	lcdRejectFromWebhookReason(ctx, webhookReason, keypadRole)
-	playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
 	ctx.pinFailMu.Lock()
 	ctx.pinFailSeq++
 	failCount := ctx.pinFailSeq
@@ -6201,7 +6367,11 @@ func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, 
 	for k, v := range extra {
 		wh[k] = v
 	}
+	// Fire the webhook BEFORE the (blocking) reject sound so remote displays
+	// (fb-virtualkeyz2) show ACCESS DENIED in sync with the LCD, not after the
+	// sound has finished playing.
 	fireEventWebhook(ctx, "pin_rejected", wh)
+	playSoundEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled, cfg.SoundPinRejectBlocking)
 	ctx.configMu.RLock()
 	buzzTh := ctx.Config.PinRejectBuzzerAfterAttempts
 	buzzDur := ctx.Config.BuzzerRelayPulseDuration
@@ -6236,7 +6406,10 @@ func (ctx *AppContext) pinRejectWithStreak(cfg DeviceConfig, keypadRole string, 
 			"lockout_enabled": lockOn,
 		})
 	}
-	time.Sleep(feedbackDelay)
+	// No feedback-delay sleep: it would block the keypad listener and delay
+	// re-entry after a rejection. The displays hold ACCESS DENIED on their own
+	// (LCD auto-idle + fb result hold), so return immediately and stay responsive.
+	_ = feedbackDelay
 }
 
 // grantDefaultModeDoorUnlockLikePIN performs the same unlock side effects as processPIN's default branch
@@ -6250,9 +6423,11 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 	ctx.noteDoorHoldExtraGrace(doorHoldExtra)
 	okSound := cfg.SoundPinOK
 	okEn := cfg.SoundPinOKEnabled
+	okBlocking := cfg.SoundPinOKBlocking
 	if credLabel == "exit_button" || credLabel == "entry_button" {
 		okSound = cfg.SoundAccessGranted
 		okEn = cfg.SoundAccessGrantedEnabled
+		okBlocking = cfg.SoundAccessGrantedBlocking
 	}
 	relPulsed := false
 	if ctx.FiremansServiceActive() {
@@ -6276,7 +6451,7 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 			fireEventWebhook(ctx, "hardware_actuation_failed", failWh)
 			log.Printf("ERROR: Door relay actuation failed (hardware_actuation_failed): %v", err)
 			lcdShowCommFail(ctx)
-			playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+			playSoundEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled, cfg.SoundPinRejectBlocking)
 			time.Sleep(feedbackDelay)
 			return false
 		}
@@ -6286,13 +6461,9 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 		log.Println("WARNING: GPIO unavailable; relay pulse skipped.")
 	}
 	lcdShowGranted(ctx, credLabel)
-	playSoundSyncEnabled(cfg, okSound, okEn)
-	if strings.TrimSpace(pin) != "" && !ctx.FiremansServiceActive() {
-		ctx.lightingEnergizeAndArmTimer(fmt.Sprintf("pin_accepted_%s", strings.TrimSpace(keypadRole)))
-	}
-	if pairedEntryPublishesToPeer(mode, cfg.PairPeerRole) {
-		publishMQTTPairPeerPulse(ctx, cfg)
-	}
+	// Fire the accepted webhook BEFORE the (blocking) welcome sound so remote
+	// displays (fb-virtualkeyz2) show ACCESS GRANTED in sync with the LCD, not
+	// after the sound has finished playing.
 	wh := map[string]any{
 		"operation_mode":   mode,
 		"keypad_role":      keypadRole,
@@ -6307,6 +6478,13 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 		wh[k] = v
 	}
 	fireEventWebhook(ctx, "pin_accepted", wh)
+	playSoundEnabled(cfg, okSound, okEn, okBlocking)
+	if strings.TrimSpace(pin) != "" && !ctx.FiremansServiceActive() {
+		ctx.lightingEnergizeAndArmTimer(fmt.Sprintf("pin_accepted_%s", strings.TrimSpace(keypadRole)))
+	}
+	if pairedEntryPublishesToPeer(mode, cfg.PairPeerRole) {
+		publishMQTTPairPeerPulse(ctx, cfg)
+	}
 	ctx.credentialRecordSuccessfulUse(pin, mode, keypadRole)
 	time.Sleep(feedbackDelay)
 	return true
@@ -6339,10 +6517,34 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		ctx.pinFailSeq = 0
 		ctx.pinFailMu.Unlock()
 		log.Printf("INFO: Keypad lockout cleared by override PIN (%s keypad).", keypadLogTag(keypadRole))
-		fireEventWebhook(ctx, "keypad_lockout_override", map[string]any{"keypad_role": keypadRole})
+		// The override/master PIN also opens the door, unless fireman's service
+		// is holding the relays off.
+		relPulsed := false
+		if ctx.FiremansServiceActive() {
+			log.Printf("DEBUG: Fireman's service active: override PIN door pulse suppressed.")
+		} else if ctx.GPIO != nil {
+			if err := ctx.GPIO.ActionPulseBlocking("door", cfg.RelayPulseDuration); err != nil {
+				log.Printf("ERROR: Override PIN door relay actuation failed: %v", err)
+				fireEventWebhook(ctx, "hardware_actuation_failed", map[string]any{
+					"keypad_role": keypadRole, "door_relay_gpio": int(doorBCM), "error": err.Error(), "reason": "override_pin",
+				})
+			} else {
+				relPulsed = true
+				ctx.pulseAuthorizedAccessAuxRelays(cfg)
+			}
+		} else {
+			log.Println("WARNING: GPIO unavailable; override PIN door pulse skipped.")
+		}
+		fireEventWebhook(ctx, "keypad_lockout_override", map[string]any{
+			"keypad_role":     keypadRole,
+			"relay_pulsed":    relPulsed,
+			"door_relay_gpio": int(doorBCM),
+		})
 		lcdEnqueueFullSync(ctx, lcdLinesIdle(), 0)
-		playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
-		time.Sleep(feedbackDelay)
+		playSoundEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled, cfg.SoundPinOKBlocking)
+		// No feedback-delay sleep: keep the keypad responsive (the display holds
+		// the override result on its own).
+		_ = feedbackDelay
 		return
 	}
 
@@ -6350,7 +6552,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		log.Printf("INFO: PIN rejected (keypad lockout; %s keypad).", keypadLogTag(keypadRole))
 		lcdShowKeypadLockout(ctx)
 		fireEventWebhook(ctx, "pin_rejected", map[string]any{"reason": "keypad_lockout", "keypad_role": keypadRole})
-		playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+		playSoundEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled, cfg.SoundPinRejectBlocking)
 		time.Sleep(feedbackDelay)
 		return
 	}
@@ -6421,7 +6623,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 				log.Printf("INFO: PIN accepted (elevator wait-floor; fireman's service; %s keypad; credential=%s); software enable/dispatch relays not used (cab_sense=%s).", kTag, credTag, cabSense)
 				log.Printf("DEBUG: Fireman's service: elevator_wait_floor_buttons — skipping enable relay window and floor selection handler state.")
 				lcdShowGranted(ctx, credTag)
-				playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+				playSoundEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled, cfg.SoundPinOKBlocking)
 				fireEventWebhook(ctx, "pin_accepted", map[string]any{
 					"operation_mode":                mode,
 					"keypad_role":                   keypadRole,
@@ -6440,7 +6642,7 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			ctx.elevatorMu.Unlock()
 			log.Printf("INFO: PIN accepted (elevator wait-floor; %s keypad; credential=%s); enable window started (cab_sense=%s).", kTag, credTag, cabSense)
 			lcdShowGranted(ctx, credTag)
-			playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+			playSoundEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled, cfg.SoundPinOKBlocking)
 			startElevatorFloorWaitGrant(ctx, cfg)
 			fireEventWebhook(ctx, "pin_accepted", map[string]any{
 				"operation_mode":                mode,
@@ -6471,13 +6673,13 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 					denyEx["elevator_floor_label"] = elevatorFloorLogLabel(ctx.DB, elevDenyID, aclIdx)
 				}
 				lcdShowElevatorFloorDeny(ctx)
-				playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+				playSoundEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled, cfg.SoundPinRejectBlocking)
 				fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
 				time.Sleep(feedbackDelay)
 				return
 			}
 			lcdShowGranted(ctx, credTag)
-			playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+			playSoundEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled, cfg.SoundPinOKBlocking)
 			wh := map[string]any{
 				"operation_mode":   mode,
 				"keypad_role":      keypadRole,
@@ -6620,7 +6822,7 @@ func (ctx *AppContext) grantStaticTestQRAccess(cfg DeviceConfig) {
 			log.Printf("INFO: Static test QR accepted (elevator wait-floor; fireman's service; %s; credential=%s); software relays not used (cab_sense=%s).", kTag, credTag, cabSense)
 			log.Printf("DEBUG: Fireman's service: elevator_wait_floor_buttons — skipping enable relay window (static test QR).")
 			lcdShowGranted(ctx, credTag)
-			playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+			playSoundEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled, cfg.SoundPinOKBlocking)
 			wh := map[string]any{
 				"operation_mode":                mode,
 				"keypad_role":                   keypadRole,
@@ -6644,7 +6846,7 @@ func (ctx *AppContext) grantStaticTestQRAccess(cfg DeviceConfig) {
 		ctx.elevatorMu.Unlock()
 		log.Printf("INFO: Static test QR accepted (elevator wait-floor; %s; credential=%s); enable window started (cab_sense=%s).", kTag, credTag, cabSense)
 		lcdShowGranted(ctx, credTag)
-		playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+		playSoundEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled, cfg.SoundPinOKBlocking)
 		startElevatorFloorWaitGrant(ctx, cfg)
 		wh := map[string]any{
 			"operation_mode":                mode,
@@ -6682,13 +6884,13 @@ func (ctx *AppContext) grantStaticTestQRAccess(cfg DeviceConfig) {
 				denyEx["elevator_floor_label"] = elevatorFloorLogLabel(ctx.DB, elevDenyID, aclIdx)
 			}
 			lcdShowElevatorFloorDeny(ctx)
-			playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+			playSoundEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled, cfg.SoundPinRejectBlocking)
 			fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
 			time.Sleep(feedbackDelay)
 			return
 		}
 		lcdShowGranted(ctx, credTag)
-		playSoundSyncEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled)
+		playSoundEnabled(cfg, cfg.SoundPinOK, cfg.SoundPinOKEnabled, cfg.SoundPinOKBlocking)
 		wh := map[string]any{
 			"operation_mode":   mode,
 			"keypad_role":      keypadRole,
@@ -7004,27 +7206,38 @@ var techMenuCfgKeysForCompletion = []string{
 	"relay_output_mode",
 	"relay_pulse_duration",
 	"sound_access_granted",
+	"sound_access_granted_blocking",
 	"sound_access_granted_enabled",
 	"sound_card_name",
 	"sound_door_open",
+	"sound_door_open_blocking",
 	"sound_door_open_enabled",
 	"sound_firemans_activated",
+	"sound_firemans_activated_blocking",
 	"sound_firemans_activated_enabled",
 	"sound_firemans_deactivated",
+	"sound_firemans_deactivated_blocking",
 	"sound_firemans_deactivated_enabled",
 	"sound_keypress",
+	"sound_keypress_blocking",
 	"sound_keypress_enabled",
 	"sound_lighting_timer_expired",
+	"sound_lighting_timer_expired_blocking",
 	"sound_lighting_timer_expired_enabled",
 	"sound_lighting_timer_set",
+	"sound_lighting_timer_set_blocking",
 	"sound_lighting_timer_set_enabled",
 	"sound_pin_ok",
+	"sound_pin_ok_blocking",
 	"sound_pin_ok_enabled",
 	"sound_pin_reject",
+	"sound_pin_reject_blocking",
 	"sound_pin_reject_enabled",
 	"sound_shutdown",
+	"sound_shutdown_blocking",
 	"sound_shutdown_enabled",
 	"sound_startup",
+	"sound_startup_blocking",
 	"sound_startup_enabled",
 	"tamper_switch_active_low",
 	"tamper_switch_pin",
@@ -7530,14 +7743,14 @@ func runTechnicianMenu(ctx *AppContext, shutdownNotify chan<- struct{}) {
 			ctx.configMu.RLock()
 			cfg8 := ctx.Config
 			ctx.configMu.RUnlock()
-			playSoundSyncEnabled(cfg8, cfg8.SoundKeypress, cfg8.SoundKeypressEnabled)
+			playSoundEnabled(cfg8, cfg8.SoundKeypress, cfg8.SoundKeypressEnabled, cfg8.SoundKeypressBlocking)
 			techMenuSyncPrint(func(w io.Writer) { fmt.Fprintln(w, "Sound finished (key.wav).") })
 		case "9":
 			log.Println("INFO: Technician menu: playing PIN OK sound test.")
 			ctx.configMu.RLock()
 			cfg9 := ctx.Config
 			ctx.configMu.RUnlock()
-			playSoundSyncEnabled(cfg9, cfg9.SoundPinOK, cfg9.SoundPinOKEnabled)
+			playSoundEnabled(cfg9, cfg9.SoundPinOK, cfg9.SoundPinOKEnabled, cfg9.SoundPinOKBlocking)
 			techMenuSyncPrint(func(w io.Writer) { fmt.Fprintln(w, "Sound finished (pin_ok).") })
 		case "i":
 			techMenuSyncPrint(func(w io.Writer) { techMenuWriteNetworkDiag(w) })
@@ -7737,6 +7950,7 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  keypad_evdev_path: %q\n", c.KeypadEvdevPath)
 	fmt.Fprintf(w, "  keypad_exit_evdev_path: %q\n", c.KeypadExitEvdevPath)
 	fmt.Fprintf(w, "  scanner_device_path: %q\n", c.ScannerDevicePath)
+	fmt.Fprintf(w, "  scanner_enabled: %v\n", c.ScannerEnabled)
 	fmt.Fprintf(w, "  max_devices_per_user: %d\n", c.MaxDevicesPerUser)
 	fmt.Fprintf(w, "  qr_time_window_seconds: %d\n", c.QRTimeWindowSeconds)
 	if strings.TrimSpace(c.StaticTestQRCode) != "" {
@@ -7815,11 +8029,22 @@ func techMenuShowConfig(w io.Writer, ctx *AppContext) {
 	fmt.Fprintf(w, "  sound_lighting_timer_set_enabled: %v\n", c.SoundLightingTimerSetEnabled)
 	fmt.Fprintf(w, "  sound_lighting_timer_expired_enabled: %v\n", c.SoundLightingTimerExpiredEnabled)
 	fmt.Fprintf(w, "  sound_door_open_enabled: %v\n", c.SoundDoorOpenEnabled)
+	fmt.Fprintf(w, "  sound_startup_blocking: %v\n", c.SoundStartupBlocking)
+	fmt.Fprintf(w, "  sound_shutdown_blocking: %v\n", c.SoundShutdownBlocking)
+	fmt.Fprintf(w, "  sound_pin_ok_blocking: %v\n", c.SoundPinOKBlocking)
+	fmt.Fprintf(w, "  sound_access_granted_blocking: %v\n", c.SoundAccessGrantedBlocking)
+	fmt.Fprintf(w, "  sound_pin_reject_blocking: %v\n", c.SoundPinRejectBlocking)
+	fmt.Fprintf(w, "  sound_keypress_blocking: %v\n", c.SoundKeypressBlocking)
+	fmt.Fprintf(w, "  sound_lighting_timer_set_blocking: %v\n", c.SoundLightingTimerSetBlocking)
+	fmt.Fprintf(w, "  sound_lighting_timer_expired_blocking: %v\n", c.SoundLightingTimerExpiredBlocking)
+	fmt.Fprintf(w, "  sound_door_open_blocking: %v\n", c.SoundDoorOpenBlocking)
 	fmt.Fprintf(w, "  firemans_service_enabled: %v\n", c.FiremansServiceEnabled)
 	fmt.Fprintf(w, "  sound_firemans_activated: %q\n", c.SoundFiremansActivated)
 	fmt.Fprintf(w, "  sound_firemans_deactivated: %q\n", c.SoundFiremansDeactivated)
 	fmt.Fprintf(w, "  sound_firemans_activated_enabled: %v\n", c.SoundFiremansActivatedEnabled)
 	fmt.Fprintf(w, "  sound_firemans_deactivated_enabled: %v\n", c.SoundFiremansDeactivatedEnabled)
+	fmt.Fprintf(w, "  sound_firemans_activated_blocking: %v\n", c.SoundFiremansActivatedBlocking)
+	fmt.Fprintf(w, "  sound_firemans_deactivated_blocking: %v\n", c.SoundFiremansDeactivatedBlocking)
 	fmt.Fprintf(w, "  firemans_service_runtime_active: %v\n", ctx.FiremansServiceActive())
 	fmt.Fprintf(w, "\n--- MQTT ---\n")
 	fmt.Fprintf(w, "  mqtt_enabled: %v\n", c.MQTTEnabled)
@@ -9009,6 +9234,7 @@ func (ctx *AppContext) lightingEnergizeAndArmTimer(reason string) {
 	setPath := strings.TrimSpace(ctx.Config.SoundLightingTimerSet)
 	soundCard := ctx.Config.SoundCardName
 	setEn := ctx.Config.SoundLightingTimerSetEnabled
+	setBlocking := ctx.Config.SoundLightingTimerSetBlocking
 	ctx.configMu.RUnlock()
 
 	ctx.lightingMu.Lock()
@@ -9031,8 +9257,21 @@ func (ctx *AppContext) lightingEnergizeAndArmTimer(reason string) {
 	})
 	ctx.lightingMu.Unlock()
 
+	// Notify remote displays (fb-virtualkeyz2): lights are on and the auto-off
+	// timer was (re)armed to the full duration. timeout_seconds lets the display
+	// show a countdown until the light turns off. Sent on both energize and
+	// reload so the countdown resets whenever a button/PIN extends the timer.
+	lightsWh := map[string]any{"reason": reason, "timeout_seconds": int(timeout.Seconds())}
+	if hadRunningTimer {
+		// Timer extended while already on — refresh the remote countdown only,
+		// without an audit-log row (the relay did not change state).
+		postEventWebhook(ctx, "lights_on", lightsWh)
+	} else {
+		// Genuine OFF -> ON transition.
+		fireEventWebhook(ctx, "lights_on", lightsWh)
+	}
 	log.Printf("DEBUG: Lighting: auto-off timer armed for %s [%s] gen=%d.", timeout, reason, gen)
-	playSoundAsyncEnabled(DeviceConfig{SoundCardName: soundCard}, setPath, setEn)
+	playSoundEnabled(DeviceConfig{SoundCardName: soundCard}, setPath, setEn, setBlocking)
 }
 
 func (ctx *AppContext) lightingTimerExpired(gen uint64) {
@@ -9050,13 +9289,17 @@ func (ctx *AppContext) lightingTimerExpired(gen uint64) {
 	}
 	ctx.lightingMu.Unlock()
 
+	// Relay de-energized. Notify remote displays (fb-virtualkeyz2) so the bulb
+	// icon turns off.
+	fireEventWebhook(ctx, "lights_off", map[string]any{"reason": "timer_expired"})
 	log.Printf("DEBUG: Lighting: relay OFF after lighting_timeout (gen=%d).", gen)
 	ctx.configMu.RLock()
 	expPath := strings.TrimSpace(ctx.Config.SoundLightingTimerExpired)
 	soundCard := ctx.Config.SoundCardName
 	expEn := ctx.Config.SoundLightingTimerExpiredEnabled
+	expBlocking := ctx.Config.SoundLightingTimerExpiredBlocking
 	ctx.configMu.RUnlock()
-	playSoundAsyncEnabled(DeviceConfig{SoundCardName: soundCard}, expPath, expEn)
+	playSoundEnabled(DeviceConfig{SoundCardName: soundCard}, expPath, expEn, expBlocking)
 }
 
 func (ctx *AppContext) lightingManualButtonPressed() {
@@ -9434,7 +9677,7 @@ func (ctx *AppContext) runFiremansServiceEnter(reason string) {
 	ctx.configMu.RLock()
 	cfg := ctx.Config
 	ctx.configMu.RUnlock()
-	playSoundAsyncEnabled(cfg, cfg.SoundFiremansActivated, cfg.SoundFiremansActivatedEnabled)
+	playSoundEnabled(cfg, cfg.SoundFiremansActivated, cfg.SoundFiremansActivatedEnabled, cfg.SoundFiremansActivatedBlocking)
 	fireEventWebhook(ctx, "firemans_service_activated", map[string]any{"reason": reason})
 	lcdShowFiremans(ctx, true)
 }
@@ -9452,7 +9695,7 @@ func (ctx *AppContext) runFiremansServiceExit(reason string) {
 	ctx.configMu.RLock()
 	cfg := ctx.Config
 	ctx.configMu.RUnlock()
-	playSoundAsyncEnabled(cfg, cfg.SoundFiremansDeactivated, cfg.SoundFiremansDeactivatedEnabled)
+	playSoundEnabled(cfg, cfg.SoundFiremansDeactivated, cfg.SoundFiremansDeactivatedEnabled, cfg.SoundFiremansDeactivatedBlocking)
 	fireEventWebhook(ctx, "firemans_service_deactivated", map[string]any{"reason": reason})
 	lcdShowFiremans(ctx, false)
 }
@@ -9792,7 +10035,7 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 				log.Printf("INFO: Elevator cab floor input(s) rejected (not permitted for credential or schedule): %v", deniedIndices)
 			}
 			lcdShowElevatorFloorDeny(ctx)
-			playSoundSyncEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled)
+			playSoundEnabled(cfg, cfg.SoundPinReject, cfg.SoundPinRejectEnabled, cfg.SoundPinRejectBlocking)
 			elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
 			denyEx := map[string]any{
 				"operation_mode":             mode,

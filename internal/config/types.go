@@ -13,46 +13,46 @@ type LCDDisplaySettings struct {
 
 // GPIOSettings holds BCM pin numbers and relay polarity (wiring on the Pi).
 type GPIOSettings struct {
-	RelayOutputMode string
-	MCP23017I2CBus  int
-	MCP23017I2CAddr uint8
-	XL9535I2CBus    int
-	XL9535I2CAddr   uint8
+	RelayOutputMode      string
+	MCP23017I2CBus       int
+	MCP23017I2CAddr      uint8
+	XL9535I2CBus         int
+	XL9535I2CAddr        uint8
 	I2CBusRecoverySCLBCM uint8
 
-	DoorRelayPin         uint8
-	DoorRelayActiveLow   bool
-	BuzzerRelayPin       uint8
-	BuzzerRelayActiveLow bool
-	DoorSensorPin        uint8
-	HeartbeatLEDPin      uint8
-	ExitButtonPin        uint8
-	ExitButtonActiveLow  bool
-	EntryButtonPin       uint8
-	EntryButtonActiveLow bool
-	ElevatorDispatchRelayPin  uint8
-	ElevatorDispatchActiveLow bool
-	ElevatorEnableRelayPin    uint8
-	ElevatorEnableActiveLow   bool
-	ElevatorFloorDispatchPins string
-	ElevatorWaitFloorEnablePins string
-	ElevatorPredefinedEnablePins string
-	LightingButtonPin        uint8
-	LightingButtonActiveLow  bool
-	LightingRelayPin         uint8
-	LightingRelayActiveLow   bool
-	FiremansServiceInputPin  uint8
-	FiremansServiceActiveLow bool
+	DoorRelayPin                        uint8
+	DoorRelayActiveLow                  bool
+	BuzzerRelayPin                      uint8
+	BuzzerRelayActiveLow                bool
+	DoorSensorPin                       uint8
+	HeartbeatLEDPin                     uint8
+	ExitButtonPin                       uint8
+	ExitButtonActiveLow                 bool
+	EntryButtonPin                      uint8
+	EntryButtonActiveLow                bool
+	ElevatorDispatchRelayPin            uint8
+	ElevatorDispatchActiveLow           bool
+	ElevatorEnableRelayPin              uint8
+	ElevatorEnableActiveLow             bool
+	ElevatorFloorDispatchPins           string
+	ElevatorWaitFloorEnablePins         string
+	ElevatorPredefinedEnablePins        string
+	LightingButtonPin                   uint8
+	LightingButtonActiveLow             bool
+	LightingRelayPin                    uint8
+	LightingRelayActiveLow              bool
+	FiremansServiceInputPin             uint8
+	FiremansServiceActiveLow            bool
 	AutomaticDoorOperatorRelayPin       uint8
 	AutomaticDoorOperatorRelayActiveLow bool
 	IntercomCameraTriggerRelayPin       uint8
 	IntercomCameraTriggerRelayActiveLow bool
-	FireAlarmInterfacePin       uint8
-	FireAlarmInterfaceActiveLow   bool
-	TamperSwitchPin             uint8
-	TamperSwitchActiveLow       bool
-	MotionSensorPin             uint8
-	MotionSensorActiveLow       bool
+	FireAlarmInterfacePin               uint8
+	FireAlarmInterfaceActiveLow         bool
+	TamperSwitchPin                     uint8
+	TamperSwitchActiveLow               bool
+	MotionSensorPin                     uint8
+	MotionSensorActiveLow               bool
 }
 
 // WebhookEventEndpoint is one HTTP destination for JSON event webhooks.
@@ -66,22 +66,22 @@ type WebhookEventEndpoint struct {
 
 // DeviceConfig represents configurable parameters (loaded from SQLite/Central Server).
 type DeviceConfig struct {
-	HeartbeatInterval    time.Duration
-	DoorOpenWarningAfter time.Duration
-	DoorOpenAlarmInterval time.Duration
-	DoorOpenAlarmMaxCount int
-	DoorForcedAfterWarnings int
-	DoorSensorClosedIsLow bool
-	SoundCardName         string
-	SoundStartup          string
-	SoundShutdown         string
-	SoundPinOK            string
-	SoundAccessGranted    string
-	SoundPinReject        string
-	SoundKeypress         string
-	SoundLightingTimerSet string
+	HeartbeatInterval         time.Duration
+	DoorOpenWarningAfter      time.Duration
+	DoorOpenAlarmInterval     time.Duration
+	DoorOpenAlarmMaxCount     int
+	DoorForcedAfterWarnings   int
+	DoorSensorClosedIsLow     bool
+	SoundCardName             string
+	SoundStartup              string
+	SoundShutdown             string
+	SoundPinOK                string
+	SoundAccessGranted        string
+	SoundPinReject            string
+	SoundKeypress             string
+	SoundLightingTimerSet     string
 	SoundLightingTimerExpired string
-	SoundDoorOpen         string
+	SoundDoorOpen             string
 
 	SoundStartupEnabled              bool
 	SoundShutdownEnabled             bool
@@ -93,22 +93,33 @@ type DeviceConfig struct {
 	SoundLightingTimerExpiredEnabled bool
 	SoundDoorOpenEnabled             bool
 
-	LogLevel              string
-	PinLength             int
-	RelayPulseDuration    time.Duration
+	// Per-sound blocking (sync) vs non-blocking (async) playback.
+	SoundStartupBlocking              bool
+	SoundShutdownBlocking             bool
+	SoundPinOKBlocking                bool
+	SoundAccessGrantedBlocking        bool
+	SoundPinRejectBlocking            bool
+	SoundKeypressBlocking             bool
+	SoundLightingTimerSetBlocking     bool
+	SoundLightingTimerExpiredBlocking bool
+	SoundDoorOpenBlocking             bool
+
+	LogLevel                           string
+	PinLength                          int
+	RelayPulseDuration                 time.Duration
 	AutomaticDoorOperatorPulseDuration time.Duration
 	IntercomCameraTriggerPulseDuration time.Duration
-	PinRejectBuzzerAfterAttempts int
-	BuzzerRelayPulseDuration     time.Duration
+	PinRejectBuzzerAfterAttempts       int
+	BuzzerRelayPulseDuration           time.Duration
 
-	MQTTEnabled      bool
-	MQTTBroker       string
-	MQTTClientID     string
-	MQTTUsername     string
-	MQTTPassword     string
-	MQTTCommandTopic string
-	MQTTStatusTopic  string
-	MQTTCommandToken string
+	MQTTEnabled        bool
+	MQTTBroker         string
+	MQTTClientID       string
+	MQTTUsername       string
+	MQTTPassword       string
+	MQTTCommandTopic   string
+	MQTTStatusTopic    string
+	MQTTCommandToken   string
 	TechMenuHistoryMax int
 
 	KeypadInterDigitTimeout time.Duration
@@ -120,42 +131,43 @@ type DeviceConfig struct {
 	PinLockoutOverridePin   string
 	FallbackAccessPin       string
 
-	WebhookEventEnabled      bool
-	WebhookEventURL          string
-	WebhookEventTokenEnabled bool
-	WebhookEventToken        string
-	WebhookEventTypes        map[string]bool
-	WebhookEventEndpoints    []WebhookEventEndpoint
-	WebhookHeartbeatEnabled      bool
-	WebhookHeartbeatURL          string
-	WebhookHeartbeatTokenEnabled bool
-	WebhookHeartbeatToken        string
-	WebhookHTTPTimeout           time.Duration
-	WebhookMaxConcurrent         int
-	WebhookCircuitBreakerEnabled bool
+	WebhookEventEnabled            bool
+	WebhookEventURL                string
+	WebhookEventTokenEnabled       bool
+	WebhookEventToken              string
+	WebhookEventTypes              map[string]bool
+	WebhookEventEndpoints          []WebhookEventEndpoint
+	WebhookHeartbeatEnabled        bool
+	WebhookHeartbeatURL            string
+	WebhookHeartbeatTokenEnabled   bool
+	WebhookHeartbeatToken          string
+	WebhookHTTPTimeout             time.Duration
+	WebhookMaxConcurrent           int
+	WebhookCircuitBreakerEnabled   bool
 	WebhookCircuitFailureThreshold int
-	WebhookCircuitOpenDuration   time.Duration
+	WebhookCircuitOpenDuration     time.Duration
 
-	KeypadOperationMode string
-	KeypadEvdevPath     string
-	KeypadExitEvdevPath string
-	ScannerDevicePath   string
-	MaxDevicesPerUser   int
-	QRTimeWindowSeconds int
-	StaticTestQRCode    string
-	StaticTestQRCodeEnabled bool
-	PairPeerRole        string
-	MQTTPairPeerTopic   string
-	PairPeerToken       string
-	ElevatorFloorWaitTimeout time.Duration
-	ElevatorWaitFloorCabSense string
-	ElevatorFloorInputPins    string
-	ElevatorPredefinedFloor   int
-	ElevatorPredefinedFloors  []int
-	ElevatorDispatchPulseDuration time.Duration
+	KeypadOperationMode                 string
+	KeypadEvdevPath                     string
+	KeypadExitEvdevPath                 string
+	ScannerDevicePath                   string
+	ScannerEnabled                      bool
+	MaxDevicesPerUser                   int
+	QRTimeWindowSeconds                 int
+	StaticTestQRCode                    string
+	StaticTestQRCodeEnabled             bool
+	PairPeerRole                        string
+	MQTTPairPeerTopic                   string
+	PairPeerToken                       string
+	ElevatorFloorWaitTimeout            time.Duration
+	ElevatorWaitFloorCabSense           string
+	ElevatorFloorInputPins              string
+	ElevatorPredefinedFloor             int
+	ElevatorPredefinedFloors            []int
+	ElevatorDispatchPulseDuration       time.Duration
 	ElevatorFloorDispatchPulseDurations []time.Duration
-	ElevatorEnablePulseDuration time.Duration
-	DualKeypadRejectExitWithoutEntry bool
+	ElevatorEnablePulseDuration         time.Duration
+	DualKeypadRejectExitWithoutEntry    bool
 
 	AccessControlDoorID              string
 	AccessControlElevatorID          string
@@ -166,9 +178,11 @@ type DeviceConfig struct {
 
 	LCDDisplay LCDDisplaySettings
 
-	FiremansServiceEnabled bool
-	SoundFiremansActivated          string
-	SoundFiremansDeactivated        string
-	SoundFiremansActivatedEnabled   bool
-	SoundFiremansDeactivatedEnabled bool
+	FiremansServiceEnabled           bool
+	SoundFiremansActivated           string
+	SoundFiremansDeactivated         string
+	SoundFiremansActivatedEnabled    bool
+	SoundFiremansDeactivatedEnabled  bool
+	SoundFiremansActivatedBlocking   bool
+	SoundFiremansDeactivatedBlocking bool
 }
