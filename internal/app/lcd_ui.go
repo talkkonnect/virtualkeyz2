@@ -118,6 +118,28 @@ func lcdLinesDenied(line2, line3, line4 string) [4]string {
 	}
 }
 
+func lcdLinesDoorbell() [4]string {
+	return [4]string{
+		lcdCenterRow("Doorbell"),
+		lcdCenterRow("Please Wait..."),
+		strings.Repeat(" ", lcdCols),
+		strings.Repeat(" ", lcdCols),
+	}
+}
+
+func lcdLinesLatch(on bool) [4]string {
+	l1, l2 := "Door Unlatched", "Door Locked"
+	if on {
+		l1, l2 = "Door Latched", "Stays Unlocked"
+	}
+	return [4]string{
+		lcdCenterRow(l1),
+		lcdCenterRow(l2),
+		strings.Repeat(" ", lcdCols),
+		strings.Repeat(" ", lcdCols),
+	}
+}
+
 func lcdLinesDoorHeld() [4]string {
 	return [4]string{
 		lcdCenterRow("Door Held Open"),
@@ -349,6 +371,8 @@ func lcdRejectFromWebhookReason(ctx *AppContext, reason, keypadRole string) {
 		lcdEnqueueFullSync(ctx, lcdLinesDenied("No Permission", "", ""), lcdAutoIdleAfter)
 	case "invalid_pin":
 		lcdEnqueueFullSync(ctx, lcdLinesWrongPassword(), lcdAutoIdleAfter)
+	case "invalid_function_code":
+		lcdEnqueueFullSync(ctx, lcdLinesDenied("Invalid Code", "", ""), lcdAutoIdleAfter)
 	case "credential_lifecycle", "qr_unknown_device_uuid", "qr_parse_failed",
 		"qr_static_test_mismatch", "qr_static_test_not_configured", "qr_timestamp_outside_window":
 		lcdShowInvalidCard(ctx)

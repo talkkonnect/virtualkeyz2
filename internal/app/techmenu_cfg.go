@@ -215,6 +215,12 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   sound_lighting_timer_set_enabled  true|false
   sound_lighting_timer_expired_enabled true|false
   sound_door_open_enabled           true|false
+  sound_doorbell                    WAV path (Enter on an empty keypad buffer, keypad_doorbell_enabled)
+  sound_doorbell_enabled            true|false
+  sound_doorbell_blocking           true|false
+  sound_cancel                      WAV path (keypad Cancel key clears the entry)
+  sound_cancel_enabled              true|false
+  sound_cancel_blocking             true|false
   firemans_service_enabled          true|false — master enable for fireman's / emergency bypass (GPIO, MQTT, or menu)
   sound_firemans_activated          WAV when emergency bypass turns ON
   sound_firemans_deactivated        WAV when emergency bypass turns OFF
@@ -231,6 +237,14 @@ Settable keys (snake_case, same as virtualkeyz2.json):
   tech_menu_history_max             default 100, max 10000
   keypad_inter_digit_timeout        3s–10s, default 5s
   keypad_session_timeout            10s–60s from first digit, default 30s
+  keypad_doorbell_enabled           true|false Enter with nothing typed rings the doorbell (default false)
+  keypad_doorbell_cooldown          min time between doorbell rings, default 10s
+  keypad_function_codes_enabled     true|false "<code> Space <PIN>": 1=extended hold, 2=latch, elevator wait-floor: floor index
+  keypad_fn_extended_pulse          door relay pulse for code 1, 1s–60s, default 15s
+  keypad_fn_extended_hold_extra     extra door-open grace for code 1, default 30s
+  keypad_fn_latch_enabled           true|false allow code 2 door latch toggle (default false)
+  keypad_fn_latch_max               latch auto-release, default 12h
+  keypad_fn_duress_code             1-2 digit duress code (e.g. 99): grants normally + silent duress_alarm (empty=disabled)
   lighting_timeout                  lighting relay hold after manual button or accepted PIN (default 30m; each resets full duration; relay off only when timer expires)
   lcd_display_enabled               true|false enable I2C HD44780 20x4 (see device.lcd_display JSON block)
   lcd_i2c_bus                       Linux I2C bus number (default 1 → /dev/i2c-1)

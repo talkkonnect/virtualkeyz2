@@ -64,6 +64,27 @@ func notifyPinDisplay(ctx *AppContext, pin string) {
 	}
 }
 
+// notifyKeypadEntry mirrors a keypad buffer on the displays: only the PIN digits after a
+// "<code> " function-code prefix are counted. While the PIN part is still empty after the
+// separator nothing is sent, so the displays stay on the PIN screen (a 0 count ends the session).
+func notifyKeypadEntry(ctx *AppContext, buf string) {
+	pin := keypadEntryPINPart(buf)
+	if buf != "" && pin == "" {
+		return
+	}
+	notifyPinDisplay(ctx, pin)
+}
+
+// isKeypadCancelKey reports whether code is the keypad's Cancel key. Keypads differ in
+// what they send for it; check with evtest.
+func isKeypadCancelKey(code uint16) bool {
+	switch code {
+	case evdev.KEY_ESC, evdev.KEY_DELETE, evdev.KEY_CANCEL:
+		return true
+	}
+	return false
+}
+
 // Use evtest in linux to test the capabilities of the keypad.
 // keypadRole is "entry", "exit", or "" for single-keypad modes (used in logs, webhooks, and dual-keypad setups).
 // keypadKeyChars maps PIN keypad key codes to {character, name used in the DEBUG log}.
@@ -215,22 +236,43 @@ func runKeypadListener(ctx *AppContext, dev *evdev.InputDevice, devicePath, keyp
 					char = kc[0]
 					debugf("[%s keypad] %s pressed", kpLog, kc[1])
 				}
-				switch ke.Scancode {
-				case evdev.KEY_BACKSPACE:
+				switch {
+				case ke.Scancode == evdev.KEY_BACKSPACE:
 					if len(pinBuffer) > 0 {
 						pinBuffer = pinBuffer[:len(pinBuffer)-1]
 						if len(pinBuffer) == 0 {
 							drainTimer(sessionTimer)
 						}
 					}
-					notifyPinDisplay(ctx, pinBuffer)
-				case evdev.KEY_KPENTER, evdev.KEY_ENTER:
+					notifyKeypadEntry(ctx, pinBuffer)
+				case ke.Scancode == evdev.KEY_SPACE:
+					// Function-code separator: "<code> <PIN>" (keypad_fn.go).
+					if keypadSpaceAllowed(pinBuffer) {
+						debugf("[%s keypad] space pressed (function code separator)", kpLog)
+						pinBuffer += " "
+					}
+				case isKeypadCancelKey(ke.Scancode):
+					if pinBuffer != "" {
+						log.Printf("INFO: PIN entry cancelled (%s keypad).", kpLog)
+						pinBuffer = ""
+						stopEntryTimers()
+						notifyPinDisplay(ctx, pinBuffer)
+						ctx.configMu.RLock()
+						cfg := ctx.Config
+						ctx.configMu.RUnlock()
+						ctx.playFeedbackSound(keypadRole, cfg, cfg.SoundCancel, cfg.SoundCancelEnabled, cfg.SoundCancelBlocking)
+					}
+				case ke.Scancode == evdev.KEY_KPENTER || ke.Scancode == evdev.KEY_ENTER:
+					if pinBuffer == "" {
+						ctx.ringDoorbell(keypadRole)
+						continue
+					}
 					log.Printf("INFO: PIN submission initiated (%s keypad).", kpLog)
-					processPIN(ctx, pinBuffer, keypadRole)
+					processKeypadEntry(ctx, pinBuffer, keypadRole)
 					pinBuffer = ""
 					stopEntryTimers()
 					notifyPinDisplay(ctx, pinBuffer)
-				case evdev.KEY_KPASTERISK:
+				case ke.Scancode == evdev.KEY_KPASTERISK:
 					log.Printf("INFO: 'Call for Help' triggered via USB keypad (%s).", kpLog)
 					triggerCallForHelp(ctx)
 					pinBuffer = ""
@@ -244,14 +286,16 @@ func runKeypadListener(ctx *AppContext, dev *evdev.InputDevice, devicePath, keyp
 					if wasEmpty {
 						startSessionFromFirstDigit()
 					}
-					notifyPinDisplay(ctx, pinBuffer)
+					notifyKeypadEntry(ctx, pinBuffer)
 
 					ctx.configMu.RLock()
 					pinLen := ctx.Config.PinLength
 					ctx.configMu.RUnlock()
-					if pinLen > 0 && len(pinBuffer) >= pinLen && isAllDigits(pinBuffer) {
+					// With a "<code> " prefix only the PIN digits count toward pin_length.
+					pinPart := keypadEntryPINPart(pinBuffer)
+					if pinLen > 0 && len(pinPart) >= pinLen && isAllDigits(pinPart) {
 						log.Printf("INFO: PIN auto-submitted after %d digits (%s keypad).", pinLen, kpLog)
-						processPIN(ctx, pinBuffer, keypadRole)
+						processKeypadEntry(ctx, pinBuffer, keypadRole)
 						pinBuffer = ""
 						stopEntryTimers()
 						notifyPinDisplay(ctx, pinBuffer)

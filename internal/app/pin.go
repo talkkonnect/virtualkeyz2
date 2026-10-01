@@ -154,6 +154,19 @@ func (ctx *AppContext) grantDefaultModeDoorUnlockLikePIN(pin string, cfg DeviceC
 }
 
 func processPIN(ctx *AppContext, pin string, keypadRole string) {
+	processPINOpts(ctx, pin, keypadRole, pinOpts{})
+}
+
+// processKeypadEntry submits a USB keypad buffer, which may carry a "<code> <PIN>" function code.
+func processKeypadEntry(ctx *AppContext, buf string, keypadRole string) {
+	ctx.configMu.RLock()
+	cfg := ctx.Config
+	ctx.configMu.RUnlock()
+	pin, opts := resolveKeypadEntry(cfg, buf)
+	processPINOpts(ctx, pin, keypadRole, opts)
+}
+
+func processPINOpts(ctx *AppContext, pin string, keypadRole string, opts pinOpts) {
 	// Query local SQLite for permissions
 	// Validate PIN against door constraints
 	// Trigger Relay, Sound Event, MQTT Update, and Logging
@@ -178,6 +191,9 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		ctx.keypadClearLockout()
 		ctx.ResetWrongPINCount()
 		log.Printf("INFO: Keypad lockout cleared by override PIN (%s keypad).", keypadLogTag(keypadRole))
+		if opts.duress {
+			ctx.raiseDuressAlarm(keypadRole, "override_pin")
+		}
 		// The override/master PIN also opens the door, unless fireman's service
 		// is holding the relays off.
 		relPulsed := false
@@ -218,6 +234,13 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 		return
 	}
 
+	modePre := NormalizeKeypadOperationMode(cfg.KeypadOperationMode)
+	if !ctx.keypadFnCodeValid(cfg, modePre, opts) {
+		log.Printf("INFO: PIN rejected (invalid or disabled function code %q; %s keypad).", opts.fnCode, keypadLogTag(keypadRole))
+		ctx.pinRejectWithStreak(cfg, keypadRole, buzzerBCM, "invalid_function_code", map[string]any{"fn_code": opts.fnCode})
+		return
+	}
+
 	cred := ctx.accessCredentialForPIN(pin)
 	if cred.LifecycleReason != "" {
 		log.Printf("INFO: PIN rejected (credential lifecycle: %s; %s keypad).", cred.LifecycleReason, keypadLogTag(keypadRole))
@@ -230,7 +253,10 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 	}
 	pinOK := cred.OK
 	credLabel := cred.Label
-	modePre := NormalizeKeypadOperationMode(cfg.KeypadOperationMode)
+	if pinOK && opts.duress {
+		// Before the schedule checks: a valid credential under duress always raises the alarm.
+		ctx.raiseDuressAlarm(keypadRole, credLabel)
+	}
 	if pinOK && modePre == ModeAccessDualUSBKeypad && keypadRole == "exit" && cfg.DualKeypadRejectExitWithoutEntry && !ctx.FiremansServiceActive() && ctx.dualKeypadExitWouldMismatch(pin) {
 		log.Printf("INFO: PIN rejected (exit keypad; no recorded entry for this credential; door not opened).")
 		ex := map[string]any{}
@@ -275,9 +301,17 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 			credTag = "legacy_or_unlabeled"
 		}
 
-		if ctx.grantElevatorMode(cfg, mode, doorBCM, feedbackDelay, grantRequest{
-			pin: pin, keypadRole: keypadRole, credLabel: credLabel, viaFallback: cred.ViaFallback,
-		}) {
+		greq := grantRequest{pin: pin, keypadRole: keypadRole, credLabel: credLabel, viaFallback: cred.ViaFallback}
+		if idx, ok := keypadFnFloorIndex(opts.fnCode); ok && mode == ModeElevatorWaitFloorButtons {
+			greq.keypadFloor, greq.hasKeypadFloor = idx, true
+			greq.whExtra = map[string]any{"fn_code": opts.fnCode}
+		}
+		if ctx.grantElevatorMode(cfg, mode, doorBCM, feedbackDelay, greq) {
+			return
+		}
+		if opts.fnCode == keypadFnLatch {
+			log.Printf("INFO: PIN accepted with latch code (mode=%s %s keypad; credential=%s).", mode, kTag, credTag)
+			ctx.grantDoorLatchToggle(pin, cfg, mode, keypadRole, credLabel, feedbackDelay)
 			return
 		}
 		var areaTotal, insideThis int
@@ -306,7 +340,18 @@ func processPIN(ctx *AppContext, pin string, keypadRole string) {
 				whExtra["occupancy_mismatch"] = occMismatch
 			}
 		}
-		ctx.grantDefaultModeDoorUnlockLikePIN(pin, cfg, mode, keypadRole, credLabel, doorBCM, feedbackDelay, cred.DoorHoldExtra, whExtra, zoneBookkeepingChanged)
+		holdExtra := cred.DoorHoldExtra
+		if opts.fnCode == keypadFnExtendedHold {
+			// cfg is a local copy: the longer pulse applies to this grant only.
+			cfg.RelayPulseDuration = cfg.KeypadFnExtendedPulse
+			holdExtra += cfg.KeypadFnExtendedHoldExtra
+			if whExtra == nil {
+				whExtra = map[string]any{}
+			}
+			whExtra["fn_code"] = opts.fnCode
+			log.Printf("INFO: Extended door hold (relay pulse %s; extra door-open grace %s).", cfg.RelayPulseDuration, holdExtra)
+		}
+		ctx.grantDefaultModeDoorUnlockLikePIN(pin, cfg, mode, keypadRole, credLabel, doorBCM, feedbackDelay, holdExtra, whExtra, zoneBookkeepingChanged)
 		return
 	}
 
@@ -327,6 +372,10 @@ type grantRequest struct {
 	viaFallback bool
 	staticTest  bool           // static test QR: skip floor ACL and use_count
 	whExtra     map[string]any // merged into every webhook (e.g. auth_method)
+	// keypadFloor is the floor index from a "<floor> <PIN>" keypad entry (hasKeypadFloor set):
+	// elevator_wait_floor_buttons dispatches it directly instead of waiting for a cab button.
+	keypadFloor    int
+	hasKeypadFloor bool
 }
 
 // grantElevatorMode performs the grant side effects for the elevator operation modes and reports
@@ -369,6 +418,10 @@ func (ctx *AppContext) grantElevatorMode(cfg DeviceConfig, mode string, doorBCM 
 				"elevator_wait_floor_cab_sense": cabSense,
 				"firemans_service":              true,
 			})
+			return true
+		}
+		if g.hasKeypadFloor {
+			ctx.grantElevatorKeypadFloor(cfg, mode, feedbackDelay, g, accepted)
 			return true
 		}
 		if g.staticTest {

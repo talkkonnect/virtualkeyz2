@@ -21,6 +21,14 @@
   keypad_inter_digit_timeout: 5s
   keypad_session_timeout: 30s
   pin_entry_feedback_delay: 3s
+  keypad_doorbell_enabled: false
+  keypad_doorbell_cooldown: 10s
+  keypad_function_codes_enabled: false
+  keypad_fn_extended_pulse: 15s
+  keypad_fn_extended_hold_extra: 30s
+  keypad_fn_latch_enabled: false
+  keypad_fn_latch_max: 12h0m0s
+  keypad_fn_duress_code: ""
 
 --- Operation mode ---
   keypad_operation_mode: access_entry
@@ -61,6 +69,8 @@
   sound_pin_ok: "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/pin_ok.wav"
   sound_access_granted: "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/access_granted.wav"
   sound_door_open: "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/door_open.wav"
+  sound_doorbell: ""
+  sound_cancel: ""
   sound_pin_reject: "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/pin_reject.wav"
   sound_keypress: "/home/talkkonnect/gocode/src/github.com/virtualkeyz2/sounds/key.wav"
   sound_lighting_timer_set: ""
@@ -74,6 +84,8 @@
   sound_lighting_timer_set_enabled: true
   sound_lighting_timer_expired_enabled: true
   sound_door_open_enabled: true
+  sound_doorbell_enabled: false
+  sound_cancel_enabled: false
   sound_startup_blocking: false
   sound_shutdown_blocking: true
   sound_pin_ok_blocking: true
@@ -83,6 +95,8 @@
   sound_lighting_timer_set_blocking: false
   sound_lighting_timer_expired_blocking: false
   sound_door_open_blocking: false
+  sound_doorbell_blocking: false
+  sound_cancel_blocking: false
   firemans_service_enabled: false
   sound_firemans_activated: ""
   sound_firemans_deactivated: ""

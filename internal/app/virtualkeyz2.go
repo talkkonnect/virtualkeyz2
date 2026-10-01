@@ -27,8 +27,8 @@ import (
 
 // Software build metadata — updated by ./tools/bump-version.sh after each documented revision.
 const (
-	SoftwareVersion    = "0.30"
-	SoftwareReleaseUTC = "2026-10-01T07:26:57Z"
+	SoftwareVersion    = "0.31"
+	SoftwareReleaseUTC = "2026-10-01T08:31:53Z"
 )
 
 // Config types and mode constants (see internal/config).
@@ -121,6 +121,9 @@ type AppContext struct {
 	lcdUI chan lcdCmd
 
 	inputHold inputHolds // per-source post-result input hold (input_hold.go)
+
+	doorLatch    doorLatchState // keypad function code 2 door latch (keypad_fn.go)
+	lastDoorbell atomic.Int64   // UnixNano of the last doorbell ring (keypad_doorbell_cooldown)
 
 	pinFailMu  sync.Mutex
 	pinFailSeq int // consecutive rejected PIN submissions (reset on success or after buzzer fires)
@@ -250,6 +253,10 @@ func newDefaultAppContext(rootCtx context.Context, db *sqlx.DB) *AppContext {
 			PinLockoutDuration:             60 * time.Second,
 			PinLockoutOverridePin:          "",
 			FallbackAccessPin:              "",
+			KeypadDoorbellCooldown:         10 * time.Second,
+			KeypadFnExtendedPulse:          15 * time.Second,
+			KeypadFnExtendedHoldExtra:      30 * time.Second,
+			KeypadFnLatchMax:               12 * time.Hour,
 			WebhookEventEnabled:            false,
 			WebhookEventTokenEnabled:       false,
 			WebhookHeartbeatEnabled:        false,
@@ -408,7 +415,7 @@ func Main() int {
 				gpio.AddOutput("intercom_camera_trigger", appCtx.GPIOSettings.IntercomCameraTriggerRelayPin, appCtx.GPIOSettings.IntercomCameraTriggerRelayActiveLow, useI2CExpander)
 			}
 		}
-		gpio.SetDoorHoldOpenWhile(func() bool { return appCtx.FireAlarmInterfaceActive() })
+		gpio.SetDoorHoldOpenWhile(func() bool { return appCtx.FireAlarmInterfaceActive() || appCtx.DoorLatched() })
 		gpio.ConfigureDoorSensor(appCtx.GPIOSettings.DoorSensorPin)
 		waitMode := NormalizeKeypadOperationMode(appCtx.Config.KeypadOperationMode) == ModeElevatorWaitFloorButtons
 		if waitMode && elevatorWaitFloorSenseCabInputs(appCtx.Config) {

@@ -4,6 +4,7 @@
 #   ./tools/bump-version.sh "What you changed"
 #
 
+[0.31] 2026-10-01T08:31:53Z  keypad function keys: Cancel clears entry, Enter-empty doorbell, Space function codes (extended hold, latch, elevator floor), duress code
 [0.30] 2026-10-01T07:26:57Z  Refactor: split internal/app/virtualkeyz2.go (10.3k lines) into 25 subsystem files (pure move, verified line-for-line); docs updated
 [0.29] 2026-10-01T07:24:15Z  Cleanup: cfg set keys are one table (cfg_keys.go) feeding both cfg set and Tab completion; 8 settable keys (scanner_*, static_test_qr_*, qr_time_window_seconds, max_devices_per_user, buzzer_relay_pulse_duration, elevator_enable_relay_pin) now Tab-complete
 [0.28] 2026-10-01T07:20:45Z  Cleanup: shared elevator grant path for PIN and static QR; table-driven evdev/keypad key maps; generic comma-list parser; maps/slices/cmp idioms; dead code removed; QR reject reads GPIO settings under lock; grant-path tests

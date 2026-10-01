@@ -413,3 +413,47 @@ func monitorElevatorFloorSelection(ctx *AppContext) {
 		fireEventWebhook(ctx, "elevator_floor_selected", map[string]any{"operation_mode": mode, "elevator_floor_indices": toDispatch})
 	}
 }
+
+// grantElevatorKeypadFloor handles an accepted "<floor> <PIN>" keypad entry in
+// elevator_wait_floor_buttons: the floor ACL is checked and the floor is dispatched directly,
+// with no cab-button wait window. accepted fires pin_accepted and holds input.
+func (ctx *AppContext) grantElevatorKeypadFloor(cfg DeviceConfig, mode string, feedbackDelay time.Duration, g grantRequest, accepted func(map[string]any)) {
+	idx := g.keypadFloor
+	elevID := strings.TrimSpace(ctx.effectiveAccessElevatorID())
+	credTag := g.credLabel
+	if credTag == "" {
+		credTag = "legacy_or_unlabeled"
+	}
+	floorLabel := func() string { return elevatorFloorLogLabel(ctx.DB, elevID, idx) }
+	if !ctx.elevatorFloorChannelAllowed(g.pin, elevID, idx, g.viaFallback, time.Now()) {
+		log.Printf("INFO: Elevator keypad floor %s rejected (not permitted for credential=%s or schedule).", floorLabel(), credTag)
+		denyEx := map[string]any{
+			"operation_mode":             mode,
+			"keypad_role":                g.keypadRole,
+			"elevator_floor_indices":     []int{idx},
+			"access_control_elevator_id": elevID,
+			"elevator_floor_labels":      []string{floorLabel()},
+		}
+		if g.credLabel != "" {
+			denyEx["credential_label"] = g.credLabel
+		}
+		lcdShowElevatorFloorDeny(ctx)
+		fireEventWebhook(ctx, "elevator_floor_denied", denyEx)
+		ctx.playRejectSound(g.keypadRole, cfg)
+		ctx.holdInput(g.keypadRole, feedbackDelay)
+		return
+	}
+	// A direct selection replaces any cab-button wait window still open from an earlier PIN.
+	clearElevatorGrantState(ctx)
+	pulsed := pulseElevatorFloorSelections(ctx, cfg, []int{idx})
+	log.Printf("INFO: PIN accepted (elevator wait-floor; keypad floor %s; credential=%s); dispatch pulse sent=%v.", floorLabel(), credTag, pulsed)
+	lcdShowGranted(ctx, credTag)
+	ctx.playOKSound(g.keypadRole, cfg)
+	accepted(map[string]any{
+		"elevator_phase":       "keypad_floor_select",
+		"elevator_floor_index": idx,
+		"relay_pulsed":         pulsed,
+	})
+	fireEventWebhook(ctx, "elevator_floor_selected", map[string]any{"operation_mode": mode, "elevator_floor_indices": []int{idx}, "keypad_role": g.keypadRole})
+	ctx.credentialRecordSuccessfulUse(g.pin, mode, g.keypadRole)
+}

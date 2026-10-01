@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -250,6 +251,39 @@ func mqttPublishRemoteAck(ctx *AppContext, ack remotemqtt.RemoteAck) {
 		log.Printf("WARNING: MQTT publish status: no broker ack within %s", mqttPublishWaitTimeout)
 	} else if t.Error() != nil {
 		log.Printf("WARNING: MQTT publish status: %v", t.Error())
+	}
+}
+
+// mqttPublishEvent publishes an alert-style event (doorbell, duress_alarm) as JSON to
+// "<mqtt_status_topic>/event". It waits for the broker ack, so callers run it in a goroutine.
+func mqttPublishEvent(ctx *AppContext, event string, detail map[string]any) {
+	ctx.mqttMu.RLock()
+	client := ctx.MQTTClient
+	ctx.mqttMu.RUnlock()
+	if client == nil || !client.IsConnected() {
+		return
+	}
+	ctx.configMu.RLock()
+	topic := strings.TrimSpace(ctx.Config.MQTTStatusTopic)
+	clientID := ctx.Config.MQTTClientID
+	ctx.configMu.RUnlock()
+	if topic == "" {
+		return
+	}
+	pay := map[string]any{
+		"event":            event,
+		"timestamp":        time.Now().UTC().Format(time.RFC3339Nano),
+		"device_client_id": clientID,
+	}
+	maps.Copy(pay, detail)
+	b, err := json.Marshal(pay)
+	if err != nil {
+		return
+	}
+	if t := client.Publish(topic+"/event", 1, false, b); !t.WaitTimeout(mqttPublishWaitTimeout) {
+		log.Printf("WARNING: MQTT publish %s: no broker ack within %s", event, mqttPublishWaitTimeout)
+	} else if t.Error() != nil {
+		log.Printf("WARNING: MQTT publish %s: %v", event, t.Error())
 	}
 }
 

@@ -44,6 +44,10 @@ func (ctx *AppContext) applyFireAlarmInterfaceTransition(wantActive bool, reason
 	log.Printf("INFO: Fire alarm interface CLEARED (reason=%q): releasing door relay hold.", reason)
 	debugf("Fire alarm interface: GPIO inactive — returning door relay to software control.")
 	lcdShowFireAlarm(ctx, false)
+	if ctx.DoorLatched() {
+		debugf("Fire alarm interface: door relay stays on (keypad door latch active).")
+		return
+	}
 	if ctx.GPIO != nil && ctx.GPIO.HasOutput("door") {
 		ctx.GPIO.ActionOff("door")
 	}
@@ -253,6 +257,7 @@ func (ctx *AppContext) runFiremansServiceEnter(reason string) {
 	debugf("Fireman's service: enter — clearing elevator grant state and lighting auto-off timer.")
 	ctx.firemansStopLightingAutoOffTimer()
 	clearElevatorGrantState(ctx)
+	ctx.releaseDoorLatch("firemans_service", "")
 	if ctx.GPIO != nil {
 		deenergizeAllRelayOutputs(ctx.GPIO, ctx.FireAlarmInterfaceActive())
 		if ctx.FireAlarmInterfaceActive() && ctx.GPIO.HasOutput("door") {

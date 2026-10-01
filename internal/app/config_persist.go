@@ -33,6 +33,8 @@ type virtualkeyz2PersistDevice struct {
 	SoundLightingTimerSet               string                 `json:"sound_lighting_timer_set"`
 	SoundLightingTimerExpired           string                 `json:"sound_lighting_timer_expired"`
 	SoundDoorOpen                       string                 `json:"sound_door_open"`
+	SoundDoorbell                       string                 `json:"sound_doorbell"`
+	SoundCancel                         string                 `json:"sound_cancel"`
 	SoundStartupEnabled                 bool                   `json:"sound_startup_enabled"`
 	SoundShutdownEnabled                bool                   `json:"sound_shutdown_enabled"`
 	SoundPinOKEnabled                   bool                   `json:"sound_pin_ok_enabled"`
@@ -42,6 +44,8 @@ type virtualkeyz2PersistDevice struct {
 	SoundLightingTimerSetEnabled        bool                   `json:"sound_lighting_timer_set_enabled"`
 	SoundLightingTimerExpiredEnabled    bool                   `json:"sound_lighting_timer_expired_enabled"`
 	SoundDoorOpenEnabled                bool                   `json:"sound_door_open_enabled"`
+	SoundDoorbellEnabled                bool                   `json:"sound_doorbell_enabled"`
+	SoundCancelEnabled                  bool                   `json:"sound_cancel_enabled"`
 	SoundStartupBlocking                bool                   `json:"sound_startup_blocking"`
 	SoundShutdownBlocking               bool                   `json:"sound_shutdown_blocking"`
 	SoundPinOKBlocking                  bool                   `json:"sound_pin_ok_blocking"`
@@ -51,6 +55,8 @@ type virtualkeyz2PersistDevice struct {
 	SoundLightingTimerSetBlocking       bool                   `json:"sound_lighting_timer_set_blocking"`
 	SoundLightingTimerExpiredBlocking   bool                   `json:"sound_lighting_timer_expired_blocking"`
 	SoundDoorOpenBlocking               bool                   `json:"sound_door_open_blocking"`
+	SoundDoorbellBlocking               bool                   `json:"sound_doorbell_blocking"`
+	SoundCancelBlocking                 bool                   `json:"sound_cancel_blocking"`
 	SoundFiremansActivated              string                 `json:"sound_firemans_activated"`
 	SoundFiremansDeactivated            string                 `json:"sound_firemans_deactivated"`
 	SoundFiremansActivatedEnabled       bool                   `json:"sound_firemans_activated_enabled"`
@@ -82,6 +88,14 @@ type virtualkeyz2PersistDevice struct {
 	PinLockoutDuration                  string                 `json:"pin_lockout_duration"`
 	PinLockoutOverridePin               string                 `json:"pin_lockout_override_pin"`
 	FallbackAccessPin                   string                 `json:"fallback_access_pin"`
+	KeypadDoorbellEnabled               bool                   `json:"keypad_doorbell_enabled"`
+	KeypadDoorbellCooldown              string                 `json:"keypad_doorbell_cooldown"`
+	KeypadFunctionCodesEnabled          bool                   `json:"keypad_function_codes_enabled"`
+	KeypadFnExtendedPulse               string                 `json:"keypad_fn_extended_pulse"`
+	KeypadFnExtendedHoldExtra           string                 `json:"keypad_fn_extended_hold_extra"`
+	KeypadFnLatchEnabled                bool                   `json:"keypad_fn_latch_enabled"`
+	KeypadFnLatchMax                    string                 `json:"keypad_fn_latch_max"`
+	KeypadFnDuressCode                  string                 `json:"keypad_fn_duress_code"`
 	WebhookEventEnabled                 bool                   `json:"webhook_event_enabled"`
 	WebhookEventURL                     string                 `json:"webhook_event_url"`
 	WebhookEventTokenEnabled            bool                   `json:"webhook_event_token_enabled"`
@@ -201,6 +215,8 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.SoundLightingTimerSet = c.SoundLightingTimerSet
 	out.Device.SoundLightingTimerExpired = c.SoundLightingTimerExpired
 	out.Device.SoundDoorOpen = c.SoundDoorOpen
+	out.Device.SoundDoorbell = c.SoundDoorbell
+	out.Device.SoundCancel = c.SoundCancel
 	out.Device.SoundStartupEnabled = c.SoundStartupEnabled
 	out.Device.SoundShutdownEnabled = c.SoundShutdownEnabled
 	out.Device.SoundPinOKEnabled = c.SoundPinOKEnabled
@@ -210,6 +226,8 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.SoundLightingTimerSetEnabled = c.SoundLightingTimerSetEnabled
 	out.Device.SoundLightingTimerExpiredEnabled = c.SoundLightingTimerExpiredEnabled
 	out.Device.SoundDoorOpenEnabled = c.SoundDoorOpenEnabled
+	out.Device.SoundDoorbellEnabled = c.SoundDoorbellEnabled
+	out.Device.SoundCancelEnabled = c.SoundCancelEnabled
 	out.Device.SoundStartupBlocking = c.SoundStartupBlocking
 	out.Device.SoundShutdownBlocking = c.SoundShutdownBlocking
 	out.Device.SoundPinOKBlocking = c.SoundPinOKBlocking
@@ -219,6 +237,8 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.SoundLightingTimerSetBlocking = c.SoundLightingTimerSetBlocking
 	out.Device.SoundLightingTimerExpiredBlocking = c.SoundLightingTimerExpiredBlocking
 	out.Device.SoundDoorOpenBlocking = c.SoundDoorOpenBlocking
+	out.Device.SoundDoorbellBlocking = c.SoundDoorbellBlocking
+	out.Device.SoundCancelBlocking = c.SoundCancelBlocking
 	out.Device.SoundFiremansActivated = c.SoundFiremansActivated
 	out.Device.SoundFiremansDeactivated = c.SoundFiremansDeactivated
 	out.Device.SoundFiremansActivatedEnabled = c.SoundFiremansActivatedEnabled
@@ -254,6 +274,14 @@ func buildPersistFile(app *AppContext) virtualkeyz2PersistFile {
 	out.Device.PinLockoutDuration = c.PinLockoutDuration.String()
 	out.Device.PinLockoutOverridePin = c.PinLockoutOverridePin
 	out.Device.FallbackAccessPin = c.FallbackAccessPin
+	out.Device.KeypadDoorbellEnabled = c.KeypadDoorbellEnabled
+	out.Device.KeypadDoorbellCooldown = c.KeypadDoorbellCooldown.String()
+	out.Device.KeypadFunctionCodesEnabled = c.KeypadFunctionCodesEnabled
+	out.Device.KeypadFnExtendedPulse = c.KeypadFnExtendedPulse.String()
+	out.Device.KeypadFnExtendedHoldExtra = c.KeypadFnExtendedHoldExtra.String()
+	out.Device.KeypadFnLatchEnabled = c.KeypadFnLatchEnabled
+	out.Device.KeypadFnLatchMax = c.KeypadFnLatchMax.String()
+	out.Device.KeypadFnDuressCode = c.KeypadFnDuressCode
 	out.Device.WebhookEventEnabled = c.WebhookEventEnabled
 	out.Device.WebhookEventURL = c.WebhookEventURL
 	out.Device.WebhookEventTokenEnabled = c.WebhookEventTokenEnabled

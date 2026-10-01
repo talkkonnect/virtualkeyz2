@@ -243,6 +243,7 @@ All keys accepted by **`cfg set`** are listed by **`cfg keys`** and documented i
 | **`sound_lighting_timer_set`** / **`sound_lighting_timer_expired`** | Optional WAV when the lighting auto-off timer is (re)armed or when it expires. |
 | **`sound_door_open`** | WAV on **first** **`door_open_timeout`** and each **repeat** while the door stays open (see §10). |
 | **`sound_firemans_activated`** / **`sound_firemans_deactivated`** | Optional WAV when fireman's service is turned **on** / **off**. |
+| **`sound_doorbell`** / **`sound_cancel`** | Optional WAV for the keypad doorbell (Enter on an empty entry) and the **Cancel** key (§5.4.1). Default empty / disabled. |
 | **`sound_*_enabled`** | Per-sound master switches (**`true`** = WAV path may play; **`false`** = never play that cue). |
 
 ### 5.2 Door relay timing and auxiliary pulses
@@ -285,6 +286,37 @@ Per-PIN extra time before the first alarm: **`access_pins.door_hold_extra_second
 | **`buzzer_relay_pulse_duration`** | Buzzer relay pulse length. |
 | **`fallback_access_pin`** | Accepted when no **`access_pins`** row matches (empty disables). |
 | **`access_schedule_apply_to_fallback_pin`** | When **true**, fallback PIN is subject to schedules too. |
+
+#### 5.4.1 Keypad function keys (Cancel, Enter, Space)
+
+| Key on keypad | Behaviour |
+|---------------|-----------|
+| **Backspace** | Deletes the last character. |
+| **Cancel** | Clears the entry immediately (log **`PIN entry cancelled`**, displays return to idle, optional **`sound_cancel`**). Accepted scancodes: **`KEY_ESC`**, **`KEY_DELETE`**, **`KEY_CANCEL`** (check yours with **`evtest`**). Nothing happens on an empty entry. |
+| **Enter** | Submits the entry. With nothing typed and **`keypad_doorbell_enabled`**, rings the doorbell: **`doorbell`** webhook, MQTT **`<mqtt_status_topic>/event`**, LCD "Doorbell", optional **`sound_doorbell`**. |
+| **Space** | Function-code separator: **`<code> Space <PIN>`** (code first, 1–2 digits, one Space). With **`pin_length`** auto-submit, only the digits after the Space count. |
+
+Function codes (the code is typed **before** the PIN):
+
+| Code | Mode | Effect |
+|------|------|--------|
+| **`keypad_fn_duress_code`** (e.g. **`99`**) | all | Valid PIN is granted **exactly as normal** (same LCD, sounds and **`pin_accepted`** payload) and a silent **`duress_alarm`** webhook + MQTT event is raised. An invalid PIN is a normal reject with no alarm. Exclude **`duress_alarm`** from any display endpoint's allowlist. |
+| **`1`** | door modes | Extended hold: door relay pulse **`keypad_fn_extended_pulse`** and **`keypad_fn_extended_hold_extra`** added to the door-open grace (on top of the PIN's own hold extra). |
+| **`2`** | door modes | Latch toggle (needs **`keypad_fn_latch_enabled`**): the door relay stays on (**`door_latched`**) until the next **`2 Space PIN`**, **`keypad_fn_latch_max`**, or fireman's service (**`door_unlatched`**). Door-open warnings are suppressed while latched. Dual-keypad occupancy is not updated. A restart drops the latch. Refused during fireman's service. |
+| **`<n>`** | **`elevator_wait_floor_buttons`** | Direct floor select: 0-based floor index (same as **`acl`** floor indices). The floor ACL is checked and the floor's dispatch output pulses at once, with no cab-button wait. Needs per-floor **`elevator_floor_dispatch_pins`**. |
+
+Codes other than the duress code need **`keypad_function_codes_enabled`**. An unknown or disabled code is rejected with **`pin_rejected`** reason **`invalid_function_code`** (counts toward the wrong-PIN streak / lockout). The override PIN ignores codes, except that the duress code still raises the alarm.
+
+| Key | Purpose |
+|-----|---------|
+| **`keypad_doorbell_enabled`** | Enter on an empty entry rings the doorbell (default **false**). |
+| **`keypad_doorbell_cooldown`** | Minimum time between rings (default **10s**). |
+| **`keypad_function_codes_enabled`** | Enables codes **1**, **2** and elevator floor codes (default **false**). |
+| **`keypad_fn_extended_pulse`** | Door relay pulse for code **1** (clamped **1s–60s**, default **15s**). |
+| **`keypad_fn_extended_hold_extra`** | Extra door-open grace for code **1** (default **30s**). |
+| **`keypad_fn_latch_enabled`** | Allows code **2** (default **false**). |
+| **`keypad_fn_latch_max`** | Latch auto-release (default **12h**). |
+| **`keypad_fn_duress_code`** | 1–2 digit duress code (empty = disabled). Shown as **`(set)`** in **`cfg list`**. |
 
 ### 5.5 Lighting
 
@@ -517,6 +549,8 @@ Payload: plain text command or JSON **`{"cmd":"..."}`**. If **`mqtt_command_toke
 
 Acknowledgements on **`mqtt_status_topic`**: **`ok`**, **`cmd`**, optional **`error`**, **`detail`**, optional **`door_open`**.
 
+Alert events (**`doorbell`**, **`duress_alarm`**, §5.4.1) are published as JSON (**`event`**, **`timestamp`**, **`device_client_id`**, details) to **`<mqtt_status_topic>/event`**.
+
 ### 9.2 Pair-peer (`mqtt_pair_peer_topic`)
 
 JSON **`{"cmd":"pulse_paired_exit"}`** or **`unlock_peer_exit`**; optional **`token`**. Fires **`mqtt_pair_peer_exit_pulse`**.
@@ -547,7 +581,7 @@ Server on **`:8080`** (**`net/http`** mux): **`GET /admin`** returns plain text 
 
 **Common event names** (for **`webhook_event_types`** / endpoint allowlists):
 
-**`pin_accepted`**, **`pin_rejected`**, **`wrong_pin_buzzer`**, **`keypad_lockout_activated`**, **`keypad_lockout_override`**, **`door_opened`**, **`door_closed`**, **`door_open_timeout`**, **`door_forced`**, **`mqtt_remote_door_open`**, **`mqtt_remote_door_open_denied`**, **`mqtt_remote_buzzer`**, **`mqtt_pair_peer_exit_pulse`**, **`firemans_service_activated`**, **`firemans_service_deactivated`**, **`elevator_floor_denied`**, **`elevator_floor_selected`**, **`elevator_floor_timeout`**, and credential lifecycle / schedule reasons embedded in **`pin_rejected`** details.
+**`pin_accepted`**, **`pin_rejected`**, **`wrong_pin_buzzer`**, **`keypad_lockout_activated`**, **`keypad_lockout_override`**, **`door_opened`**, **`door_closed`**, **`door_open_timeout`**, **`door_forced`**, **`mqtt_remote_door_open`**, **`mqtt_remote_door_open_denied`**, **`mqtt_remote_buzzer`**, **`mqtt_pair_peer_exit_pulse`**, **`firemans_service_activated`**, **`firemans_service_deactivated`**, **`elevator_floor_denied`**, **`elevator_floor_selected`**, **`elevator_floor_timeout`**, **`doorbell`**, **`duress_alarm`**, **`door_latched`**, **`door_unlatched`** (§5.4.1; **`pin_rejected`** reasons **`invalid_function_code`**, **`latch_unavailable`**), and credential lifecycle / schedule reasons embedded in **`pin_rejected`** details.
 
 ---
 

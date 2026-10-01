@@ -82,6 +82,8 @@ type DeviceConfig struct {
 	SoundLightingTimerSet     string
 	SoundLightingTimerExpired string
 	SoundDoorOpen             string
+	SoundDoorbell             string
+	SoundCancel               string
 
 	SoundStartupEnabled              bool
 	SoundShutdownEnabled             bool
@@ -92,6 +94,8 @@ type DeviceConfig struct {
 	SoundLightingTimerSetEnabled     bool
 	SoundLightingTimerExpiredEnabled bool
 	SoundDoorOpenEnabled             bool
+	SoundDoorbellEnabled             bool
+	SoundCancelEnabled               bool
 
 	// Per-sound blocking (sync) vs non-blocking (async) playback.
 	SoundStartupBlocking              bool
@@ -103,6 +107,8 @@ type DeviceConfig struct {
 	SoundLightingTimerSetBlocking     bool
 	SoundLightingTimerExpiredBlocking bool
 	SoundDoorOpenBlocking             bool
+	SoundDoorbellBlocking             bool
+	SoundCancelBlocking               bool
 
 	LogLevel                           string
 	PinLength                          int
@@ -130,6 +136,17 @@ type DeviceConfig struct {
 	PinLockoutDuration      time.Duration
 	PinLockoutOverridePin   string
 	FallbackAccessPin       string
+
+	// Keypad function keys: Enter on an empty buffer rings the doorbell; "<code> Space <PIN>"
+	// selects a function code (extended hold, latch, direct elevator floor, duress).
+	KeypadDoorbellEnabled      bool
+	KeypadDoorbellCooldown     time.Duration
+	KeypadFunctionCodesEnabled bool
+	KeypadFnExtendedPulse      time.Duration
+	KeypadFnExtendedHoldExtra  time.Duration
+	KeypadFnLatchEnabled       bool
+	KeypadFnLatchMax           time.Duration
+	KeypadFnDuressCode         string
 
 	WebhookEventEnabled            bool
 	WebhookEventURL                string

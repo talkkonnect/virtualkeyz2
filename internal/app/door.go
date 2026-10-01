@@ -118,6 +118,14 @@ func monitorDoorSensors(ctx *AppContext) {
 		if openSince.IsZero() {
 			openSince = time.Now()
 		}
+		if ctx.DoorLatched() {
+			// Keypad latch (function code 2): the door is meant to stand open; restart the
+			// held-open clock so warnings only begin after the latch is released.
+			openSince = time.Now()
+			inAlarmPhase = false
+			warningCount = 0
+			continue
+		}
 
 		ctx.doorAlarmMu.Lock()
 		holdExtra := ctx.doorHoldExtraGrace

@@ -46,6 +46,8 @@ type virtualkeyz2DeviceJSON struct {
 	SoundLightingTimerSet               *string                     `json:"sound_lighting_timer_set,omitempty"`
 	SoundLightingTimerExpired           *string                     `json:"sound_lighting_timer_expired,omitempty"`
 	SoundDoorOpen                       *string                     `json:"sound_door_open,omitempty"`
+	SoundDoorbell                       *string                     `json:"sound_doorbell,omitempty"`
+	SoundCancel                         *string                     `json:"sound_cancel,omitempty"`
 	SoundStartupEnabled                 *bool                       `json:"sound_startup_enabled,omitempty"`
 	SoundShutdownEnabled                *bool                       `json:"sound_shutdown_enabled,omitempty"`
 	SoundPinOKEnabled                   *bool                       `json:"sound_pin_ok_enabled,omitempty"`
@@ -55,6 +57,8 @@ type virtualkeyz2DeviceJSON struct {
 	SoundLightingTimerSetEnabled        *bool                       `json:"sound_lighting_timer_set_enabled,omitempty"`
 	SoundLightingTimerExpiredEnabled    *bool                       `json:"sound_lighting_timer_expired_enabled,omitempty"`
 	SoundDoorOpenEnabled                *bool                       `json:"sound_door_open_enabled,omitempty"`
+	SoundDoorbellEnabled                *bool                       `json:"sound_doorbell_enabled,omitempty"`
+	SoundCancelEnabled                  *bool                       `json:"sound_cancel_enabled,omitempty"`
 	SoundStartupBlocking                *bool                       `json:"sound_startup_blocking,omitempty"`
 	SoundShutdownBlocking               *bool                       `json:"sound_shutdown_blocking,omitempty"`
 	SoundPinOKBlocking                  *bool                       `json:"sound_pin_ok_blocking,omitempty"`
@@ -64,6 +68,8 @@ type virtualkeyz2DeviceJSON struct {
 	SoundLightingTimerSetBlocking       *bool                       `json:"sound_lighting_timer_set_blocking,omitempty"`
 	SoundLightingTimerExpiredBlocking   *bool                       `json:"sound_lighting_timer_expired_blocking,omitempty"`
 	SoundDoorOpenBlocking               *bool                       `json:"sound_door_open_blocking,omitempty"`
+	SoundDoorbellBlocking               *bool                       `json:"sound_doorbell_blocking,omitempty"`
+	SoundCancelBlocking                 *bool                       `json:"sound_cancel_blocking,omitempty"`
 	LogLevel                            *string                     `json:"log_level"`
 	PinLength                           *int                        `json:"pin_length"`
 	RelayPulseDuration                  *string                     `json:"relay_pulse_duration"`
@@ -86,6 +92,14 @@ type virtualkeyz2DeviceJSON struct {
 	PinLockoutDuration                  *string                     `json:"pin_lockout_duration"`
 	PinLockoutOverridePin               *string                     `json:"pin_lockout_override_pin"`
 	FallbackAccessPin                   *string                     `json:"fallback_access_pin"`
+	KeypadDoorbellEnabled               *bool                       `json:"keypad_doorbell_enabled"`
+	KeypadDoorbellCooldown              *string                     `json:"keypad_doorbell_cooldown"`
+	KeypadFunctionCodesEnabled          *bool                       `json:"keypad_function_codes_enabled"`
+	KeypadFnExtendedPulse               *string                     `json:"keypad_fn_extended_pulse"`
+	KeypadFnExtendedHoldExtra           *string                     `json:"keypad_fn_extended_hold_extra"`
+	KeypadFnLatchEnabled                *bool                       `json:"keypad_fn_latch_enabled"`
+	KeypadFnLatchMax                    *string                     `json:"keypad_fn_latch_max"`
+	KeypadFnDuressCode                  *string                     `json:"keypad_fn_duress_code"`
 	WebhookEventEnabled                 *bool                       `json:"webhook_event_enabled"`
 	WebhookEventURL                     *string                     `json:"webhook_event_url"`
 	WebhookEventTokenEnabled            *bool                       `json:"webhook_event_token_enabled"`
@@ -478,6 +492,21 @@ func normalizeKeypadAndPinUX(c *DeviceConfig) {
 	} else {
 		c.PinEntryFeedbackDelay = clampDuration(c.PinEntryFeedbackDelay, 2*time.Second, 10*time.Second)
 	}
+	if c.KeypadDoorbellCooldown < 0 {
+		c.KeypadDoorbellCooldown = 0
+	}
+	if c.KeypadFnExtendedPulse <= 0 {
+		c.KeypadFnExtendedPulse = 15 * time.Second
+	} else {
+		c.KeypadFnExtendedPulse = clampDuration(c.KeypadFnExtendedPulse, time.Second, 60*time.Second)
+	}
+	if c.KeypadFnExtendedHoldExtra < 0 {
+		c.KeypadFnExtendedHoldExtra = 0
+	}
+	if c.KeypadFnLatchMax <= 0 {
+		c.KeypadFnLatchMax = 12 * time.Hour
+	}
+	c.KeypadFnDuressCode = strings.TrimSpace(c.KeypadFnDuressCode)
 	if c.PinLockoutDuration <= 0 {
 		c.PinLockoutDuration = 60 * time.Second
 	} else {
@@ -695,6 +724,12 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.SoundDoorOpen != nil {
 		app.Config.SoundDoorOpen = *d.SoundDoorOpen
 	}
+	if d.SoundDoorbell != nil {
+		app.Config.SoundDoorbell = *d.SoundDoorbell
+	}
+	if d.SoundCancel != nil {
+		app.Config.SoundCancel = *d.SoundCancel
+	}
 	if d.SoundStartupEnabled != nil {
 		app.Config.SoundStartupEnabled = *d.SoundStartupEnabled
 	}
@@ -722,6 +757,12 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	if d.SoundDoorOpenEnabled != nil {
 		app.Config.SoundDoorOpenEnabled = *d.SoundDoorOpenEnabled
 	}
+	if d.SoundDoorbellEnabled != nil {
+		app.Config.SoundDoorbellEnabled = *d.SoundDoorbellEnabled
+	}
+	if d.SoundCancelEnabled != nil {
+		app.Config.SoundCancelEnabled = *d.SoundCancelEnabled
+	}
 	if d.SoundStartupBlocking != nil {
 		app.Config.SoundStartupBlocking = *d.SoundStartupBlocking
 	}
@@ -748,6 +789,12 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if d.SoundDoorOpenBlocking != nil {
 		app.Config.SoundDoorOpenBlocking = *d.SoundDoorOpenBlocking
+	}
+	if d.SoundDoorbellBlocking != nil {
+		app.Config.SoundDoorbellBlocking = *d.SoundDoorbellBlocking
+	}
+	if d.SoundCancelBlocking != nil {
+		app.Config.SoundCancelBlocking = *d.SoundCancelBlocking
 	}
 	if d.LogLevel != nil {
 		app.Config.LogLevel = *d.LogLevel
@@ -793,6 +840,30 @@ func applyVirtualKeyz2JSON(app *AppContext, raw *virtualkeyz2JSON) error {
 	}
 	if d.FallbackAccessPin != nil {
 		app.Config.FallbackAccessPin = *d.FallbackAccessPin
+	}
+	if d.KeypadDoorbellEnabled != nil {
+		app.Config.KeypadDoorbellEnabled = *d.KeypadDoorbellEnabled
+	}
+	if err := applyJSONDuration(&app.Config.KeypadDoorbellCooldown, "device", "keypad_doorbell_cooldown", d.KeypadDoorbellCooldown); err != nil {
+		return err
+	}
+	if d.KeypadFunctionCodesEnabled != nil {
+		app.Config.KeypadFunctionCodesEnabled = *d.KeypadFunctionCodesEnabled
+	}
+	if err := applyJSONDuration(&app.Config.KeypadFnExtendedPulse, "device", "keypad_fn_extended_pulse", d.KeypadFnExtendedPulse); err != nil {
+		return err
+	}
+	if err := applyJSONDuration(&app.Config.KeypadFnExtendedHoldExtra, "device", "keypad_fn_extended_hold_extra", d.KeypadFnExtendedHoldExtra); err != nil {
+		return err
+	}
+	if d.KeypadFnLatchEnabled != nil {
+		app.Config.KeypadFnLatchEnabled = *d.KeypadFnLatchEnabled
+	}
+	if err := applyJSONDuration(&app.Config.KeypadFnLatchMax, "device", "keypad_fn_latch_max", d.KeypadFnLatchMax); err != nil {
+		return err
+	}
+	if d.KeypadFnDuressCode != nil {
+		app.Config.KeypadFnDuressCode = *d.KeypadFnDuressCode
 	}
 	if d.WebhookEventEnabled != nil {
 		app.Config.WebhookEventEnabled = *d.WebhookEventEnabled
