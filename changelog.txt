@@ -4,6 +4,15 @@
 #   ./tools/bump-version.sh "What you changed"
 #
 
+[0.30] 2026-10-01T07:26:57Z  Refactor: split internal/app/virtualkeyz2.go (10.3k lines) into 25 subsystem files (pure move, verified line-for-line); docs updated
+[0.29] 2026-10-01T07:24:15Z  Cleanup: cfg set keys are one table (cfg_keys.go) feeding both cfg set and Tab completion; 8 settable keys (scanner_*, static_test_qr_*, qr_time_window_seconds, max_devices_per_user, buzzer_relay_pulse_duration, elevator_enable_relay_pin) now Tab-complete
+[0.28] 2026-10-01T07:20:45Z  Cleanup: shared elevator grant path for PIN and static QR; table-driven evdev/keypad key maps; generic comma-list parser; maps/slices/cmp idioms; dead code removed; QR reject reads GPIO settings under lock; grant-path tests
+[0.27] 2026-10-01T07:11:53Z  Perf: ordered per-endpoint webhook workers (pin_progress coalesced, payload marshalled once, shared HTTP client, no endpoint clone); debugf skips formatting when DEBUG filtered; single-write log lines without per-line allocations; LCD backlight written only on change
+[0.26] 2026-10-01T07:06:27Z  Perf: batched async audit-log writer (flushed on exit/restart); SQLite synchronous=NORMAL; cached timezone lookups; schedule indexes; elevator monitor adaptive polling and no elevatorMu across DB checks (fixes unlocked grant PIN read)
+[0.25] 2026-10-01T07:02:28Z  Perf: keypad/QR input never blocks — feedback delay is now a per-source input-ignore window (keys dropped, not replayed); QR decode decoupled from processing; keypad/QR reopen after unplug; relay off-phase async with stuck-relay reporting; non-blocking feedback sounds; MQTT publish wait bounded
+[0.24] 2026-10-01T06:52:17Z  Tests: golden tests for config persist/show/set/help and evdev key mapping; extract newDefaultAppContext
+[0.23] 2026-10-01T06:29:52Z  QR scanner: mirror Caps Lock LED while grabbed so scanners with Caps Lock detection send data; apply Caps Lock to letter case
+[0.22] 2026-10-01T06:22:41Z  QR scanner: suppress repeated reject feedback for the same invalid code until it is rescanned (3s quiet gap)
 [0.21] 2026-04-27T04:36:25Z  added sounds
 [0.20] 2026-04-26T05:27:56Z  added lcd display
 [0.19] 2026-04-26T03:56:03Z  added qr usb code reader

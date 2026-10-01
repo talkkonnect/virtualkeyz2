@@ -1,0 +1,164 @@
+
+--- Configuration ---
+  config_path (-config): "testdata/virtualkeyz2.json"
+  tech_menu_prompt: "MeSpace Access Control"
+  log_level: "debug"
+  heartbeat_interval: 1m0s
+  tech_menu_history_max: 100
+  pin_length: 6
+  door_open_warning_after: 1m0s
+  door_open_alarm_interval: 2m0s
+  door_open_alarm_max_count: 0 (0=unlimited door_open_timeout per open period)
+  door_forced_after_warnings: 0 (0=never)
+  door_sensor_closed_is_low: true
+  relay_pulse_duration: 1s
+  buzzer_relay_pulse_duration: 800ms
+  automatic_door_operator_pulse_duration: (unset; uses relay_pulse_duration)
+  intercom_camera_trigger_pulse_duration: 800ms
+  lighting_timeout: 10s (manual button or accepted PIN; default 30m; full reset each trigger; relay off only at expiry)
+  lcd_display: enabled=false bus=1 addr=0x3f backlight_idle_off=1m0s i2c_debug=false
+  pin_reject_buzzer_after_attempts: 3
+  keypad_inter_digit_timeout: 5s
+  keypad_session_timeout: 30s
+  pin_entry_feedback_delay: 3s
+
+--- Operation mode ---
+  keypad_operation_mode: access_entry_with_exit_button
+  keypad_evdev_path: "/dev/input/by-id/usb-13ba_Barcode_Reader-event-kbd"
+  keypad_exit_evdev_path: ""
+  scanner_device_path: "/dev/input/by-id/usb-USBKey_Chip_USBKey_Module_202730041341-event-kbd"
+  scanner_enabled: true
+  max_devices_per_user: 3
+  qr_time_window_seconds: 30
+  static_test_qr_code: (set)
+  static_test_qr_code_enabled: true
+  pair_peer_role: none
+  mqtt_pair_peer_topic: ""
+  pair_peer_token: ""
+  elevator_floor_wait_timeout: 5s
+  elevator_floor_input_pins: "7,8"
+  elevator_predefined_floor: 0
+  elevator_predefined_floors: (unset; legacy single-floor label uses elevator_predefined_floor only)
+  elevator_dispatch_pulse_duration: 400ms
+  elevator_floor_dispatch_pulse_durations: (unset)
+  elevator_enable_pulse_duration: (unset; predefined mode uses dispatch pulse default)
+  dual_keypad_reject_exit_without_entry: false
+
+--- Access schedule (SQLite) ---
+  access_control_door_id: ""
+  access_control_elevator_id: ""
+  access_schedule_enforce: true
+  access_schedule_apply_to_fallback_pin: false
+  access_exception_site_timezone: ""
+  pin_lockout_enabled: false
+  pin_lockout_after_attempts: 5
+  pin_lockout_duration: 1m0s
+  pin_lockout_override_pin: (set)
+  keypad_lockout_remaining: disabled
+  sound_card_name: "plughw:0,0"
+  sound_startup: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/startup.wav"
+  sound_shutdown: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/shutdown.wav"
+  sound_pin_ok: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/welcome.wav"
+  sound_access_granted: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/access_granted.wav"
+  sound_door_open: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/door_open.wav"
+  sound_pin_reject: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/pin_rejected.wav"
+  sound_keypress: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/key.wav"
+  sound_lighting_timer_set: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/lighting_timer_set.wav"
+  sound_lighting_timer_expired: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/lighting_timer_expired.wav"
+  sound_startup_enabled: true
+  sound_shutdown_enabled: true
+  sound_pin_ok_enabled: true
+  sound_access_granted_enabled: true
+  sound_pin_reject_enabled: true
+  sound_keypress_enabled: true
+  sound_lighting_timer_set_enabled: true
+  sound_lighting_timer_expired_enabled: true
+  sound_door_open_enabled: true
+  sound_startup_blocking: false
+  sound_shutdown_blocking: true
+  sound_pin_ok_blocking: true
+  sound_access_granted_blocking: true
+  sound_pin_reject_blocking: true
+  sound_keypress_blocking: false
+  sound_lighting_timer_set_blocking: false
+  sound_lighting_timer_expired_blocking: false
+  sound_door_open_blocking: false
+  firemans_service_enabled: true
+  sound_firemans_activated: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/fire_alarm.wav"
+  sound_firemans_deactivated: "/home/talkkonnect/gocode/src/github.com/talkkonnect/virtualkeyz2/sounds/fire_alarm_deactivated.wav"
+  sound_firemans_activated_enabled: true
+  sound_firemans_deactivated_enabled: true
+  sound_firemans_activated_blocking: false
+  sound_firemans_deactivated_blocking: false
+  firemans_service_runtime_active: false
+
+--- MQTT ---
+  mqtt_enabled: false
+  mqtt_broker: "tcp://central-mqtt-server:1883"
+  mqtt_client_id: "virtualkeyz2-pi-001"
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_command_topic: "virtualkeyz2/commands"
+  mqtt_status_topic: "virtualkeyz2/status"
+  mqtt_command_token: ""
+
+--- HTTP webhooks ---
+  webhook_event_enabled: true
+  webhook_event_url: "http://127.0.0.1:8081/event"
+  webhook_event_token_enabled: false
+  webhook_event_token: ""
+  webhook_event_types: (unset = all event types)
+  webhook_event_endpoints: (unset = use webhook_event_url)
+  webhook_heartbeat_enabled: false
+  webhook_heartbeat_url: ""
+  webhook_heartbeat_token_enabled: false
+  webhook_heartbeat_token: ""
+  webhook_http_timeout: 25s
+  webhook_max_concurrent: 16
+  webhook_circuit_breaker_enabled: true
+  webhook_circuit_failure_threshold: 5
+  webhook_circuit_open_duration: 1m0s
+
+--- GPIO ---
+  relay_output_mode: gpio
+  mcp23017_i2c_bus: 1
+  mcp23017_i2c_addr: 32
+  xl9535_i2c_bus: 1
+  xl9535_i2c_addr: 32
+  i2c_bus_recovery_scl_bcm: 0
+  door_relay_pin: 5
+  door_relay_active_low: false
+  buzzer_relay_pin: 11
+  buzzer_relay_active_low: false
+  door_sensor_pin: 7
+  heartbeat_led_pin: 26
+  exit_button_pin: 8
+  exit_button_active_low: true
+  entry_button_pin: 0
+  entry_button_active_low: true
+  lighting_button_pin: 25
+  lighting_button_active_low: true
+  lighting_relay_pin: 10
+  lighting_relay_active_low: false
+  firemans_service_input_pin: 24 (0=not used)
+  firemans_service_active_low: false
+  automatic_door_operator_relay_pin: 0 (0=disabled)
+  automatic_door_operator_relay_active_low: false
+  intercom_camera_trigger_relay_pin: 0 (0=disabled)
+  intercom_camera_trigger_relay_active_low: false
+  fire_alarm_interface_pin: 0 (0=disabled)
+  fire_alarm_interface_active_low: true
+  fire_alarm_interface_runtime_active: false
+  tamper_switch_pin: 0 (0=disabled)
+  tamper_switch_active_low: true
+  motion_sensor_pin: 0 (0=disabled)
+  motion_sensor_active_low: true
+  elevator_dispatch_relay_pin: 0
+  elevator_dispatch_active_low: false
+  elevator_enable_relay_pin: 0
+  elevator_enable_active_low: false
+  elevator_floor_dispatch_pins: (unset; use elevator_dispatch_relay_pin / door)
+  elevator_predefined_enable_pins: (unset; elevator_predefined_floor only)
+  elevator_wait_floor_enable_pins: (unset; use elevator_enable_relay_pin for wait-floor)
+  gpio_manager_available: false
+

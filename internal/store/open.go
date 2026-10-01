@@ -6,7 +6,7 @@ import (
 	"io/fs"
 	"log"
 	"path"
-	"sort"
+	"slices"
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3" // SQLite driver
@@ -16,7 +16,10 @@ import (
 var migrationFiles embed.FS
 
 // DefaultDSN is the on-disk SQLite URL used by the access-control service.
-const DefaultDSN = "file:./access_control.db?_fk=1&_busy_timeout=5000&_journal_mode=WAL"
+// _synchronous=NORMAL: in WAL mode commits stay atomic and durable across application crashes;
+// only the last transactions before a power cut may roll back (no corruption), and commits no
+// longer fsync, which matters on SD cards.
+const DefaultDSN = "file:./access_control.db?_fk=1&_busy_timeout=5000&_journal_mode=WAL&_synchronous=NORMAL"
 
 // OpenAccessDB opens SQLite, applies WAL, runs embedded core migrations, and migrates access_pins columns.
 func OpenAccessDB(dsn string) (*sqlx.DB, error) {
@@ -41,7 +44,7 @@ func OpenAccessDB(dsn string) (*sqlx.DB, error) {
 		}
 		names = append(names, e.Name())
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	for _, name := range names {
 		b, err := migrationFiles.ReadFile(path.Join("migrations", name))
 		if err != nil {

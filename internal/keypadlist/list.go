@@ -3,12 +3,13 @@
 package keypadlist
 
 import (
+	"cmp"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -32,7 +33,7 @@ func Fprint(w io.Writer, usbOnly bool) error {
 		if len(links) == 0 {
 			continue
 		}
-		sort.Strings(links)
+		slices.Sort(links)
 		base := filepath.Base(eventAbs)
 		if !deviceNodeExists(eventAbs) {
 			continue
@@ -64,12 +65,11 @@ func Fprint(w io.Writer, usbOnly bool) error {
 		out = append(out, row)
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		pi, pj := keypadRowPriority(out[i]), keypadRowPriority(out[j])
-		if pi != pj {
-			return pi > pj
-		}
-		return eventNum(filepath.Base(out[i].eventPath)) < eventNum(filepath.Base(out[j].eventPath))
+	slices.SortFunc(out, func(a, b stableRow) int {
+		return cmp.Or(
+			cmp.Compare(keypadRowPriority(b), keypadRowPriority(a)), // higher priority first
+			cmp.Compare(eventNum(filepath.Base(a.eventPath)), eventNum(filepath.Base(b.eventPath))),
+		)
 	})
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
@@ -154,7 +154,7 @@ func aliasNote(primary string, all []string) string {
 	if len(rest) == 0 {
 		return ""
 	}
-	sort.Strings(rest)
+	slices.Sort(rest)
 	if len(rest) <= 2 {
 		return "also: " + strings.Join(rest, ", ")
 	}
@@ -176,9 +176,9 @@ func pickPreferredStablePath(links []string) string {
 			other = append(other, p)
 		}
 	}
-	sort.Strings(byID)
-	sort.Strings(byPath)
-	sort.Strings(other)
+	slices.Sort(byID)
+	slices.Sort(byPath)
+	slices.Sort(other)
 	if len(byID) > 0 {
 		return byID[0]
 	}
@@ -248,7 +248,7 @@ func kbdHandlersFromProc() map[string]bool {
 	}
 	for _, block := range splitProcInputBlocks(string(b)) {
 		var handlers string
-		for _, line := range strings.Split(block, "\n") {
+		for line := range strings.SplitSeq(block, "\n") {
 			line = strings.TrimRight(line, "\r")
 			if strings.HasPrefix(line, "H: Handlers=") {
 				handlers = strings.TrimSpace(strings.TrimPrefix(line, "H: Handlers="))

@@ -34,11 +34,11 @@ func syncLCDTransportLibraryDebug(enabled bool) {
 // enqueue lcdCmd / PinDisplayDigits with bounded, non-blocking sends).
 
 const (
-	lcdCols           = 20
-	lcdCmdBuffer      = 32
-	lcdAutoIdleAfter  = 4 * time.Second
-	lcdMinBacklight   = 5 * time.Second
-	lcdMaxBacklight   = 60 * time.Minute
+	lcdCols          = 20
+	lcdCmdBuffer     = 32
+	lcdAutoIdleAfter = 4 * time.Second
+	lcdMinBacklight  = 5 * time.Second
+	lcdMaxBacklight  = 60 * time.Minute
 )
 
 // lcdCmd is a full-screen update for the display goroutine (PIN masking uses PinDisplayDigits only).
@@ -84,7 +84,7 @@ func lcdLinesIdle() [4]string {
 		lcdCenterRow("Scan Phone or PIN"),
 		lcdCenterRow("to Open Door"),
 		strings.Repeat(" ", lcdCols),
-		}
+	}
 }
 
 func lcdLinesProcessing() [4]string {
@@ -269,28 +269,12 @@ func lcdShowGranted(ctx *AppContext, credentialLabel string) {
 	lcdEnqueueFullSync(ctx, lcdLinesGranted(credentialLabel), lcdAutoIdleAfter)
 }
 
-func lcdShowDeniedReason(ctx *AppContext, mid, bottom string) {
-	lcdEnqueueFull(ctx, lcdLinesDenied(mid, bottom, ""), lcdAutoIdleAfter)
-}
-
-func lcdShowScheduleDeny(ctx *AppContext) {
-	lcdEnqueueFull(ctx, lcdLinesDenied("Outside Schedule", "", ""), lcdAutoIdleAfter)
-}
-
 func lcdShowInvalidCard(ctx *AppContext) {
 	lcdEnqueueFullSync(ctx, lcdLinesDenied("Invalid Card", "", ""), lcdAutoIdleAfter)
 }
 
-func lcdShowNoPermission(ctx *AppContext) {
-	lcdEnqueueFull(ctx, lcdLinesDenied("No Permission", "", ""), lcdAutoIdleAfter)
-}
-
 func lcdShowKeypadLockout(ctx *AppContext) {
 	lcdEnqueueFullSync(ctx, lcdLinesDenied("Keypad Locked", "Try Later", ""), lcdAutoIdleAfter)
-}
-
-func lcdShowWrongPIN(ctx *AppContext) {
-	lcdEnqueueFull(ctx, lcdLinesWrongPassword(), lcdAutoIdleAfter)
 }
 
 func lcdShowElevatorFloorDeny(ctx *AppContext) {
@@ -417,6 +401,10 @@ func displayController(ctx *AppContext) {
 	idleTimer := time.NewTimer(time.Hour)
 	drainTimer(idleTimer)
 
+	// backlightLit tracks the backlight so keypresses only touch I2C when it is actually off.
+	// Guarded by busMu like dev.
+	backlightLit := false
+
 	closeHW := func() {
 		busMu.Lock()
 		defer busMu.Unlock()
@@ -424,6 +412,7 @@ func displayController(ctx *AppContext) {
 			_ = dev.BacklightOff()
 			dev = nil
 		}
+		backlightLit = false
 		if bus != nil {
 			_ = bus.Close()
 			bus = nil
@@ -444,6 +433,7 @@ func displayController(ctx *AppContext) {
 		bus = ic
 		dev = lcd
 		_ = dev.BacklightOn()
+		backlightLit = true
 		log.Printf("INFO: LCD HD44780 20x4 opened on /dev/i2c-%d address 0x%02x.", busN, addr)
 		return nil
 	}
@@ -513,20 +503,16 @@ func displayController(ctx *AppContext) {
 		d := ctx.Config.LCDDisplay.BacklightTimeout
 		ctx.configMu.RUnlock()
 		drainTimer(blTimer)
-		if d <= 0 {
-			busMu.Lock()
-			if dev != nil {
-				_ = dev.BacklightOn()
-			}
-			busMu.Unlock()
-			return
-		}
 		busMu.Lock()
-		if dev != nil {
-			_ = dev.BacklightOn()
+		if dev != nil && !backlightLit {
+			if err := dev.BacklightOn(); err == nil {
+				backlightLit = true
+			}
 		}
 		busMu.Unlock()
-		blTimer.Reset(d)
+		if d > 0 {
+			blTimer.Reset(d)
+		}
 	}
 
 	backlightMaybeOff := func() {
@@ -540,6 +526,7 @@ func displayController(ctx *AppContext) {
 		busMu.Lock()
 		if dev != nil {
 			_ = dev.BacklightOff()
+			backlightLit = false
 		}
 		busMu.Unlock()
 	}

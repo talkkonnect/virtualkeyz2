@@ -276,7 +276,7 @@ Per-PIN extra time before the first alarm: **`access_pins.door_hold_extra_second
 | **`pin_length`** | Digits before auto-submit; **0** = require **Enter** / KP Enter to submit. |
 | **`keypad_inter_digit_timeout`** | Max gap between digits (clamped in software, typically **3s–10s**). |
 | **`keypad_session_timeout`** | Max time from first digit to submit/clear (clamped **10s–60s**). |
-| **`pin_entry_feedback_delay`** | Pause after PIN OK/reject before accepting new keys (clamped **2s–10s**). |
+| **`pin_entry_feedback_delay`** | After a granted PIN/QR (or a keypad-lockout reject), keys/scans from **that** keypad or scanner are ignored for this long (clamped **2s–10s**); they are dropped, not queued. A sound with `sound_<name>_blocking` true extends the window until it finishes. Wrong-PIN rejects and the override PIN have no window, so the user can retype immediately. |
 | **`pin_lockout_enabled`** | Master switch for wrong-PIN lockout. |
 | **`pin_lockout_after_attempts`** | Consecutive wrong PINs before lockout (**0** = off; else clamped **3–5**). |
 | **`pin_lockout_duration`** | Keypad ignore duration after lockout (clamped **30s–300s**). |
